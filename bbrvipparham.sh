@@ -7,12 +7,20 @@ CONFIG_FILE="/etc/sysctl.d/99-bbrvipparham.conf"
 DNS_FILE="/etc/systemd/resolved.conf.d/dns.conf"
 NETPLAN_DIR="/etc/netplan/"
 
+# Function to display progress messages
+show_msg() {
+  echo -e "\n[$(date +'%H:%M:%S')] $1"
+}
+
 check_root() {
-  [ "$EUID" -ne 0 ] && echo "Please run as root: sudo bash $0" && exit 1
+  if [ "$EUID" -ne 0 ]; then 
+    show_msg "ERROR: Please run as root: sudo bash $0"
+    exit 1
+  fi
 }
 
 set_dns() {
-  echo -e "\nDNS Configuration:"
+  show_msg "DNS Configuration:"
   echo "1) Cloudflare (1.1.1.1)"
   echo "2) Google (8.8.8.8)"
   echo "3) OpenDNS (208.67.222.222)"
@@ -24,20 +32,20 @@ set_dns() {
     2) DNS="8.8.8.8 8.8.4.4" ;;
     3) DNS="208.67.222.222 208.67.220.220" ;;
     4) read -p "Enter DNS servers (space separated): " DNS ;;
-    *) echo "Invalid choice"; return ;;
+    *) show_msg "Invalid choice"; return ;;
   esac
 
   mkdir -p /etc/systemd/resolved.conf.d
   echo -e "[Resolve]\nDNS=$DNS\nDNSSEC=no" > $DNS_FILE
   systemctl restart systemd-resolved
-  echo "DNS set to: $DNS"
+  show_msg "DNS set to: $DNS"
 }
 
 set_mtu() {
   INTERFACE=$(ip route | grep default | awk '{print $5}')
   CURRENT_MTU=$(cat /sys/class/net/$INTERFACE/mtu 2>/dev/null || echo "1500")
   
-  echo -e "\nCurrent MTU on $INTERFACE: $CURRENT_MTU"
+  show_msg "Current MTU on $INTERFACE: $CURRENT_MTU"
   echo "Recommended values:"
   echo "1) Default (1500)"
   echo "2) Cloud (1450)"
@@ -54,16 +62,15 @@ set_mtu() {
       while true; do
         read -p "Enter MTU value (68-9000): " NEW_MTU
         [ $NEW_MTU -ge 68 ] && [ $NEW_MTU -le 9000 ] && break
-        echo "Invalid MTU! Must be between 68-9000"
+        show_msg "Invalid MTU! Must be between 68-9000"
       done
       ;;
-    *) echo "Invalid option"; return ;;
+    *) show_msg "Invalid option"; return ;;
   esac
 
-  # Temporary change
+  show_msg "Setting MTU to $NEW_MTU on $INTERFACE..."
   ip link set dev $INTERFACE mtu $NEW_MTU
   
-  # Persistent change
   if [ -d "$NETPLAN_DIR" ]; then
     NETPLAN_FILE=$(ls $NETPLAN_DIR/*.yaml 2>/dev/null | head -n1)
     [ -z "$NETPLAN_FILE" ] && NETPLAN_FILE="$NETPLAN_DIR/01-netcfg.yaml"
@@ -89,12 +96,12 @@ EOF
     netplan apply
   fi
   
-  echo "MTU set to $NEW_MTU on $INTERFACE"
+  show_msg "MTU successfully set to $NEW_MTU"
 }
 
 optimize_network() {
   MODE=$1
-  echo -e "\nApplying $MODE Optimizations..."
+  show_msg "Applying $MODE Optimizations..."
 
   case $MODE in
     "DOWNLOAD")
@@ -142,7 +149,7 @@ EOF
   esac
 
   sysctl --system
-  echo "$MODE Optimizations Applied"
+  show_msg "$MODE Optimizations Successfully Applied"
 }
 
 show_status() {
@@ -184,12 +191,14 @@ main_menu() {
       6) show_status ;;
       0) exit 0 ;;
       *)
-        echo "Invalid option"
+        show_msg "Invalid option"
         sleep 1
         ;;
     esac
   done
 }
 
+# Initial checks
 check_root
+show_msg "Starting Network Optimizer..."
 main_menu
