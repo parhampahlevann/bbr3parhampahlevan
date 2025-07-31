@@ -6,7 +6,6 @@ set -e
 CONFIG_FILE="/etc/sysctl.d/99-bbrvipparham.conf"
 DNS_FILE="/etc/systemd/resolved.conf.d/dns.conf"
 NETPLAN_DIR="/etc/netplan/"
-NETPLAN_FILE="$NETPLAN_DIR/01-netcfg.yaml"
 
 show_msg() {
     echo -e "\n[$(date +'%H:%M:%S')] $1"
@@ -17,7 +16,8 @@ check_root() {
 }
 
 set_dns() {
-    show_msg "DNS Configuration:"
+    clear
+    echo -e "\nDNS Configuration:"
     echo "1) Cloudflare (1.1.1.1) - Best for Gaming"
     echo "2) Google (8.8.8.8) - Balanced"
     echo "3) OpenDNS (208.67.222.222) - Secure"
@@ -81,18 +81,13 @@ set_mtu() {
 
     # Make MTU persistent in Netplan
     mkdir -p $NETPLAN_DIR
-    if [ -f "$NETPLAN_FILE" ]; then
-        # Backup existing config
-        cp "$NETPLAN_FILE" "$NETPLAN_FILE.bak"
-        
-        # Check if YAML file has correct syntax
-        if ! yq -e '.' "$NETPLAN_FILE" >/dev/null 2>&1; then
-            show_msg "WARNING: Existing netplan config is invalid. Creating new one."
-            rm -f "$NETPLAN_FILE"
-        fi
-    fi
+    NETPLAN_FILE=$(ls $NETPLAN_DIR/*.yaml 2>/dev/null | head -n1)
+    [ -z "$NETPLAN_FILE" ] && NETPLAN_FILE="$NETPLAN_DIR/01-netcfg.yaml"
 
-    # Create new netplan config if needed
+    # Create backup
+    [ -f "$NETPLAN_FILE" ] && cp "$NETPLAN_FILE" "$NETPLAN_FILE.bak"
+
+    # Create new config if doesn't exist
     if [ ! -f "$NETPLAN_FILE" ]; then
         cat > "$NETPLAN_FILE" <<EOF
 network:
@@ -101,26 +96,33 @@ network:
   ethernets:
     $INTERFACE:
       dhcp4: true
+      mtu: $NEW_MTU
 EOF
+    else
+        # Check if interface exists in config
+        if ! grep -q "$INTERFACE:" "$NETPLAN_FILE"; then
+            # Add new interface config
+            cat >> "$NETPLAN_FILE" <<EOF
+    $INTERFACE:
+      dhcp4: true
+      mtu: $NEW_MTU
+EOF
+        else
+            # Update existing MTU
+            if grep -q "mtu:" "$NETPLAN_FILE"; then
+                sed -i "/$INTERFACE:/,/mtu:/s/mtu:.*/mtu: $NEW_MTU/" "$NETPLAN_FILE"
+            else
+                sed -i "/$INTERFACE:/a \      mtu: $NEW_MTU" "$NETPLAN_FILE"
+            fi
+        fi
     fi
 
-    # Use yq to modify the YAML file properly
-    if ! command -v yq &>/dev/null; then
-        show_msg "ERROR: yq (YAML processor) is required but not installed. Please install it first."
-        show_msg "On Ubuntu/Debian: sudo apt install yq"
-        show_msg "On CentOS/RHEL: sudo yum install yq"
-        return 1
-    fi
-
-    # Add/update MTU setting in netplan
-    yq e ".network.ethernets.$INTERFACE.mtu = $NEW_MTU" -i "$NETPLAN_FILE"
-    
     # Apply netplan changes
     if netplan apply; then
         show_msg "MTU successfully set to $NEW_MTU (persistent after reboot)"
     else
         show_msg "ERROR: Failed to apply netplan changes. Restoring backup..."
-        mv "$NETPLAN_FILE.bak" "$NETPLAN_FILE"
+        [ -f "$NETPLAN_FILE.bak" ] && mv "$NETPLAN_FILE.bak" "$NETPLAN_FILE"
         netplan apply
         return 1
     fi
@@ -129,6 +131,8 @@ EOF
     ACTUAL_MTU=$(cat /sys/class/net/$INTERFACE/mtu 2>/dev/null)
     if [ "$ACTUAL_MTU" != "$NEW_MTU" ]; then
         show_msg "WARNING: MTU shows as $ACTUAL_MTU but should be $NEW_MTU. Reboot may be needed."
+    else
+        show_msg "MTU successfully verified as $NEW_MTU"
     fi
 }
 
