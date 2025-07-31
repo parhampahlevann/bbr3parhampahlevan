@@ -4,16 +4,15 @@ set -e
 
 CONFIG_FILE="/etc/sysctl.d/99-bbr.conf"
 
-# Ensure root access
+# Make sure user is root
 if [ "$EUID" -ne 0 ]; then
-  echo "❌ Please run this script as root (use sudo)."
+  echo "❌ Please run this script as root (use: sudo bash install.sh)"
   exit 1
 fi
 
 function install_bbr3() {
   echo "🚀 Installing BBR3 by Parham Pahlevan..."
 
-  # Check kernel version
   kernel_version=$(uname -r | cut -d '-' -f1)
   major=$(echo "$kernel_version" | cut -d '.' -f1)
   minor=$(echo "$kernel_version" | cut -d '.' -f2)
@@ -21,13 +20,12 @@ function install_bbr3() {
   echo "🔍 Current kernel version: $kernel_version"
 
   if [ "$major" -lt 6 ] || { [ "$major" -eq 6 ] && [ "$minor" -lt 1 ]; }; then
-    echo "⚠️ Your kernel doesn't support BBRv3. Please upgrade to kernel 6.1+."
+    echo "⚠️ Kernel does not support BBRv3. Please upgrade to 6.1 or newer."
     exit 1
   fi
 
-  # Write tuning config
   cat > "$CONFIG_FILE" <<EOF
-# BBRv3 Network Optimizer by Parham Pahlevan
+# BBRv3 Optimized Settings by Parham Pahlevan
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.core.rmem_max = 67108864
@@ -47,39 +45,34 @@ net.ipv4.tcp_keepalive_probes = 5
 EOF
 
   sysctl --system
-
   echo ""
-  echo "✅ BBR3 installation completed!"
+  echo "✅ BBRv3 installation complete!"
   sysctl net.ipv4.tcp_congestion_control
 }
 
 function uninstall_bbr3() {
-  echo "🧹 Removing BBR3 settings and restoring defaults..."
-
-  [ -f "$CONFIG_FILE" ] && rm -f "$CONFIG_FILE" && echo "✔ Removed: $CONFIG_FILE"
-
+  echo "🧹 Removing BBR3 settings and restoring default values..."
+  rm -f "$CONFIG_FILE"
   sysctl -w net.core.default_qdisc=cake >/dev/null 2>&1 || true
   sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
-
   sysctl --system
-  echo "✅ Settings reset to default."
+  echo "✅ Reverted to default system settings."
 }
 
 function reboot_system() {
-  echo "🔁 Rebooting now..."
+  echo "🔁 Rebooting system..."
   reboot
 }
 
-# Menu
 while true; do
   echo ""
-  echo "============== BBR3 Network Optimizer =============="
+  echo "============ BBR3 Network Optimizer ============"
   echo "1) Install BBR3 By Parham Pahlevan"
-  echo "2) Uninstall (Reset to Default)"
-  echo "3) Reboot"
+  echo "2) Uninstall and Reset Settings"
+  echo "3) Reboot System"
   echo "0) Exit"
-  echo "===================================================="
-  read -p "Select an option [0-3]: " choice
+  echo "==============================================="
+  read -p "Choose an option [0-3]: " choice
 
   case $choice in
     1)
@@ -92,11 +85,11 @@ while true; do
       reboot_system
       ;;
     0)
-      echo "👋 Exiting script. Goodbye!"
+      echo "👋 Exiting..."
       exit 0
       ;;
     *)
-      echo "❌ Invalid option. Choose between 0 and 3."
+      echo "❌ Invalid choice. Please enter 0 to 3."
       ;;
   esac
 done
