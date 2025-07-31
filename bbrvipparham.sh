@@ -1,7 +1,5 @@
 #!/bin/bash
 
-set -e
-
 # Configuration Files
 CONFIG_FILE="/etc/sysctl.d/99-bbrvipparham.conf"
 DNS_FILE="/etc/systemd/resolved.conf.d/dns.conf"
@@ -12,7 +10,10 @@ show_msg() {
 }
 
 check_root() {
-    [ "$EUID" -ne 0 ] && show_msg "ERROR: Please run as root: sudo bash $0" && exit 1
+    if [ "$EUID" -ne 0 ]; then
+        show_msg "ERROR: Please run as root: sudo bash $0"
+        exit 1
+    fi
 }
 
 set_dns() {
@@ -33,19 +34,19 @@ set_dns() {
     esac
 
     mkdir -p /etc/systemd/resolved.conf.d
-    echo -e "[Resolve]\nDNS=$DNS\nDNSSEC=no" > $DNS_FILE
+    echo -e "[Resolve]\nDNS=$DNS\nDNSSEC=no" > "$DNS_FILE"
     systemctl restart systemd-resolved
     show_msg "DNS set to: $DNS"
 }
 
 set_mtu() {
-    INTERFACE=$(ip route | grep default | awk '{print $5}')
+    INTERFACE=$(ip route | grep default | awk '{print $5}' 2>/dev/null)
     if [ -z "$INTERFACE" ]; then
         show_msg "ERROR: Could not determine default network interface"
         return 1
     fi
     
-    CURRENT_MTU=$(cat /sys/class/net/$INTERFACE/mtu 2>/dev/null || echo "1500")
+    CURRENT_MTU=$(cat /sys/class/net/"$INTERFACE"/mtu 2>/dev/null || echo "1500")
     
     show_msg "Current MTU on $INTERFACE: $CURRENT_MTU"
     echo "Recommended values:"
@@ -55,15 +56,17 @@ set_mtu() {
     echo "4) Custom"
     
     while true; do
-        read -p "Select option [1-4]: " mtu_opt
+        read -rp "Select option [1-4]: " mtu_opt
         case $mtu_opt in
             1) NEW_MTU=1500; break ;;
             2) NEW_MTU=1450; break ;;
             3) NEW_MTU=1420; break ;;
             4) 
                 while true; do
-                    read -p "Enter MTU value (576-9000): " NEW_MTU
-                    [[ $NEW_MTU =~ ^[0-9]+$ ]] && [ $NEW_MTU -ge 576 ] && [ $NEW_MTU -le 9000 ] && break
+                    read -rp "Enter MTU value (576-9000): " NEW_MTU
+                    if [[ "$NEW_MTU" =~ ^[0-9]+$ ]] && [ "$NEW_MTU" -ge 576 ] && [ "$NEW_MTU" -le 9000 ]; then
+                        break
+                    fi
                     show_msg "Invalid MTU! Must be between 576-9000"
                 done
                 break
@@ -74,20 +77,21 @@ set_mtu() {
 
     # Apply MTU immediately
     show_msg "Setting MTU to $NEW_MTU on $INTERFACE..."
-    if ! ip link set dev $INTERFACE mtu $NEW_MTU; then
+    if ip link set dev "$INTERFACE" mtu "$NEW_MTU"; then
+        show_msg "MTU changed successfully"
+    else
         show_msg "ERROR: Failed to set MTU. Interface may not support this value."
         return 1
     fi
 
     # Make MTU persistent in Netplan
-    mkdir -p $NETPLAN_DIR
-    NETPLAN_FILE=$(ls $NETPLAN_DIR/*.yaml 2>/dev/null | head -n1)
+    mkdir -p "$NETPLAN_DIR"
+    NETPLAN_FILE=$(find "$NETPLAN_DIR" -name "*.yaml" -o -name "*.yml" | head -n 1)
     [ -z "$NETPLAN_FILE" ] && NETPLAN_FILE="$NETPLAN_DIR/01-netcfg.yaml"
 
     # Create backup
     [ -f "$NETPLAN_FILE" ] && cp "$NETPLAN_FILE" "$NETPLAN_FILE.bak"
 
-    # Create new config if doesn't exist
     if [ ! -f "$NETPLAN_FILE" ]; then
         cat > "$NETPLAN_FILE" <<EOF
 network:
@@ -102,11 +106,9 @@ EOF
         # Check if interface exists in config
         if ! grep -q "$INTERFACE:" "$NETPLAN_FILE"; then
             # Add new interface config
-            cat >> "$NETPLAN_FILE" <<EOF
-    $INTERFACE:
-      dhcp4: true
-      mtu: $NEW_MTU
-EOF
+            echo "    $INTERFACE:" >> "$NETPLAN_FILE"
+            echo "      dhcp4: true" >> "$NETPLAN_FILE"
+            echo "      mtu: $NEW_MTU" >> "$NETPLAN_FILE"
         else
             # Update existing MTU
             if grep -q "mtu:" "$NETPLAN_FILE"; then
@@ -117,22 +119,13 @@ EOF
         fi
     fi
 
-    # Apply netplan changes
     if netplan apply; then
-        show_msg "MTU successfully set to $NEW_MTU (persistent after reboot)"
+        show_msg "MTU configuration saved persistently"
     else
         show_msg "ERROR: Failed to apply netplan changes. Restoring backup..."
         [ -f "$NETPLAN_FILE.bak" ] && mv "$NETPLAN_FILE.bak" "$NETPLAN_FILE"
         netplan apply
         return 1
-    fi
-    
-    # Verify MTU was actually changed
-    ACTUAL_MTU=$(cat /sys/class/net/$INTERFACE/mtu 2>/dev/null)
-    if [ "$ACTUAL_MTU" != "$NEW_MTU" ]; then
-        show_msg "WARNING: MTU shows as $ACTUAL_MTU but should be $NEW_MTU. Reboot may be needed."
-    else
-        show_msg "MTU successfully verified as $NEW_MTU"
     fi
 }
 
@@ -142,7 +135,7 @@ optimize_network() {
 
     case $MODE in
         "GAMING")
-            cat > $CONFIG_FILE <<'EOF'
+            cat > "$CONFIG_FILE" <<'EOF'
 # Ultra-Low Latency BBRv3 Configuration for Gaming
 net.core.default_qdisc=fq_pie
 net.ipv4.tcp_congestion_control=bbr
@@ -181,7 +174,7 @@ EOF
             ;;
 
         "STREAM")
-            cat > $CONFIG_FILE <<'EOF'
+            cat > "$CONFIG_FILE" <<'EOF'
 # High Throughput BBRv3 Configuration for Streaming
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
@@ -218,7 +211,7 @@ EOF
             ;;
 
         "BALANCED")
-            cat > $CONFIG_FILE <<'EOF'
+            cat > "$CONFIG_FILE" <<'EOF'
 # Balanced BBRv3 Configuration
 net.core.default_qdisc=fq_pie
 net.ipv4.tcp_congestion_control=bbr
@@ -256,14 +249,14 @@ EOF
             ;;
     esac
 
-    sysctl --system
+    sysctl --system >/dev/null 2>&1
     show_msg "$MODE Optimizations Successfully Applied"
 }
 
 show_status() {
     clear
     INTERFACE=$(ip route | grep default | awk '{print $5}' 2>/dev/null || echo "Unknown")
-    CURRENT_MTU=$(cat /sys/class/net/$INTERFACE/mtu 2>/dev/null || echo "Unknown")
+    CURRENT_MTU=$(cat /sys/class/net/"$INTERFACE"/mtu 2>/dev/null || echo "Unknown")
     
     echo "----------------------------------------"
     echo "Current Network Status:"
@@ -272,13 +265,13 @@ show_status() {
     echo "Queue Discipline: $(sysctl -n net.core.default_qdisc 2>/dev/null || echo "Unknown")"
     echo "Interface: $INTERFACE"
     echo "MTU: $CURRENT_MTU"
-    echo "DNS Servers: $(grep '^DNS=' $DNS_FILE 2>/dev/null | cut -d= -f2 || echo "Not configured")"
+    echo "DNS Servers: $(grep '^DNS=' "$DNS_FILE" 2>/dev/null | cut -d= -f2 || echo "Not configured")"
     echo "----------------------------------------"
-    read -p "Press Enter to continue..."
+    read -rp "Press Enter to continue..."
 }
 
 reboot_system() {
-    read -p "Are you sure you want to reboot? (y/n): " choice
+    read -rp "Are you sure you want to reboot? (y/n): " choice
     case "$choice" in
         y|Y) 
             show_msg "System will reboot in 5 seconds..."
@@ -307,7 +300,7 @@ main_menu() {
         echo "0) Exit"
         echo "========================================"
         
-        read -p "Select option [0-7]: " opt
+        read -rp "Select option [0-7]: " opt
         
         case $opt in
             1) set_dns ;;
