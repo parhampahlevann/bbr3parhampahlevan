@@ -4,8 +4,7 @@ set -e
 
 CONFIG_FILE="/etc/sysctl.d/99-bbrvipparham.conf"
 KERNEL_VERSION="6.6.8"  # Latest stable kernel version
-UBUNTU_URL="https://kernel.ubuntu.com/~kernel-ppa/mainline/v${KERNEL_VERSION}"
-KERNEL_ORG_URL="https://cdn.kernel.org/pub/linux/kernel/v6.x"
+BASE_URL="https://kernel.ubuntu.com/~kernel-ppa/mainline/v${KERNEL_VERSION}"
 
 check_root() {
   if [ "$EUID" -ne 0 ]; then
@@ -54,56 +53,60 @@ EOF
 
 download_kernel_packages() {
   local arch=$1
-  local files=()
+  echo "🔍 Detected architecture: $arch"
+
+  cd /tmp
+  rm -f *.deb  # Clean up any previous downloads
 
   if [[ "$arch" == "x86_64" ]]; then
-    files=(
-      "linux-headers-${KERNEL_VERSION}_${KERNEL_VERSION}.amd64.deb"
-      "linux-headers-${KERNEL_VERSION}-generic_${KERNEL_VERSION}.amd64.deb"
-      "linux-image-unsigned-${KERNEL_VERSION}-generic_${KERNEL_VERSION}.amd64.deb"
-      "linux-modules-${KERNEL_VERSION}-generic_${KERNEL_VERSION}.amd64.deb"
-    )
+    echo "📦 Downloading kernel packages for amd64..."
+    wget -c ${BASE_URL}/amd64/linux-headers-${KERNEL_VERSION}-generic_${KERNEL_VERSION}_amd64.deb
+    wget -c ${BASE_URL}/amd64/linux-headers-${KERNEL_VERSION}_${KERNEL_VERSION}_all.deb
+    wget -c ${BASE_URL}/amd64/linux-image-unsigned-${KERNEL_VERSION}-generic_${KERNEL_VERSION}_amd64.deb
+    wget -c ${BASE_URL}/amd64/linux-modules-${KERNEL_VERSION}-generic_${KERNEL_VERSION}_amd64.deb
   elif [[ "$arch" == "aarch64" ]]; then
-    files=(
-      "linux-headers-${KERNEL_VERSION}_${KERNEL_VERSION}.arm64.deb"
-      "linux-headers-${KERNEL_VERSION}-generic_${KERNEL_VERSION}.arm64.deb"
-      "linux-image-unsigned-${KERNEL_VERSION}-generic_${KERNEL_VERSION}.arm64.deb"
-      "linux-modules-${KERNEL_VERSION}-generic_${KERNEL_VERSION}.arm64.deb"
-    )
+    echo "📦 Downloading kernel packages for arm64..."
+    wget -c ${BASE_URL}/arm64/linux-headers-${KERNEL_VERSION}-generic_${KERNEL_VERSION}_arm64.deb
+    wget -c ${BASE_URL}/arm64/linux-headers-${KERNEL_VERSION}_${KERNEL_VERSION}_all.deb
+    wget -c ${BASE_URL}/arm64/linux-image-unsigned-${KERNEL_VERSION}-generic_${KERNEL_VERSION}_arm64.deb
+    wget -c ${BASE_URL}/arm64/linux-modules-${KERNEL_VERSION}-generic_${KERNEL_VERSION}_arm64.deb
   else
-    echo "⚠️ Unsupported architecture: $arch"
+    echo "❌ Unsupported architecture: $arch"
     exit 1
   fi
-
-  # Try multiple download sources
-  for file in "${files[@]}"; do
-    echo "Downloading: $file"
-    if ! wget -c --no-check-certificate "${UBUNTU_URL}/${arch}/${file}"; then
-      echo "Ubuntu server failed, trying kernel.org mirror..."
-      if ! wget -c "${KERNEL_ORG_URL}/${file}"; then
-        echo "❌ Failed to download kernel packages"
-        exit 1
-      fi
-    fi
-  done
 }
 
 upgrade_kernel() {
   echo "⬆️  Upgrading kernel to version ${KERNEL_VERSION}..."
-
-  cd /tmp
-  arch=$(uname -m)
   
+  # Check internet connection
+  if ! ping -c 1 kernel.ubuntu.com &> /dev/null; then
+    echo "❌ No internet connection or can't reach kernel.ubuntu.com"
+    exit 1
+  fi
+
+  arch=$(uname -m)
   download_kernel_packages "$arch"
 
-  # Install kernel packages
+  # Verify downloads
+  if ! ls *.deb &> /dev/null; then
+    echo "❌ Failed to download kernel packages. Possible reasons:"
+    echo "1. Kernel version ${KERNEL_VERSION} is no longer available"
+    echo "2. Network connectivity issues"
+    echo "3. Server is down"
+    echo ""
+    echo "Please check available versions at: https://kernel.ubuntu.com/~kernel-ppa/mainline/"
+    exit 1
+  fi
+
+  echo "🔧 Installing kernel packages..."
   dpkg -i *.deb || {
-    echo "⚠️ Error installing kernel packages, attempting dependency resolution..."
+    echo "⚠️ Running apt-get install -f to fix dependencies..."
     apt-get install -f -y
     dpkg -i *.deb
   }
 
-  echo "✅ Kernel ${KERNEL_VERSION} successfully installed. Please reboot your system."
+  echo "✅ Kernel ${KERNEL_VERSION} successfully installed. Please reboot."
 }
 
 uninstall_bbr3() {
@@ -131,12 +134,12 @@ reboot_now() {
 main_menu() {
   while true; do
     echo ""
-    echo "========= BBRv3 Optimizer by Parham Pahlevan ========="
-    echo "1) Install BBRv3 (auto kernel upgrade if needed)"
+    echo "========= BBRv3 Optimizer ========="
+    echo "1) Install BBRv3 (auto kernel upgrade)"
     echo "2) Uninstall and reset configuration"
     echo "3) Reboot system"
     echo "0) Exit"
-    echo "======================================================"
+    echo "=================================="
     read -rp "Please select an option [0-3]: " opt
 
     case "$opt" in
@@ -144,7 +147,6 @@ main_menu() {
         if check_kernel_version; then
           install_bbr3
         else
-          echo "⚠️ Your kernel version is outdated. Upgrading to ${KERNEL_VERSION}..."
           upgrade_kernel
         fi
         ;;
