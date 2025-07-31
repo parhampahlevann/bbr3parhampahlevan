@@ -13,12 +13,10 @@ check_root() {
 
 check_kernel_version() {
   local version
-  version=$(uname -r | cut -d '-' -f1)
-  local major=${version%%.*}
-  local minor=${version#*.}
-  minor=${minor%%.*}
+  version=$(uname -r | awk -F. '{print $1"."$2}')
+  local required="6.1"
 
-  if (( major > 6 )) || (( major == 6 && minor >= 1 )); then
+  if printf '%s\n' "$required" "$version" | sort -V -C; then
     return 0
   else
     return 1
@@ -57,26 +55,35 @@ upgrade_kernel() {
 
   cd /tmp
   arch=$(uname -m)
+  kernel_version="6.5.10"
 
   if [[ "$arch" == "x86_64" ]]; then
+    base_url="https://kernel.ubuntu.com/~kernel-ppa/mainline/v${kernel_version}/amd64"
     files=(
-      "linux-headers-6.5.10-060510-generic_6.5.10-060510.202310281035_amd64.deb"
-      "linux-headers-6.5.10-060510_6.5.10-060510.202310281035_all.deb"
-      "linux-image-unsigned-6.5.10-060510-generic_6.5.10-060510.202310281035_amd64.deb"
-      "linux-modules-6.5.10-060510-generic_6.5.10-060510.202310281035_amd64.deb"
+      "linux-headers-${kernel_version}-060510-generic_${kernel_version}-060510.202310281035_amd64.deb"
+      "linux-headers-${kernel_version}-060510_${kernel_version}-060510.202310281035_all.deb"
+      "linux-image-unsigned-${kernel_version}-060510-generic_${kernel_version}-060510.202310281035_amd64.deb"
+      "linux-modules-${kernel_version}-060510-generic_${kernel_version}-060510.202310281035_amd64.deb"
     )
-    base_url="https://kernel.ubuntu.com/~kernel-ppa/mainline/v6.5.10/amd64"
+  elif [[ "$arch" == "aarch64" ]]; then
+    base_url="https://kernel.ubuntu.com/~kernel-ppa/mainline/v${kernel_version}/arm64"
+    files=(
+      "linux-headers-${kernel_version}-060510-generic_${kernel_version}-060510.202310281035_arm64.deb"
+      "linux-headers-${kernel_version}-060510_${kernel_version}-060510.202310281035_all.deb"
+      "linux-image-unsigned-${kernel_version}-060510-generic_${kernel_version}-060510.202310281035_arm64.deb"
+      "linux-modules-${kernel_version}-060510-generic_${kernel_version}-060510.202310281035_arm64.deb"
+    )
   else
     echo "⚠️ Unsupported architecture: $arch"
     exit 1
   fi
 
   for file in "${files[@]}"; do
-    wget -c "$base_url/$file"
+    wget -c --no-check-certificate "$base_url/$file"
   done
 
   dpkg -i *.deb
-  echo "✅ Kernel 6.5 installed. Please reboot now to apply."
+  echo "✅ Kernel ${kernel_version} installed. Please reboot now to apply."
 }
 
 uninstall_bbr3() {
