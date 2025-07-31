@@ -5,11 +5,12 @@ set -e
 CONFIG_FILE="/etc/sysctl.d/99-bbrvipparham.conf"
 KERNEL_VERSION="6.6.8"  # Latest stable kernel version
 
-# Multiple download mirrors
+# Multiple download mirrors with different protocols
 MIRRORS=(
   "https://kernel.ubuntu.com/~kernel-ppa/mainline/v${KERNEL_VERSION}"
-  "https://mirrors.edge.kernel.org/pub/linux/kernel/v6.x"
-  "http://ftp.us.debian.org/debian/pool/main/l/linux/"
+  "http://mirrors.edge.kernel.org/pub/linux/kernel/v6.x"
+  "https://ftp.us.debian.org/debian/pool/main/l/linux/"
+  "http://archive.ubuntu.com/ubuntu/pool/main/l/linux/"
 )
 
 check_root() {
@@ -17,6 +18,37 @@ check_root() {
     echo "Please run as root (sudo bash $0)"
     exit 1
   fi
+}
+
+check_internet() {
+  echo "🌐 Checking internet connection..."
+  
+  # Try multiple connectivity tests
+  local test_urls=(
+    "google.com" 
+    "kernel.ubuntu.com"
+    "1.1.1.1"
+    "8.8.8.8"
+  )
+  
+  for url in "${test_urls[@]}"; do
+    if ping -c 1 -W 3 "$url" &> /dev/null; then
+      echo "✅ Network connectivity confirmed via $url"
+      return 0
+    fi
+  done
+  
+  # Last resort: check DNS resolution
+  if nslookup google.com &> /dev/null; then
+    echo "⚠️ Can ping local network but not internet. Checking DNS..."
+    return 0
+  fi
+  
+  echo "❌ No internet connection detected. Please check:"
+  echo "1. Network cables/WiFi connection"
+  echo "2. DNS settings (/etc/resolv.conf)"
+  echo "3. Firewall/proxy settings"
+  exit 1
 }
 
 check_kernel_version() {
@@ -63,7 +95,14 @@ download_with_fallback() {
   local mirror
   
   for mirror in "${MIRRORS[@]}"; do
-    if wget -c --no-check-certificate "${mirror}/${url}" -O "$file"; then
+    echo "🔍 Trying mirror: $mirror"
+    
+    # Try both wget and curl with different options
+    if wget --no-check-certificate --tries=3 --timeout=30 "${mirror}/${url}" -O "$file"; then
+      return 0
+    fi
+    
+    if curl --insecure --retry 3 --connect-timeout 30 -L "${mirror}/${url}" -o "$file"; then
       return 0
     fi
   done
@@ -100,7 +139,11 @@ download_kernel_packages() {
   for pkg in "${!packages[@]}"; do
     echo "📦 Downloading ${pkg} package..."
     if ! download_with_fallback "${packages[$pkg]}" "${pkg}.deb"; then
-      echo "❌ Failed to download ${pkg} package from all mirrors"
+      echo "❌ Critical: Failed to download ${pkg} package from all mirrors"
+      echo "Possible solutions:"
+      echo "1. Check internet connection"
+      echo "2. Try again later (mirrors might be down)"
+      echo "3. Manually download from: https://kernel.ubuntu.com/~kernel-ppa/mainline/"
       exit 1
     fi
   done
@@ -109,11 +152,7 @@ download_kernel_packages() {
 upgrade_kernel() {
   echo "⬆️  Upgrading kernel to version ${KERNEL_VERSION}..."
   
-  # Check internet connection
-  if ! ping -c 1 kernel.ubuntu.com &> /dev/null && ! ping -c 1 google.com &> /dev/null; then
-    echo "❌ No internet connection detected"
-    exit 1
-  fi
+  check_internet  # Verify connectivity before proceeding
 
   arch=$(uname -m)
   download_kernel_packages "$arch"
@@ -121,11 +160,29 @@ upgrade_kernel() {
   echo "🔧 Installing kernel packages..."
   if ! dpkg -i *.deb; then
     echo "⚠️ Attempting to fix dependencies..."
-    apt-get update
-    apt-get install -f -y
+    apt-get update || {
+      echo "❌ Failed to update package lists"
+      echo "Trying alternative mirrors..."
+      rm -f /var/lib/apt/lists/*
+      apt-get update
+    }
+    
+    apt-get install -f -y || {
+      echo "❌ Failed to fix dependencies"
+      echo "Trying alternative approach..."
+      apt-get --fix-broken install -y
+    }
+    
     if ! dpkg -i *.deb; then
-      echo "❌ Failed to install kernel packages"
-      exit 1
+      echo "❌ Critical: Failed to install kernel packages"
+      echo "Last resort: Trying to install dependencies manually..."
+      apt-get install linux-base linux-image-generic linux-headers-generic -y
+      dpkg -i *.deb || {
+        echo "💀 Complete installation failure. Please report this issue with:"
+        echo "1. Your OS version (lsb_release -a)"
+        echo "2. Kernel version (uname -a)"
+        exit 1
+      }
     fi
   fi
 
@@ -149,7 +206,7 @@ reboot_now() {
       reboot
       ;;
     *)
-      echo "Reboot cancelled."
+      echo "Reboot cancelled. Remember to reboot later for changes to take effect."
       ;;
   esac
 }
@@ -161,9 +218,10 @@ main_menu() {
     echo "1) Install BBRv3 (auto kernel upgrade)"
     echo "2) Uninstall and reset configuration"
     echo "3) Reboot system"
+    echo "4) Check internet connection"
     echo "0) Exit"
     echo "==========================================="
-    read -rp "Please select an option [0-3]: " opt
+    read -rp "Please select an option [0-4]: " opt
 
     case "$opt" in
       1)
@@ -179,6 +237,9 @@ main_menu() {
       3)
         reboot_now
         ;;
+      4)
+        check_internet
+        ;;
       0)
         echo "Exiting..."
         exit 0
@@ -190,5 +251,7 @@ main_menu() {
   done
 }
 
+# Main execution
 check_root
+check_internet
 main_menu
