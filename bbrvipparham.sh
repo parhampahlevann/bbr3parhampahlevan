@@ -4,43 +4,40 @@ set -e
 
 CONFIG_FILE="/etc/sysctl.d/99-bbrvipparham.conf"
 
-# Ensure script is run as root
+# Check root permission
 if [ "$EUID" -ne 0 ]; then
-  echo "Please run this script as root (use: sudo bash bbrvipparham.sh)"
+  echo "Please run as root (sudo bash bbrvipparham.sh)"
   exit 1
 fi
 
-# Check required tools
-for cmd in curl uname sysctl; do
+# Check required commands
+for cmd in curl uname sysctl lsb_release; do
   if ! command -v $cmd &>/dev/null; then
-    echo "Missing required command: $cmd. Please install it first."
+    echo "Command $cmd not found. Please install it first."
     exit 1
   fi
 done
 
-# Detect architecture and Ubuntu version
 arch=$(uname -m)
-ubuntu_version=$(lsb_release -rs 2>/dev/null || grep -oP 'VERSION_ID="\K[^"]+' /etc/os-release)
+ubuntu_version=$(lsb_release -rs)
 kernel_version=$(uname -r | cut -d '-' -f1)
 major=$(echo "$kernel_version" | cut -d '.' -f1)
 minor=$(echo "$kernel_version" | cut -d '.' -f2)
 
-echo "Detected Architecture: $arch"
-echo "Ubuntu Version: $ubuntu_version"
-echo "Kernel Version: $kernel_version"
+echo "Architecture: $arch"
+echo "Ubuntu version: $ubuntu_version"
+echo "Kernel version: $kernel_version"
 
-# Check kernel version compatibility
 if [ "$major" -lt 6 ] || { [ "$major" -eq 6 ] && [ "$minor" -lt 1 ]; }; then
-  echo "Kernel does not support BBRv3. You must upgrade to 6.1 or newer."
+  echo "Kernel version is less than 6.1, BBRv3 is not supported."
   exit 1
 fi
 
-# Function to install BBR3
 install_bbr3() {
-  echo "Installing BBRv3 and optimizing TCP performance..."
+  echo "Installing BBRv3 and applying optimizations..."
 
   cat > "$CONFIG_FILE" <<EOF
-# BBRv3 Optimized Settings by Parham Pahlevan
+# BBRv3 optimized sysctl settings by Parham Pahlevan
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.core.rmem_max = 67108864
@@ -60,39 +57,40 @@ net.ipv4.tcp_keepalive_probes = 5
 EOF
 
   sysctl --system
-  echo ""
-  echo "BBRv3 has been installed and optimized successfully."
+
+  echo "BBRv3 installed and sysctl settings applied."
   sysctl net.ipv4.tcp_congestion_control
 }
 
-# Function to uninstall
 uninstall_bbr3() {
-  echo "Removing BBRv3 settings..."
+  echo "Removing BBRv3 settings and restoring defaults..."
+
   rm -f "$CONFIG_FILE"
+
   sysctl -w net.core.default_qdisc=cake >/dev/null 2>&1 || true
   sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
+
   sysctl --system
-  echo "System settings reverted to default."
+
+  echo "Defaults restored."
 }
 
-# Function to reboot
 reboot_system() {
   echo "Rebooting system..."
   reboot
 }
 
-# Main menu
 while true; do
   echo ""
-  echo "============ BBRv3 Optimizer by Parham Pahlevan ============"
+  echo "========== BBRv3 Optimizer by Parham Pahlevan =========="
   echo "1) Install BBR3 (TCP Optimizer)"
   echo "2) Uninstall and Reset Settings"
   echo "3) Reboot System"
   echo "0) Exit"
-  echo "============================================================="
-  read -p "Choose an option [0-3]: " choice
+  echo "======================================================="
+  read -rp "Choose an option [0-3]: " choice
 
-  case $choice in
+  case "$choice" in
     1)
       install_bbr3
       ;;
@@ -103,11 +101,11 @@ while true; do
       reboot_system
       ;;
     0)
-      echo "Exiting script."
+      echo "Exiting."
       exit 0
       ;;
     *)
-      echo "Invalid choice. Please enter 0 to 3."
+      echo "Invalid option, please enter 0-3."
       ;;
   esac
 done
