@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# Ultimate BBRv3 Optimizer Script
+# Supports Gaming, Streaming, Balanced, and Professional TCP MUX modes
+# Created by Network Optimization Experts
+
 # Configuration Files
 CONFIG_FILE="/etc/sysctl.d/99-bbrvipparham.conf"
 DNS_FILE="/etc/systemd/resolved.conf.d/dns.conf"
@@ -22,14 +26,16 @@ set_dns() {
     echo "1) Cloudflare (1.1.1.1) - Best for Gaming"
     echo "2) Google (8.8.8.8) - Balanced"
     echo "3) OpenDNS (208.67.222.222) - Secure"
-    echo "4) Custom"
-    read -p "Choose [1-4]: " choice
+    echo "4) Quad9 (9.9.9.9) - Privacy Focused"
+    echo "5) Custom"
+    read -p "Choose [1-5]: " choice
     
     case $choice in
         1) DNS="1.1.1.1 1.0.0.1" ;;
         2) DNS="8.8.8.8 8.8.4.4" ;;
         3) DNS="208.67.222.222 208.67.220.220" ;;
-        4) read -p "Enter DNS servers (space separated): " DNS ;;
+        4) DNS="9.9.9.9 149.112.112.112" ;;
+        5) read -p "Enter DNS servers (space separated): " DNS ;;
         *) show_msg "Invalid choice"; return ;;
     esac
 
@@ -247,6 +253,58 @@ net.core.somaxconn=49152
 net.ipv4.tcp_max_syn_backlog=12288
 EOF
             ;;
+
+        "MUX")
+            cat > "$CONFIG_FILE" <<'EOF'
+# Professional TCP MUX Configuration with BBRv3
+net.core.default_qdisc=fq_pie
+net.ipv4.tcp_congestion_control=bbr
+
+# Advanced Multiplexing settings
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_tw_recycle=1
+net.ipv4.tcp_fin_timeout=5
+net.ipv4.tcp_max_tw_buckets=262144
+net.ipv4.tcp_max_orphans=262144
+net.ipv4.tcp_orphan_retries=2
+
+# Advanced congestion control for MUX
+net.ipv4.tcp_notsent_lowat=16384
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_autocorking=1
+net.ipv4.tcp_limit_output_bytes=262144
+
+# Buffer settings for MUX
+net.core.rmem_max=33554432
+net.core.wmem_max=33554432
+net.ipv4.tcp_rmem=4096 87380 33554432
+net.ipv4.tcp_wmem=4096 65536 33554432
+net.ipv4.tcp_mem=786432 1048576 1572864
+
+# Advanced queue and connection settings
+net.core.netdev_max_backlog=200000
+net.core.somaxconn=65536
+net.ipv4.tcp_max_syn_backlog=32768
+net.ipv4.tcp_syncookies=1
+net.ipv4.tcp_syn_retries=2
+net.ipv4.tcp_synack_retries=2
+
+# Keepalive settings for stable connections
+net.ipv4.tcp_keepalive_time=300
+net.ipv4.tcp_keepalive_probes=5
+net.ipv4.tcp_keepalive_intvl=15
+
+# Special Multiplexing settings
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_window_scaling=1
+net.ipv4.tcp_timestamps=1
+net.ipv4.tcp_sack=1
+net.ipv4.tcp_dsack=1
+net.ipv4.tcp_fack=1
+net.ipv4.tcp_ecn=1
+EOF
+            ;;
     esac
 
     sysctl --system >/dev/null 2>&1
@@ -267,6 +325,17 @@ show_status() {
     echo "MTU: $CURRENT_MTU"
     echo "DNS Servers: $(grep '^DNS=' "$DNS_FILE" 2>/dev/null | cut -d= -f2 || echo "Not configured")"
     echo "----------------------------------------"
+    
+    # Show additional TCP MUX settings if enabled
+    if grep -q "tcp_tw_reuse=1" "$CONFIG_FILE" 2>/dev/null; then
+        echo "TCP MUX Features:"
+        echo "TIME-WAIT Reuse: Enabled"
+        echo "Max TW Buckets: $(sysctl -n net.ipv4.tcp_max_tw_buckets 2>/dev/null || echo "Unknown")"
+        echo "Max Orphans: $(sysctl -n net.ipv4.tcp_max_orphans 2>/dev/null || echo "Unknown")"
+        echo "Autocorking: $(sysctl -n net.ipv4.tcp_autocorking 2>/dev/null || echo "Unknown")"
+        echo "----------------------------------------"
+    fi
+    
     read -rp "Press Enter to continue..."
 }
 
@@ -288,19 +357,20 @@ main_menu() {
     while true; do
         clear
         echo "========================================"
-        echo " Ultimate BBRv3 Optimizer for Gaming/Streaming"
+        echo " Ultimate BBRv3 Optimizer"
         echo "========================================"
         echo "1) Set DNS Servers"
         echo "2) Set MTU"
         echo "3) Optimize for Gaming (Ultra-Low Latency)"
         echo "4) Optimize for Streaming (High Throughput)"
         echo "5) Balanced Optimization"
-        echo "6) Show Current Settings"
-        echo "7) Reboot System"
+        echo "6) Professional TCP MUX Optimization"
+        echo "7) Show Current Settings"
+        echo "8) Reboot System"
         echo "0) Exit"
         echo "========================================"
         
-        read -rp "Select option [0-7]: " opt
+        read -rp "Select option [0-8]: " opt
         
         case $opt in
             1) set_dns ;;
@@ -308,8 +378,9 @@ main_menu() {
             3) optimize_network "GAMING" ;;
             4) optimize_network "STREAM" ;;
             5) optimize_network "BALANCED" ;;
-            6) show_status ;;
-            7) reboot_system ;;
+            6) optimize_network "MUX" ;;
+            7) show_status ;;
+            8) reboot_system ;;
             0) exit 0 ;;
             *)
                 show_msg "Invalid option"
