@@ -22,137 +22,111 @@ check_root() {
   fi
 }
 
-safe_reboot() {
-  echo -e "${YELLOW}⚠️ Creating safe restore point...${NC}"
-  mkdir -p /root/network_backup
-  cp "$CONFIG_FILE" /root/network_backup/ 2>/dev/null || true
-  cp "$DNS_CONFIG" /root/network_backup/ 2>/dev/null || true
-  cp -r "$NETPLAN_DIR" /root/network_backup/netplan/ 2>/dev/null || true
-  cp "$GRUB_CONFIG" /root/network_backup/ 2>/dev/null || true
+fix_netplan() {
+  echo -e "${YELLOW}🔧 Fixing Netplan configuration...${NC}"
   
-  cat > /root/network_backup/restore_network.sh <<'EOF'
-#!/bin/bash
-set -e
-echo "Restoring network settings..."
-cp -f /root/network_backup/*.conf /etc/sysctl.d/ || true
-cp -f /root/network_backup/dns.conf /etc/systemd/resolved.conf.d/ || true
-cp -f /root/network_backup/grub /etc/default/ || true
-rm -rf /etc/netplan/*
-cp -f /root/network_backup/netplan/* /etc/netplan/ || true
-sysctl --system
-update-grub
-netplan apply
-systemctl restart systemd-resolved
-echo "✅ Network restored!"
+  # Backup existing netplan files
+  mkdir -p /root/netplan_backup
+  cp ${NETPLAN_DIR}*.yaml /root/netplan_backup/ 2>/dev/null || true
+  
+  # Disable cloud-init network config if exists
+  if [ -f "/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg" ]; then
+    echo "network: {config: disabled}" > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+  fi
+
+  # Create clean netplan config for Hetzner
+  cat > "${NETPLAN_DIR}01-netcfg.yaml" <<'EOF'
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    eth0:
+      dhcp4: true
+      dhcp6: false
+      optional: true
 EOF
-  chmod +x /root/network_backup/restore_network.sh
-  echo -e "${GREEN}✅ Restore point created at /root/network_backup${NC}"
+
+  # Apply netplan
+  if netplan generate && netplan apply; then
+    echo -e "${GREEN}✅ Netplan configuration fixed successfully${NC}"
+  else
+    echo -e "${RED}❌ Failed to fix netplan configuration${NC}"
+    return 1
+  fi
 }
 
-detect_interface() {
-  local iface
-  for iface in eth0 enp ens; do
-    if ip link show | grep -q "$iface"; then
-      INTERFACE=$(ip link show | grep "$iface" | head -1 | awk -F': ' '{print $2}')
-      break
-    fi
-  done
-
-  if [ -z "$INTERFACE" ]; then
-    INTERFACE=$(ip route | grep default | awk '{print $5}' | head -1)
+fix_openvswitch() {
+  echo -e "${YELLOW}🔧 Checking Open vSwitch...${NC}"
+  
+  if systemctl is-active --quiet ovsdb-server.service; then
+    echo -e "${BLUE}ℹ️ Open vSwitch is running, no changes needed${NC}"
+    return
   fi
 
-  if [ -z "$INTERFACE" ] || ! ip link show "$INTERFACE" &>/dev/null; then
-    echo -e "${RED}❌ Interface detection failed!${NC}"
-    echo -e "${BLUE}Available interfaces:${NC}"
-    ip -o link show | awk -F': ' '{print $2}'
-    exit 1
+  # Disable openvswitch if not needed
+  if dpkg -l | grep -q openvswitch; then
+    echo -e "${YELLOW}⚠️ Open vSwitch is installed but not running${NC}"
+    read -p "Disable Open vSwitch? (y/N): " choice
+    case "$choice" in
+      y|Y)
+        systemctl stop ovsdb-server.service
+        systemctl disable ovsdb-server.service
+        echo -e "${GREEN}✅ Open vSwitch disabled${NC}"
+        ;;
+      *)
+        echo -e "${BLUE}ℹ️ Keeping Open vSwitch configuration${NC}"
+        ;;
+    esac
   fi
-  echo "$INTERFACE"
 }
 
 optimize_gaming() {
   echo -e "${GREEN}🎮 Applying Gaming/Streaming Optimizations...${NC}"
 
   cat > "$CONFIG_FILE" <<'EOF'
-# Ultimate Gaming/Streaming BBRv3 Configuration
+# Gaming Optimized BBRv3 Configuration
 net.core.default_qdisc = fq_pie
 net.ipv4.tcp_congestion_control = bbr
 
-# Gaming-Optimized Buffers
+# Network Buffers
 net.core.rmem_max = 33554432
 net.core.wmem_max = 33554432
 net.ipv4.tcp_rmem = 4096 87380 33554432
 net.ipv4.tcp_wmem = 4096 65536 33554432
-net.ipv4.udp_rmem_min = 8192
-net.ipv4.udp_wmem_min = 8192
 
-# Low-Latency Tweaks
+# Latency Reduction
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_low_latency = 1
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_workaround_signed_windows = 1
-
-# Gaming/Streaming Specific
-net.ipv4.tcp_ecn = 2
-net.ipv4.tcp_frto = 2
-net.ipv4.tcp_rfc1337 = 1
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_dsack = 1
-net.ipv4.tcp_fack = 1
 
 # Connection Stability
 net.ipv4.tcp_syn_retries = 3
 net.ipv4.tcp_synack_retries = 3
-net.ipv4.tcp_retries2 = 8
 net.ipv4.tcp_fin_timeout = 10
-
-# Queue Management
-net.core.netdev_max_backlog = 50000
-net.core.somaxconn = 32768
-net.ipv4.tcp_max_syn_backlog = 8192
-net.ipv4.tcp_max_tw_buckets = 2000000
-
-# IPv6 Optimizations
-net.ipv6.conf.all.optimize_dst_addr = 1
 EOF
 
-  # Apply settings
   sysctl --system
-  
-  # Enable BBRv3 module
-  echo "tcp_bbr" | tee /etc/modules-load.d/bbr.conf
-  modprobe tcp_bbr
-
-  # Update GRUB for kernel parameters
-  if ! grep -q "tcp_congestion_control=bbr" "$GRUB_CONFIG"; then
-    sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet splash tcp_congestion_control=bbr"/' "$GRUB_CONFIG"
-    update-grub
-  fi
-
-  echo -e "${GREEN}✅ Gaming/Streaming Optimizations Applied!${NC}"
+  echo -e "${GREEN}✅ Gaming Optimizations Applied${NC}"
 }
 
-set_mtu_gaming() {
-  INTERFACE=$(detect_interface)
+set_mtu() {
+  INTERFACE=$(ip -o link show | awk -F': ' '{print $2}' | grep -v lo | head -1)
   CURRENT_MTU=$(cat /sys/class/net/$INTERFACE/mtu 2>/dev/null || echo "1500")
   
   echo -e "\n${YELLOW}📦 Current MTU on $INTERFACE: $CURRENT_MTU${NC}"
-  echo -e "${BLUE}Recommended for Gaming:${NC}"
-  echo -e "1) Ethernet (1500) - Default"
-  echo -e "2) Cloud Gaming (1420)"
-  echo -e "3) Low-Latency (1450)"
+  echo -e "${BLUE}Recommended values:${NC}"
+  echo -e "1) Default (1500)"
+  echo -e "2) Cloud (1450)"
+  echo -e "3) Gaming (1420)"
   echo -e "4) Custom value"
   
   read -rp "Select MTU option [1-4]: " mtu_opt
   
   case $mtu_opt in
     1) NEW_MTU=1500 ;;
-    2) NEW_MTU=1420 ;;
-    3) NEW_MTU=1450 ;;
+    2) NEW_MTU=1450 ;;
+    3) NEW_MTU=1420 ;;
     4) 
       while true; do
         read -rp "Enter MTU (576-1500): " NEW_MTU
@@ -171,11 +145,16 @@ set_mtu_gaming() {
   # Temporary change
   ip link set dev "$INTERFACE" mtu "$NEW_MTU"
   
-  # Persistent change (Hetzner compatible)
+  # Persistent change in netplan
   if [ -d "$NETPLAN_DIR" ]; then
-    NETPLAN_FILE=$(ls $NETPLAN_DIR/*.yaml 2>/dev/null | head -1)
-    if [ -z "$NETPLAN_FILE" ]; then
-      NETPLAN_FILE="$NETPLAN_DIR/01-netcfg.yaml"
+    NETPLAN_FILE="${NETPLAN_DIR}01-netcfg.yaml"
+    if [ -f "$NETPLAN_FILE" ]; then
+      if grep -q "mtu" "$NETPLAN_FILE"; then
+        sed -i "s/mtu:.*/mtu: $NEW_MTU/" "$NETPLAN_FILE"
+      else
+        sed -i "/$INTERFACE:/a \      mtu: $NEW_MTU" "$NETPLAN_FILE"
+      fi
+    else
       cat > "$NETPLAN_FILE" <<EOF
 network:
   version: 2
@@ -185,88 +164,55 @@ network:
       dhcp4: true
       mtu: $NEW_MTU
 EOF
-    else
-      if grep -q "$INTERFACE" "$NETPLAN_FILE"; then
-        if grep -q "mtu" "$NETPLAN_FILE"; then
-          sed -i "/$INTERFACE:/,/mtu:/ s/mtu:.*/mtu: $NEW_MTU/" "$NETPLAN_FILE"
-        else
-          sed -i "/$INTERFACE:/a \      mtu: $NEW_MTU" "$NETPLAN_FILE"
-        fi
-      else
-        sed -i "/version:/a \  ethernets:\n    $INTERFACE:\n      dhcp4: true\n      mtu: $NEW_MTU" "$NETPLAN_FILE"
-      fi
     fi
     
-    # Validate Netplan config
-    if netplan generate; then
-      netplan apply
+    # Apply netplan
+    if netplan generate && netplan apply; then
+      echo -e "${GREEN}✅ MTU set to $NEW_MTU on $INTERFACE${NC}"
     else
-      echo -e "${RED}❌ Invalid Netplan config! Reverting...${NC}"
-      rm -f "$NETPLAN_FILE"
-      netplan apply
+      echo -e "${RED}❌ Failed to apply MTU via netplan${NC}"
       return 1
     fi
   fi
-
-  # Verify MTU
-  ACTUAL_MTU=$(cat /sys/class/net/$INTERFACE/mtu 2>/dev/null || echo "0")
-  if [ "$ACTUAL_MTU" -eq "$NEW_MTU" ]; then
-    echo -e "${GREEN}✅ MTU set to $NEW_MTU on $INTERFACE${NC}"
-  else
-    echo -e "${RED}❌ MTU setting failed! Current: $ACTUAL_MTU${NC}"
-  fi
-}
-
-show_status() {
-  echo -e "\n${GREEN}📊 Current Network Status:${NC}"
-  echo -e "${BLUE}--------------------------------${NC}"
-  echo -e "Interface: $(detect_interface)"
-  echo -e "IPv4 Address: $(ip -4 addr show $(detect_interface) | grep -oP '(?<=inet\s)\d+(\.\d+){3}')"
-  echo -e "MTU: $(cat /sys/class/net/$(detect_interface)/mtu 2>/dev/null || echo "Unknown")"
-  echo -e "BBR Status: $(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')"
-  echo -e "Queue Discipline: $(sysctl net.core.default_qdisc 2>/dev/null | awk '{print $3}')"
-  echo -e "TCP Rmem: $(sysctl net.ipv4.tcp_rmem | awk '{print $3" "$4" "$5}')"
-  echo -e "TCP Wmem: $(sysctl net.ipv4.tcp_wmem | awk '{print $3" "$4" "$5}')"
-  echo -e "${BLUE}--------------------------------${NC}"
-  echo -e "${YELLOW}Run 'ping -c 5 google.com' to test latency${NC}"
-  read -rp "Press Enter to continue..."
 }
 
 main_menu() {
   while true; do
     clear
     echo -e "${YELLOW}==============================================${NC}"
-    echo -e "${GREEN} Ultimate Gaming/Streaming Network Optimizer ${NC}"
+    echo -e "${GREEN} Advanced Network Optimizer for Hetzner ${NC}"
     echo -e "${YELLOW}==============================================${NC}"
-    echo -e "1) Apply ${GREEN}Gaming Optimizations${NC} (BBRv3+Tweaks)"
-    echo -e "2) Set ${BLUE}Gaming MTU${NC} (Low-Latency)"
-    echo -e "3) Create ${YELLOW}Restore Point${NC}"
-    echo -e "4) View ${GREEN}Current Settings${NC}"
-    echo -e "5) ${RED}Restore Network${NC} (From Backup)"
+    echo -e "1) Fix Netplan & Open vSwitch Issues"
+    echo -e "2) Apply Gaming Optimizations"
+    echo -e "3) Set Gaming MTU"
+    echo -e "4) View Current Settings"
     echo -e "0) Exit"
     echo -e "${YELLOW}==============================================${NC}"
     
-    read -rp "Select option [0-5]: " opt
+    read -rp "Select option [0-4]: " opt
     
     case $opt in
-      1) optimize_gaming ;;
-      2) set_mtu_gaming ;;
-      3) safe_reboot ;;
-      4) show_status ;;
-      5)
-        if [ -f "/root/network_backup/restore_network.sh" ]; then
-          /root/network_backup/restore_network.sh
-        else
-          echo -e "${RED}❌ No backup found!${NC}"
-        fi
-        sleep 3
+      1)
+        fix_netplan
+        fix_openvswitch
         ;;
-      0) 
+      2) optimize_gaming ;;
+      3) set_mtu ;;
+      4)
+        echo -e "\n${GREEN}📊 Current Network Settings:${NC}"
+        ip a
+        echo -e "\n${BLUE}BBR Status:${NC}"
+        sysctl net.ipv4.tcp_congestion_control
+        echo -e "\n${BLUE}MTU:${NC}"
+        ip link show | grep mtu
+        read -rp "Press Enter to continue..."
+        ;;
+      0)
         echo -e "${GREEN}Exiting...${NC}"
         exit 0
         ;;
       *)
-        echo -e "${RED}Invalid option!${NC}"
+        echo -e "${RED}Invalid option${NC}"
         sleep 1
         ;;
     esac
@@ -275,5 +221,4 @@ main_menu() {
 
 # Initial checks
 check_root
-safe_reboot
 main_menu
