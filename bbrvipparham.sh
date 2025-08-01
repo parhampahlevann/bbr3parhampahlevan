@@ -1,8 +1,9 @@
 #!/bin/bash
 
-# Ultimate BBR Optimizer Script (Updated for VPN with BBRv2/BBRv3)
+# Ultimate BBR Optimizer Script (VPN Edition with BBRv2/BBRv3)
 # Supports Gaming, Streaming, Balanced, Professional TCP MUX, and BBRv3 modes
-# Optimized for VPN environments by Grok Analysis
+# Optimized for VPN environments with enhanced MTU and status handling
+# Created by Grok Analysis
 
 # Configuration Files
 CONFIG_FILE="/etc/sysctl.d/99-bbrvipparham.conf"
@@ -38,7 +39,7 @@ check_bbr_support() {
         }
     fi
 
-    show_msg "BBR module loaded. Note: BBRv3 requires custom kernel; using BBRv2 if unavailable."
+    show_msg "BBR module loaded. Note: BBRv3 requires custom kernel; falling back to BBRv2 if unavailable."
 }
 
 set_dns() {
@@ -66,8 +67,12 @@ set_dns() {
 
     mkdir -p /etc/systemd/resolved.conf.d
     echo -e "[Resolve]\nDNS=$DNS\nDNSSEC=$DNSSEC" > "$DNS_FILE"
-    systemctl restart systemd-resolved
-    show_msg "DNS set to: $DNS (DNSSEC: $DNSSEC)"
+    if systemctl restart systemd-resolved >/dev/null 2>&1; then
+        show_msg "DNS set to: $DNS (DNSSEC: $DNSSEC)"
+    else
+        show_msg "ERROR: Failed to restart systemd-resolved"
+        return 1
+    fi
 }
 
 set_mtu() {
@@ -77,21 +82,25 @@ set_mtu() {
         return 1
     fi
     
-    CURRENT_MTU=$(cat /sys/class/net/"$INTERFACE"/mtu 2>/dev/null || echo "1500")
+    CURRENT_MTU=$(ip link show "$INTERFACE" 2>/dev/null | grep -o 'mtu [0-9]*' | awk '{print $2}' || echo "Unknown")
+    [ "$CURRENT_MTU" = "Unknown" ] && {
+        show_msg "ERROR: Could not retrieve current MTU for $INTERFACE"
+        return 1
+    }
     
     show_msg "Current MTU on $INTERFACE: $CURRENT_MTU"
     echo "Recommended values for VPN:"
     echo "1) Default (1500) - General use"
-    echo "2) VPN/Cloud (1420) - Common for VPNs"
-    echo "3) Gaming/VPN (1380) - Low latency with VPN overhead"
+    echo "2) VPN/Cloud (1380) - Common for VPNs"
+    echo "3) Gaming/VPN (1350) - Low latency with VPN overhead"
     echo "4) Custom"
     
     while true; do
         read -rp "Select option [1-4]: " mtu_opt
         case $mtu_opt in
             1) NEW_MTU=1500; break ;;
-            2) NEW_MTU=1420; break ;;
-            3) NEW_MTU=1380; break ;;
+            2) NEW_MTU=1380; break ;;
+            3) NEW_MTU=1350; break ;;
             4) 
                 while true; do
                     read -rp "Enter MTU value (576-9000): " NEW_MTU
@@ -106,7 +115,7 @@ set_mtu() {
         esac
     done
 
-    # Check if MTU is supported by interface
+    # Test MTU support
     show_msg "Testing MTU $NEW_MTU on $INTERFACE..."
     if ! ip link set dev "$INTERFACE" mtu "$NEW_MTU" >/dev/null 2>&1; then
         show_msg "ERROR: MTU $NEW_MTU not supported by $INTERFACE. Reverting to $CURRENT_MTU."
@@ -119,7 +128,7 @@ set_mtu() {
     if ping -c 1 -s $((NEW_MTU - 28)) -M do "$TEST_IP" >/dev/null 2>&1; then
         show_msg "MTU test passed"
     else
-        show_msg "WARNING: MTU $NEW_MTU may cause fragmentation. Consider a lower value."
+        show_msg "WARNING: MTU $NEW_MTU may cause fragmentation. Reverting to $CURRENT_MTU."
         ip link set dev "$INTERFACE" mtu "$CURRENT_MTU"
         return 1
     fi
@@ -129,11 +138,8 @@ set_mtu() {
     NETPLAN_FILE=$(find "$NETPLAN_DIR" -name "*.yaml" -o -name "*.yml" | head -n 1)
     [ -z "$NETPLAN_FILE" ] && NETPLAN_FILE="$NETPLAN_DIR/01-netcfg.yaml"
 
-    # Create backup
-    [ -f "$NETPLAN_FILE" ] && cp "$NETPLAN_FILE" "$NETPLAN_FILE.bak"
-
-    if [ ! -f "$NETPLAN_FILE" ]; then
-        cat > "$NETPLAN_FILE" <<EOF
+    # Validate YAML format
+    NETPLAN_CONTENT=$(cat <<EOF
 network:
   version: 2
   renderer: networkd
@@ -142,11 +148,11 @@ network:
       dhcp4: true
       mtu: $NEW_MTU
 EOF
-    else
+)
+    if [ -f "$NETPLAN_FILE" ]; then
+        cp "$NETPLAN_FILE" "$NETPLAN_FILE.bak"
         if ! grep -q "$INTERFACE:" "$NETPLAN_FILE"; then
-            echo "    $INTERFACE:" >> "$NETPLAN_FILE"
-            echo "      dhcp4: true" >> "$NETPLAN_FILE"
-            echo "      mtu: $NEW_MTU" >> "$NETPLAN_FILE"
+            echo "$NETPLAN_CONTENT" >> "$NETPLAN_FILE"
         else
             if grep -q "mtu:" "$NETPLAN_FILE"; then
                 sed -i "/$INTERFACE:/,/mtu:/s/mtu:.*/mtu: $NEW_MTU/" "$NETPLAN_FILE"
@@ -154,14 +160,18 @@ EOF
                 sed -i "/$INTERFACE:/a \      mtu: $NEW_MTU" "$NETPLAN_FILE"
             fi
         fi
+    else
+        echo "$NETPLAN_CONTENT" > "$NETPLAN_FILE"
     fi
 
-    if netplan apply >/dev/null 2>&1; then
+    # Validate and apply netplan
+    if netplan try --timeout 30 >/dev/null 2>&1; then
         show_msg "MTU $NEW_MTU applied and saved persistently"
     else
         show_msg "ERROR: Failed to apply netplan changes. Restoring backup..."
         [ -f "$NETPLAN_FILE.bak" ] && mv "$NETPLAN_FILE.bak" "$NETPLAN_FILE"
-        netplan apply
+        netplan apply >/dev/null 2>&1
+        ip link set dev "$INTERFACE" mtu "$CURRENT_MTU"
         return 1
     fi
 }
@@ -176,7 +186,7 @@ optimize_network() {
 # Ultra-Low Latency BBR Configuration for Gaming (VPN Optimized)
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
-net.ipv4.tcp_notsent_lowat=16384
+net.ipv4.tcp_notsent_lowat=8192
 net.ipv4.tcp_fastopen=3
 net.ipv4.tcp_timestamps=1
 net.ipv4.tcp_window_scaling=1
@@ -187,25 +197,25 @@ net.ipv4.tcp_low_latency=1
 net.ipv4.tcp_slow_start_after_idle=0
 net.ipv4.tcp_mtu_probing=1
 
-# Buffer settings for low latency
-net.core.rmem_max=8388608
-net.core.wmem_max=8388608
-net.ipv4.tcp_rmem=4096 87380 8388608
-net.ipv4.tcp_wmem=4096 65536 8388608
+# Buffer settings for minimal latency
+net.core.rmem_max=4194304
+net.core.wmem_max=4194304
+net.ipv4.tcp_rmem=4096 87380 4194304
+net.ipv4.tcp_wmem=4096 65536 4194304
 
 # Connection stability for VPN
-net.ipv4.tcp_syn_retries=3
-net.ipv4.tcp_synack_retries=3
-net.ipv4.tcp_retries2=5
-net.ipv4.tcp_fin_timeout=7
-net.ipv4.tcp_keepalive_time=60
-net.ipv4.tcp_keepalive_probes=5
+net.ipv4.tcp_syn_retries=2
+net.ipv4.tcp_synack_retries=2
+net.ipv4.tcp_retries2=4
+net.ipv4.tcp_fin_timeout=5
+net.ipv4.tcp_keepalive_time=30
+net.ipv4.tcp_keepalive_probes=3
 net.ipv4.tcp_keepalive_intvl=10
 
 # Queue management
-net.core.netdev_max_backlog=50000
-net.core.somaxconn=32768
-net.ipv4.tcp_max_syn_backlog=8192
+net.core.netdev_max_backlog=25000
+net.core.somaxconn=16384
+net.ipv4.tcp_max_syn_backlog=4096
 EOF
             ;;
 
@@ -225,24 +235,24 @@ net.ipv4.tcp_slow_start_after_idle=0
 net.ipv4.tcp_mtu_probing=1
 
 # Buffer settings for high throughput
-net.core.rmem_max=25165824
-net.core.wmem_max=25165824
-net.ipv4.tcp_rmem=4096 87380 25165824
-net.ipv4.tcp_wmem=4096 65536 25165824
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.ipv4.tcp_rmem=4096 87380 16777216
+net.ipv4.tcp_wmem=4096 65536 16777216
 
 # Connection stability for VPN
 net.ipv4.tcp_syn_retries=3
 net.ipv4.tcp_synack_retries=3
 net.ipv4.tcp_retries2=5
-net.ipv4.tcp_fin_timeout=15
-net.ipv4.tcp_keepalive_time=120
+net.ipv4.tcp_fin_timeout=10
+net.ipv4.tcp_keepalive_time=90
 net.ipv4.tcp_keepalive_probes=5
-net.ipv4.tcp_keepalive_intvl=30
+net.ipv4.tcp_keepalive_intvl=15
 
 # Queue management
-net.core.netdev_max_backlog=100000
-net.core.somaxconn=65535
-net.ipv4.tcp_max_syn_backlog=16384
+net.core.netdev_max_backlog=75000
+net.core.somaxconn=32768
+net.ipv4.tcp_max_syn_backlog=8192
 EOF
             ;;
 
@@ -263,24 +273,24 @@ net.ipv4.tcp_slow_start_after_idle=0
 net.ipv4.tcp_mtu_probing=1
 
 # Buffer settings
-net.core.rmem_max=16777216
-net.core.wmem_max=16777216
-net.ipv4.tcp_rmem=4096 87380 16777216
-net.ipv4.tcp_wmem=4096 65536 16777216
+net.core.rmem_max=12582912
+net.core.wmem_max=12582912
+net.ipv4.tcp_rmem=4096 87380 12582912
+net.ipv4.tcp_wmem=4096 65536 12582912
 
 # Connection stability for VPN
 net.ipv4.tcp_syn_retries=3
 net.ipv4.tcp_synack_retries=3
 net.ipv4.tcp_retries2=5
-net.ipv4.tcp_fin_timeout=10
-net.ipv4.tcp_keepalive_time=90
+net.ipv4.tcp_fin_timeout=8
+net.ipv4.tcp_keepalive_time=60
 net.ipv4.tcp_keepalive_probes=5
 net.ipv4.tcp_keepalive_intvl=15
 
 # Queue management
-net.core.netdev_max_backlog=75000
-net.core.somaxconn=49152
-net.ipv4.tcp_max_syn_backlog=12288
+net.core.netdev_max_backlog=50000
+net.core.somaxconn=24576
+net.ipv4.tcp_max_syn_backlog=6144
 EOF
             ;;
 
@@ -293,8 +303,8 @@ net.ipv4.tcp_congestion_control=bbr
 # Advanced Multiplexing settings for VPN
 net.ipv4.tcp_tw_reuse=1
 net.ipv4.tcp_fin_timeout=5
-net.ipv4.tcp_max_tw_buckets=131072
-net.ipv4.tcp_max_orphans=131072
+net.ipv4.tcp_max_tw_buckets=65536
+net.ipv4.tcp_max_orphans=65536
 net.ipv4.tcp_orphan_retries=2
 
 # Advanced congestion control for MUX
@@ -305,24 +315,24 @@ net.ipv4.tcp_autocorking=1
 net.ipv4.tcp_limit_output_bytes=131072
 
 # Buffer settings for MUX
-net.core.rmem_max=25165824
-net.core.wmem_max=25165824
-net.ipv4.tcp_rmem=4096 87380 25165824
-net.ipv4.tcp_wmem=4096 65536 25165824
-net.ipv4.tcp_mem=786432 1048576 1572864
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.ipv4.tcp_rmem=4096 87380 16777216
+net.ipv4.tcp_wmem=4096 65536 16777216
+net.ipv4.tcp_mem=524288 786432 1048576
 
 # Advanced queue and connection settings
-net.core.netdev_max_backlog=150000
-net.core.somaxconn=65536
-net.ipv4.tcp_max_syn_backlog=32768
+net.core.netdev_max_backlog=100000
+net.core.somaxconn=32768
+net.ipv4.tcp_max_syn_backlog=16384
 net.ipv4.tcp_syncookies=1
 net.ipv4.tcp_syn_retries=2
 net.ipv4.tcp_synack_retries=2
 
 # Keepalive settings for stable VPN connections
-net.ipv4.tcp_keepalive_time=300
+net.ipv4.tcp_keepalive_time=180
 net.ipv4.tcp_keepalive_probes=5
-net.ipv4.tcp_keepalive_intvl=15
+net.ipv4.tcp_keepalive_intvl=10
 
 # Standard TCP settings
 net.ipv4.tcp_slow_start_after_idle=0
@@ -341,7 +351,7 @@ net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 
 # Advanced BBRv3 settings for VPN
-net.ipv4.tcp_notsent_lowat=16384
+net.ipv4.tcp_notsent_lowat=12288
 net.ipv4.tcp_fastopen=3
 net.ipv4.tcp_timestamps=1
 net.ipv4.tcp_window_scaling=1
@@ -353,45 +363,56 @@ net.ipv4.tcp_slow_start_after_idle=0
 net.ipv4.tcp_mtu_probing=1
 
 # Buffer settings for BBRv3
-net.core.rmem_max=16777216
-net.core.wmem_max=16777216
-net.ipv4.tcp_rmem=4096 87380 16777216
-net.ipv4.tcp_wmem=4096 65536 16777216
+net.core.rmem_max=12582912
+net.core.wmem_max=12582912
+net.ipv4.tcp_rmem=4096 87380 12582912
+net.ipv4.tcp_wmem=4096 65536 12582912
 
 # Connection stability for VPN
-net.ipv4.tcp_syn_retries=3
-net.ipv4.tcp_synack_retries=3
-net.ipv4.tcp_retries2=5
-net.ipv4.tcp_fin_timeout=10
-net.ipv4.tcp_keepalive_time=90
-net.ipv4.tcp_keepalive_probes=5
-net.ipv4.tcp_keepalive_intvl=15
+net.ipv4.tcp_syn_retries=2
+net.ipv4.tcp_synack_retries=2
+net.ipv4.tcp_retries2=4
+net.ipv4.tcp_fin_timeout=6
+net.ipv4.tcp_keepalive_time=45
+net.ipv4.tcp_keepalive_probes=4
+net.ipv4.tcp_keepalive_intvl=10
 
 # Queue management
-net.core.netdev_max_backlog=100000
-net.core.somaxconn=49152
-net.ipv4.tcp_max_syn_backlog=16384
+net.core.netdev_max_backlog=50000
+net.core.somaxconn=24576
+net.ipv4.tcp_max_syn_backlog=8192
 EOF
             ;;
     esac
 
-    sysctl --system >/dev/null 2>&1
-    show_msg "$MODE Optimizations Successfully Applied"
+    if sysctl --system >/dev/null 2>&1; then
+        show_msg "$MODE Optimizations Successfully Applied"
+    else
+        show_msg "ERROR: Failed to apply sysctl settings"
+        return 1
+    fi
 }
 
 show_status() {
     clear
     INTERFACE=$(ip route | grep default | awk '{print $5}' 2>/dev/null || echo "Unknown")
-    CURRENT_MTU=$(cat /sys/class/net/"$INTERFACE"/mtu 2>/dev/null || echo "Unknown")
+    CURRENT_MTU=$(ip link show "$INTERFACE" 2>/dev/null | grep -o 'mtu [0-9]*' | awk '{print $2}' || echo "Unknown")
     
     echo "----------------------------------------"
     echo "Current Network Status:"
     echo "----------------------------------------"
+    echo "Kernel Version: $(uname -r)"
+    echo "BBR Module: $(lsmod | grep -q tcp_bbr && echo "Loaded" || echo "Not Loaded")"
     echo "TCP Algorithm: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "Unknown")"
     echo "Queue Discipline: $(sysctl -n net.core.default_qdisc 2>/dev/null || echo "Unknown")"
     echo "Interface: $INTERFACE"
     echo "MTU: $CURRENT_MTU"
     echo "DNS Servers: $(grep '^DNS=' "$DNS_FILE" 2>/dev/null | cut -d= -f2 || echo "Not configured")"
+    echo "DNSSEC: $(grep '^DNSSEC=' "$DNS_FILE" 2>/dev/null | cut -d= -f2 || echo "Not configured")"
+    echo "----------------------------------------"
+    echo "Service Status:"
+    echo "systemd-resolved: $(systemctl is-active systemd-resolved 2>/dev/null || echo "Not running")"
+    echo "systemd-networkd: $(systemctl is-active systemd-networkd 2>/dev/null || echo "Not running")"
     echo "----------------------------------------"
     
     if grep -q "tcp_tw_reuse=1" "$CONFIG_FILE" 2>/dev/null; then
