@@ -2,7 +2,6 @@
 set -euo pipefail
 LANG=C.UTF-8
 
-# -------- Functions --------
 log() { echo -e "\e[32m[$(date '+%F %T')]\e[0m $*"; }
 error() { echo -e "\e[31mError: $*\e[0m" >&2; }
 pause() { read -rp "Press Enter to continue..."; }
@@ -50,22 +49,30 @@ set_dns() {
   log "DNS set to $dns_value"
 }
 check_kernel_version() {
-  local major minor
-  major=$(uname -r | cut -d '.' -f1)
-  minor=$(uname -r | cut -d '.' -f2 | cut -d '-' -f1)
-  echo "$major.$minor"
+  local kv
+  kv=$(uname -r | cut -d'-' -f1)
+  echo "$kv"
 }
 install_kernel_hwe() {
-  log "Installing latest HWE kernel for better BBR2 support..."
+  log "Updating package lists..."
   apt-get update -y
-  apt-get install -y --no-install-recommends linux-generic-hwe-$(lsb_release -rs) linux-headers-generic-hwe-$(lsb_release -rs)
-  log "Kernel installation done. Please reboot after installation."
+  log "Installing latest HWE kernel for better BBR2 support..."
+  local release=$(lsb_release -rs)
+  apt-get install -y --install-recommends linux-generic-hwe-"$release" linux-headers-generic-hwe-"$release"
+  log "Kernel installation done. Please reboot your server and rerun the script."
+}
+enable_bbr2_module() {
+  if ! modprobe tcp_bbr2 >/dev/null 2>&1; then
+    error "tcp_bbr2 module not found in kernel. BBR2 not supported. Please update your kernel."
+    return 1
+  fi
+  log "tcp_bbr2 kernel module loaded."
 }
 apply_sysctl() {
   local sysctl_file="/etc/sysctl.d/99-bbr2-tuned.conf"
   backup_file "$sysctl_file"
   cat >"$sysctl_file" <<EOF
-# BBR2 Optimized Settings
+# BBR2 optimized sysctl settings
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr2
 
@@ -73,7 +80,7 @@ net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
 net.ipv4.tcp_rmem = 4096 87380 16777216
 net.ipv4.tcp_wmem = 4096 65536 16777216
-net.core.netdev_max_backlog = 10000
+net.core.netdev_max_backlog = 2500
 
 net.ipv4.tcp_low_latency = 1
 net.ipv4.tcp_no_metrics_save = 1
@@ -94,17 +101,6 @@ net.ipv4.tcp_orphan_retries = 2
 EOF
   sysctl --system
   log "Sysctl parameters applied."
-}
-enable_bbr2_module() {
-  if ! modprobe tcp_bbr2 >/dev/null 2>&1; then
-    error "tcp_bbr2 module not found in kernel. BBR2 not supported. Please update your kernel."
-    return 1
-  fi
-  log "tcp_bbr2 kernel module loaded."
-}
-enable_bbr2_module_load_on_boot() {
-  echo "tcp_bbr2" > /etc/modules-load.d/bbr2.conf
-  log "tcp_bbr2 module will be loaded on boot."
 }
 check_bbr2_enabled() {
   local cc
@@ -134,58 +130,12 @@ remove_bbr2() {
   restore_backup /etc/sysctl.d/99-bbr2-tuned.conf
   restore_backup /etc/systemd/resolved.conf
   restore_backup /etc/resolv.conf
-  rm -f /etc/modules-load.d/bbr2.conf
   sysctl -w net.ipv4.tcp_congestion_control=cubic || true
   sysctl -w net.core.default_qdisc=fq || true
   for iface in $(get_interfaces); do
     ip link set dev "$iface" mtu 1500 || true
   done
   log "BBR2 and related settings removed. Reboot is recommended."
-}
-menu() {
-  clear
-  echo "======================================"
-  echo "   Ultra Fast & Stable BBR2 Setup     "
-  echo "======================================"
-  echo "1) Install/Enable BBR2 (with kernel check)"
-  echo "2) Remove BBR2 & Restore Defaults"
-  echo "3) Change DNS (current: $(get_current_dns))"
-  echo "4) Change MTU (current: $(get_current_mtu))"
-  echo "5) Show Status"
-  echo "6) Reboot Server"
-  echo "0) Exit"
-  echo "======================================"
-  read -rp "Select option: " choice
-  case $choice in
-    1)
-      install_bbr2_flow
-      ;;
-    2)
-      remove_bbr2
-      pause
-      ;;
-    3)
-      change_dns
-      ;;
-    4)
-      change_mtu
-      ;;
-    5)
-      show_status
-      pause
-      ;;
-    6)
-      log "Rebooting now..."
-      reboot
-      ;;
-    0)
-      exit 0
-      ;;
-    *)
-      error "Invalid option"
-      pause
-      ;;
-  esac
 }
 get_current_dns() {
   if systemctl is-active --quiet systemd-resolved; then
@@ -224,30 +174,57 @@ change_mtu() {
 install_bbr2_flow() {
   ensure_root
   log "Starting BBR2 installation and setup..."
-  local kernel_major kernel_minor
-  kernel_major=$(uname -r | cut -d '.' -f1)
-  kernel_minor=$(uname -r | cut -d '.' -f2 | cut -d '-' -f1)
-  if (( kernel_major < 5 || (kernel_major == 5 && kernel_minor < 10) )); then
-    log "Kernel version too old ($(uname -r)). Installing HWE kernel..."
+  local kernel_ver
+  kernel_ver=$(uname -r | cut -d'-' -f1)
+  kernel_ver_num=$(echo "$kernel_ver" | awk -F. '{print $1*10000 + $2*100 + $3}')
+  local required_ver=51000  # 5.10.0 minimum for BBR2
+  
+  if (( kernel_ver_num < required_ver )); then
+    log "Kernel version $kernel_ver is too old for BBR2."
     install_kernel_hwe
-    log "Please reboot your server and rerun the script to continue BBR2 setup."
+    log "Please reboot your server and rerun this script."
     exit 0
   fi
+
   enable_bbr2_module || exit 1
-  enable_bbr2_module_load_on_boot
   apply_sysctl
   set_dns "1.1.1.1"
   set_mtu 1420
   if check_bbr2_enabled; then
-    log "BBR2 enabled successfully."
+    log "BBR2 enabled successfully!"
   else
-    error "Failed to enable BBR2 congestion control."
+    error "Failed to enable BBR2."
     exit 1
   fi
   pause
 }
+menu() {
+  clear
+  echo "======================================"
+  echo "   Ultra Fast & Stable BBR2 Setup     "
+  echo "======================================"
+  echo "1) Install/Enable BBR2 (with kernel check)"
+  echo "2) Remove BBR2 & Restore Defaults"
+  echo "3) Change DNS (current: $(get_current_dns))"
+  echo "4) Change MTU (current: $(get_current_mtu))"
+  echo "5) Show Status"
+  echo "6) Reboot Server"
+  echo "0) Exit"
+  echo "======================================"
+  read -rp "Select option: " choice
+  case $choice in
+    1) install_bbr2_flow ;;
+    2) remove_bbr2; pause ;;
+    3) change_dns ;;
+    4) change_mtu ;;
+    5) show_status; pause ;;
+    6) log "Rebooting now..."; reboot ;;
+    0) exit 0 ;;
+    *) error "Invalid option"; pause ;;
+  esac
+}
 
-# -------- Main --------
+# Main loop
 while true; do
   menu
 done
