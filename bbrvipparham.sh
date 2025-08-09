@@ -60,19 +60,38 @@ detect_package_manager() {
     exit 1
   fi
 }
-check_repos() {
+configure_repos() {
   local pkg_manager
   pkg_manager=$(detect_package_manager)
   case $pkg_manager in
     apt)
+      if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        if [[ "$ID" == "ubuntu" ]]; then
+          log "Configuring Ubuntu repositories..."
+          cat >/etc/apt/sources.list <<EOF
+deb http://archive.ubuntu.com/ubuntu $VERSION_CODENAME main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu $VERSION_CODENAME-updates main restricted universe multiverse
+deb http://security.ubuntu.com/ubuntu $VERSION_CODENAME-security main restricted universe multiverse
+EOF
+        elif [[ "$ID" == "debian" ]]; then
+          log "Configuring Debian repositories..."
+          cat >/etc/apt/sources.list <<EOF
+deb http://deb.debian.org/debian $VERSION_CODENAME main contrib non-free
+deb http://deb.debian.org/debian $VERSION_CODENAME-updates main contrib non-free
+deb http://security.debian.org/debian-security $VERSION_CODENAME-security main contrib non-free
+EOF
+        fi
+      fi
       if ! apt-get update -y; then
-        error "Failed to update package repositories. Check your sources.list."
+        error "Failed to update package repositories. Check your internet connection or /etc/apt/sources.list."
         exit 1
       fi
       ;;
     dnf|yum)
+      log "Checking $pkg_manager repositories..."
       if ! $pkg_manager makecache; then
-        error "Failed to update package repositories. Check your repo configuration."
+        error "Failed to update package repositories. Check your repo configuration or internet connection."
         exit 1
       fi
       ;;
@@ -84,29 +103,46 @@ check_kernel_version() {
   echo "$kv"
 }
 install_kernel_hwe() {
-  log "Updating package lists..."
-  check_repos
+  log "Updating package lists and installing new kernel..."
+  configure_repos
   local pkg_manager
   pkg_manager=$(detect_package_manager)
   case $pkg_manager in
     apt)
       local release
       release=$(lsb_release -rs 2>/dev/null || grep '^VERSION_ID=' /etc/os-release | cut -d'"' -f2)
-      if [[ -n "$release" ]]; then
-        apt-get install -y --install-recommends linux-generic-hwe-"$release" linux-headers-generic-hwe-"$release" || \
-        apt-get install -y linux-image-amd64 linux-headers-amd64
+      if [[ -n "$release" && "$ID" == "ubuntu" ]]; then
+        if ! apt-get install -y --install-recommends linux-generic-hwe-"$release" linux-headers-generic-hwe-"$release"; then
+          log "HWE kernel installation failed. Trying generic kernel..."
+          if ! apt-get install -y linux-image-amd64 linux-headers-amd64; then
+            error "Failed to install kernel. Check your package repositories or internet connection."
+            exit 1
+          fi
+        fi
       else
-        apt-get install -y linux-image-amd64 linux-headers-amd64
+        if ! apt-get install -y linux-image-amd64 linux-headers-amd64; then
+          error "Failed to install kernel. Check your package repositories or internet connection."
+          exit 1
+        fi
       fi
       ;;
     dnf)
-      dnf install -y kernel kernel-devel kernel-headers
+      if ! dnf install -y kernel kernel-devel kernel-headers; then
+        error "Failed to install kernel. Check your package repositories or internet connection."
+        exit 1
+      fi
       ;;
     yum)
-      yum install -y kernel kernel-devel kernel-headers
+      if ! yum install -y kernel kernel-devel kernel-headers; then
+        error "Failed to install kernel. Check your package repositories or internet connection."
+        exit 1
+      fi
       ;;
   esac
   log "Kernel installation done. Please reboot your server and rerun the script."
+  log "After reboot, verify kernel version with 'uname -r'."
+  pause
+  exit 0
 }
 enable_bbr2_module() {
   if ! ls /lib/modules/$(uname -r)/kernel/net/ipv4/tcp_bbr2.ko* >/dev/null 2>&1; then
@@ -168,7 +204,10 @@ EOF
   if ! check_qdisc_fq; then
     sed -i '/net.core.default_qdisc/d' "$sysctl_file"
   fi
-  sysctl --system
+  if ! sysctl --system; then
+    error "Failed to apply sysctl settings. Check /etc/sysctl.d/99-bbr2-tuned.conf for errors."
+    return 1
+  fi
   log "Sysctl parameters applied."
 }
 tune_bbr2_params() {
@@ -182,7 +221,11 @@ tune_bbr2_params() {
   sed -i "/tcp_bbr2_bw_probe_cwnd_gain/c\net.ipv4.tcp_bbr2_bw_probe_cwnd_gain=$cwnd_gain" /etc/sysctl.d/99-bbr2-tuned.conf
   sed -i "/tcp_bbr2_extra_acked_gain/c\net.ipv4.tcp_bbr2_extra_acked_gain=$acked_gain" /etc/sysctl.d/99-bbr2-tuned.conf
   sed -i "/tcp_bbr2_cwnd_min/c\net.ipv4.tcp_bbr2_cwnd_min=$cwnd_min" /etc/sysctl.d/99-bbr2-tuned.conf
-  sysctl --system
+  if ! sysctl --system; then
+    error "Failed to apply updated BBR2 parameters."
+    pause
+    return
+  fi
   log "BBR2 parameters updated."
   pause
 }
@@ -273,14 +316,19 @@ install_bbr2_flow() {
   local required_ver=51000  # 5.10.0 minimum for BBR2
   
   if (( kernel_ver_num < required_ver )); then
-    log "Kernel version $kernel_ver is too old for BBR2."
+    log "Kernel version $kernel_ver is too old for BBR2. Installing a newer kernel..."
     install_kernel_hwe
-    log "Please reboot your server and rerun the script."
     exit 0
   fi
 
-  enable_bbr2_module || exit 1
-  apply_sysctl
+  if ! enable_bbr2_module; then
+    error "Failed to enable BBR2 module. Please ensure kernel supports tcp_bbr2."
+    exit 1
+  fi
+  if ! apply_sysctl; then
+    error "Failed to apply sysctl settings. Check system configuration."
+    exit 1
+  fi
   set_dns "1.1.1.1"
   set_mtu 1420
   if check_bbr2_enabled; then
