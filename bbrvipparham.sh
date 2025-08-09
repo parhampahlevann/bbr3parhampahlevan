@@ -1,297 +1,406 @@
-#!/bin/bash
-# Ultimate Network Optimizer Pro v7.0
-# With BBR3 Support & Advanced TCP/VPN Optimizations
-# Optimized for Speed, Low Latency and VPN Performance
+#!/usr/bin/env bash
+# bbr2-super-english.sh
+# English version — BBR2 (preferred) with fallback to BBR
+# Provides menu: install, uninstall, manual DNS/MTU, show status, reboot.
+# Persists settings across reboots via systemd service and sysctl.d.
+# Usage: sudo ./bbr2-super-english.sh
+set -euo pipefail
+LANG=C.UTF-8
 
-# Configuration
-CONFIG_FILE="/etc/sysctl.d/99-network-opt.conf"
-DNS_FILE="/etc/systemd/resolved.conf.d/dns.conf"
-GRUB_FILE="/etc/default/grub"
-NETPLAN_DIR="/etc/netplan/"
+BACKUP_DIR="/etc/bbr_super_backup_$(date +%s)"
+SYSCTL_CONF="/etc/sysctl.d/99-bbr2-tuning.conf"
+SERVICE_FILE="/etc/systemd/system/bbr2-apply.service"
+APPLY_SCRIPT="/usr/local/sbin/bbr2-apply.sh"
+DNS_VALUE_FILE="/etc/bbr_dns_value"
+MTU_VALUE_FILE="/etc/bbr_mtu_value"
 
-# Colors
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-RED='\033[0;31m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+DEFAULT_DNS="1.1.1.1"
+DEFAULT_MTU="1420"
 
-# Check root
-[ "$(id -u)" -ne 0 ] && {
-    echo -e "${RED}Please run as root!${NC}"
+######## helpers ########
+ensure_root(){
+  if [ "$EUID" -ne 0 ]; then
+    echo "Please run as root (use sudo)."
     exit 1
+  fi
 }
 
-# Check kernel support for BBR3
-check_kernel_support() {
-    KERNEL_VERSION=$(uname -r | cut -d. -f1-2)
-    REQUIRED_VERSION="5.18"
-    
-    if [ "$(printf '%s\n' "$REQUIRED_VERSION" "$KERNEL_VERSION" | sort -V | head -n1)" != "$REQUIRED_VERSION" ]; then
-        echo -e "${YELLOW}Warning: Kernel $KERNEL_VERSION may not support BBR3${NC}"
-        echo -e "${YELLOW}Consider upgrading to kernel 5.18+ for full BBR3 support${NC}"
-        return 1
-    fi
+log(){
+  echo -e "[$(date '+%F %T')] $*"
+}
+
+backup_file(){
+  f="$1"
+  mkdir -p "$BACKUP_DIR"
+  if [ -e "$f" ]; then
+    cp -a "$f" "$BACKUP_DIR/"
+  fi
+}
+
+do_backup(){
+  log "Backing up important files to $BACKUP_DIR ..."
+  mkdir -p "$BACKUP_DIR"
+  backup_file /etc/resolv.conf
+  backup_file /etc/systemd/resolved.conf
+  backup_file /etc/netplan  || true
+  backup_file /etc/sysctl.conf || true
+  backup_file "$SYSCTL_CONF" || true
+  backup_file "$SERVICE_FILE" || true
+  log "Backup complete."
+}
+
+install_prereqs(){
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update -y
+    DEBIAN_FRONTEND=noninteractive apt-get install -y iproute2 ethtool curl coreutils ca-certificates
+  else
+    log "No apt-get found; ensure iproute2/ethtool/curl are available on your distro."
+  fi
+}
+
+detect_systemd_resolved(){
+  if systemctl list-unit-files | grep -q '^systemd-resolved'; then
     return 0
+  else
+    return 1
+  fi
 }
 
-# Apply Ultimate Optimizations
-apply_optimizations() {
-    check_kernel_support
-    
-    # Create optimized configuration
-    cat > "$CONFIG_FILE" <<'EOF'
-# Ultimate Network Optimizations v7.0
-# TCP Fast Open (Enabled for both client and server)
-net.ipv4.tcp_fastopen = 3
-
-# TCP MUX Optimizations
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_tw_recycle = 0
-net.ipv4.tcp_max_tw_buckets = 2000000
-net.ipv4.tcp_fin_timeout = 20
-net.ipv4.tcp_orphan_retries = 2
-
-# Advanced TCP Settings
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_dsack = 1
-net.ipv4.tcp_fack = 1
-net.ipv4.tcp_window_scaling = 1
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_ecn = 1
-net.ipv4.tcp_ecn_fallback = 1
-net.ipv4.tcp_rfc1337 = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.tcp_low_latency = 1
-net.ipv4.tcp_notsent_lowat = 16384
-net.ipv4.tcp_limit_output_bytes = 131072
-net.ipv4.tcp_moderate_rcvbuf = 1
-net.ipv4.tcp_reordering = 3
-net.ipv4.tcp_retries1 = 3
-net.ipv4.tcp_retries2 = 8
-
-# Congestion Control (BBR3 with fallback)
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr3
-net.ipv4.tcp_congestion_control_backup = bbr
-
-# BBR3 specific settings
-net.ipv4.tcp_bbr3_min_rtt_window_sec = 10
-net.ipv4.tcp_bbr3_probe_rtt_mode_sec = 5
-net.ipv4.tcp_bbr3_pacing_gain = 1.25
-net.ipv4.tcp_bbr3_cwnd_gain = 2
-net.ipv4.tcp_bbr3_extra_acked_gain = 1.0
-
-# Buffer Optimizations (VPN optimized)
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 65536 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-net.ipv4.udp_rmem_min = 8192
-net.ipv4.udp_wmem_min = 8192
-
-# Connection Management
-net.ipv4.tcp_max_syn_backlog = 8192
-net.core.somaxconn = 32768
-net.core.netdev_max_backlog = 100000
-net.ipv4.tcp_syn_retries = 2
-net.ipv4.tcp_synack_retries = 2
-
-# Additional Optimizations
-net.ipv4.ip_no_pmtu_disc = 1
-net.core.rps_sock_flow_entries = 32768
-net.ipv4.tcp_challenge_ack_limit = 999999
+apply_dns_systemd_resolved(){
+  dns="$1"
+  log "Configuring systemd-resolved to use DNS=$dns"
+  backup_file /etc/systemd/resolved.conf
+  cat >/etc/systemd/resolved.conf <<EOF
+[Resolve]
+DNS=$dns
+#FallbackDNS=
 EOF
+  systemctl restart systemd-resolved || true
+  # ensure /etc/resolv.conf points to resolved
+  if [ -f /run/systemd/resolve/resolv.conf ]; then
+    ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+  elif [ -f /run/systemd/resolve/stub-resolv.conf ]; then
+    ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+  fi
+}
 
-    # Apply settings
-    sysctl --system >/dev/null 2>&1
-    
-    # Update GRUB for persistence
-    if [ -f "$GRUB_FILE" ]; then
-        sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet splash tcp_fastopen=3"/' "$GRUB_FILE"
-        update-grub >/dev/null 2>&1
+apply_dns_resolvconf(){
+  dns="$1"
+  log "Writing /etc/resolv.conf with DNS=$dns"
+  backup_file /etc/resolv.conf
+  cat >/etc/resolv.conf <<EOF
+# Managed by bbr2-super-english.sh
+nameserver $dns
+options rotate
+EOF
+}
+
+apply_mtu_all_ifaces(){
+  mtu="$1"
+  log "Applying MTU=$mtu to all non-loopback/non-virtual interfaces..."
+  for iface in $(ip -o link show | awk -F': ' '{print $2}'); do
+    case "$iface" in
+      lo|docker*|veth*|br-*|tun*|tap*|wg*|virbr*|lxc*|virbr*)
+        continue
+        ;;
+    esac
+    ip link set dev "$iface" mtu "$mtu" 2>/dev/null || true
+  done
+  echo "$mtu" > "$MTU_VALUE_FILE"
+}
+
+generate_sysctl(){
+  cat >"$SYSCTL_CONF" <<'EOF'
+# bbr2-super tuning - safe defaults for gaming/streaming
+net.core.default_qdisc = fq
+net.core.netdev_max_backlog = 250000
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_tw_reuse = 1
+# congestion control line will be set by the script to bbr2 (or bbr fallback)
+net.ipv4.tcp_congestion_control = bbr2
+EOF
+}
+
+create_apply_script(){
+  cat >"$APPLY_SCRIPT" <<'EOF'
+#!/usr/bin/env bash
+set -e
+DNS_FILE="/etc/bbr_dns_value"
+MTU_FILE="/etc/bbr_mtu_value"
+# Apply sysctl
+/sbin/sysctl --system || true
+# Apply MTU
+if [ -f "$MTU_FILE" ]; then
+  mtu="$(cat "$MTU_FILE")"
+  for i in $(ip -o link show | awk -F': ' '{print $2}'); do
+    case "$i" in
+      lo|docker*|veth*|br-*|tun*|tap*|wg*|virbr*|lxc*)
+        continue
+        ;;
+    esac
+    /sbin/ip link set dev "$i" mtu "$mtu" 2>/dev/null || true
+  done
+fi
+# Apply DNS
+if [ -f "$DNS_FILE" ]; then
+  dns="$(cat "$DNS_FILE")"
+  if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    sed -i '/^DNS=/d' /etc/systemd/resolved.conf 2>/dev/null || true
+    echo -e "[Resolve]\nDNS=$dns\n" >/etc/systemd/resolved.conf
+    systemctl restart systemd-resolved || true
+    if [ -f /run/systemd/resolve/resolv.conf ]; then
+      ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
     fi
-    
-    echo -e "${GREEN}Ultimate optimizations applied with BBR3 support!${NC}"
+  else
+    cat >/etc/resolv.conf <<EOF
+# Managed by bbr2-super-english.sh
+nameserver $dns
+options rotate
+EOF
+  fi
+fi
+EOF
+  chmod +x "$APPLY_SCRIPT"
 }
 
-# DNS Configuration (unchanged)
-configure_dns() {
-    echo -e "\n${YELLOW}Available DNS Providers:${NC}"
-    echo "1) Cloudflare (1.1.1.1)"
-    echo "2) Google (8.8.8.8)"
-    echo "3) OpenDNS (208.67.222.222)"
-    echo "4) Quad9 (9.9.9.9)"
-    echo "5) Custom"
-    echo -n "Select option [1-5]: "
-    read choice
-    case $choice in
-        1) DNS="1.1.1.1 1.0.0.1" ;;
-        2) DNS="8.8.8.8 8.8.4.4" ;;
-        3) DNS="208.67.222.222 208.67.220.220" ;;
-        4) DNS="9.9.9.9 149.112.112.112" ;;
-        5)
-            echo -n "Enter custom DNS (space separated): "
-            read DNS
-            ;;
-        *)
-            echo -e "${RED}Invalid choice!${NC}"
-            return
-            ;;
-    esac
-    mkdir -p /etc/systemd/resolved.conf.d
-    echo -e "[Resolve]\nDNS=$DNS\nDNSSEC=allow-downgrade" > "$DNS_FILE"
-    systemctl restart systemd-resolved
-    echo -e "${GREEN}DNS configured successfully!${NC}"
+create_systemd_service(){
+  cat >"$SERVICE_FILE" <<EOF
+[Unit]
+Description=Apply BBR2 / MTU / DNS settings at network-online
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$APPLY_SCRIPT
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now bbr2-apply.service || true
 }
 
-# MTU Optimization with VPN detection
-optimize_mtu() {
-    INTERFACE=$(ip route | grep default | awk '{print $5}')
-    [ -z "$INTERFACE" ] && {
-        echo -e "${RED}Could not detect network interface!${NC}"
-        return
-    }
-    CURRENT_MTU=$(ip link show $INTERFACE | grep -o 'mtu [0-9]*' | awk '{print $2}')
-    echo -e "\n${YELLOW}Current MTU: ${GREEN}$CURRENT_MTU${NC}"
-    
-    echo -e "\n${YELLOW}MTU Optimization Options:${NC}"
-    echo "1) Auto-detect (Recommended)"
-    echo "2) Standard (1500)"
-    echo "3) VPN (1400)"
-    echo "4) WireGuard (1420)"
-    echo "5) Gaming (1350)"
-    echo "6) Custom"
-    echo -n "Select option [1-6]: "
-    read choice
-    case $choice in
-        1)
-            # Auto-detect optimal MTU
-            echo -e "${YELLOW}Finding optimal MTU...${NC}"
-            MTU=1500
-            while [ $MTU -gt 1400 ]; do
-                if ping -c 1 -M do -s $((MTU - 28)) 8.8.8.8 >/dev/null 2>&1; then
-                    break
-                fi
-                MTU=$((MTU - 10))
-            done
-            echo -e "${GREEN}Optimal MTU: $MTU${NC}"
-            NEW_MTU=$MTU
-            ;;
-        2) NEW_MTU=1500 ;;
-        3) NEW_MTU=1400 ;;
-        4) NEW_MTU=1420 ;;
-        5) NEW_MTU=1350 ;;
-        6)
-            echo -n "Enter MTU value (576-9000): "
-            read NEW_MTU
-            [[ ! $NEW_MTU =~ ^[0-9]+$ ]] || [ $NEW_MTU -lt 576 ] || [ $NEW_MTU -gt 9000 ] && {
-                echo -e "${RED}Invalid MTU value!${NC}"
-                return
-            }
-            ;;
-        *)
-            echo -e "${RED}Invalid choice!${NC}"
-            return
-            ;;
-    esac
-    
-    # Apply temporary MTU
-    ip link set dev $INTERFACE mtu $NEW_MTU || {
-        echo -e "${RED}Failed to set MTU!${NC}"
-        return
-    }
-    
-    # Make permanent in Netplan
-    NETPLAN_FILE=$(find $NETPLAN_DIR -name "*.yaml" -o -name "*.yml" | head -n1)
-    [ -z "$NETPLAN_FILE" ] && NETPLAN_FILE="$NETPLAN_DIR/01-netcfg.yaml"
-    
-    if [ -f "$NETPLAN_FILE" ]; then
-        if grep -q "$INTERFACE:" "$NETPLAN_FILE"; then
-            if grep -q "mtu:" "$NETPLAN_FILE"; then
-                sed -i "/$INTERFACE:/,/mtu:/s/mtu:.*/mtu: $NEW_MTU/" "$NETPLAN_FILE"
-            else
-                sed -i "/$INTERFACE:/a \      mtu: $NEW_MTU" "$NETPLAN_FILE"
-            fi
+check_bbr2_module(){
+  if modinfo tcp_bbr2 &>/dev/null; then
+    return 0
+  fi
+  if [ -d /sys/module/tcp_bbr2 ]; then
+    return 0
+  fi
+  # also check kernel config if present
+  if [ -f "/boot/config-$(uname -r)" ] && grep -q "CONFIG_TCP_CONG_BBR2=y" "/boot/config-$(uname -r)" ; then
+    return 0
+  fi
+  return 1
+}
+
+enable_bbr2_or_bbr(){
+  # Try to enable BBR2. If not available, fallback to BBR (classic) and inform the user.
+  generate_sysctl
+  if check_bbr2_module; then
+    log "BBR2 support detected in kernel, attempting to load and enable it..."
+    modprobe tcp_bbr2 2>/dev/null || true
+    sysctl --system || true
+    log "Attempted to enable BBR2. Use 'Show status' to verify."
+    return 0
+  else
+    log "BBR2 not found in this kernel. Falling back to classic BBR."
+    sed -i 's/net.ipv4.tcp_congestion_control = bbr2/net.ipv4.tcp_congestion_control = bbr/' "$SYSCTL_CONF"
+    modprobe tcp_bbr 2>/dev/null || true
+    sysctl --system || true
+    log "Classic BBR enabled (if supported). To get real BBR2, you need a kernel with tcp_bbr2 support."
+    return 1
+  fi
+}
+
+show_status(){
+  echo "=== Status ==="
+  echo "Date: $(date)"
+  echo "Kernel: $(uname -r)"
+  echo "Architecture: $(uname -m)"
+  echo
+  echo "Sysctl tuning file: $SYSCTL_CONF"
+  [ -f "$SYSCTL_CONF" ] && sed -n '1,200p' "$SYSCTL_CONF" || echo "(file not found)"
+  echo
+  echo "Active congestion control:"
+  sysctl net.ipv4.tcp_congestion_control || true
+  echo
+  echo "Loaded modules:"
+  lsmod | egrep 'tcp_bbr2|tcp_bbr' || echo "(none loaded)"
+  echo
+  echo "MTU file: $( [ -f $MTU_VALUE_FILE ] && cat $MTU_VALUE_FILE || echo '(none)' )"
+  echo "DNS file: $( [ -f $DNS_VALUE_FILE ] && cat $DNS_VALUE_FILE || echo '(none)' )"
+  echo
+  echo "/etc/resolv.conf head:"
+  head -n 20 /etc/resolv.conf || true
+  echo
+  echo "systemd-resolved active?: $(systemctl is-active systemd-resolved 2>/dev/null || echo inactive)"
+  echo
+  echo "To inspect kernel support for bbr2 run: modinfo tcp_bbr2 || grep -i bbr2 /boot/config-$(uname -r)"
+  echo "================"
+}
+
+install_flow(){
+  ensure_root
+  log "Starting BBR2-super install flow..."
+  do_backup
+  install_prereqs
+  # Save defaults
+  echo "$DEFAULT_DNS" > "$DNS_VALUE_FILE"
+  echo "$DEFAULT_MTU" > "$MTU_VALUE_FILE"
+  # Apply DNS
+  if detect_systemd_resolved; then
+    apply_dns_systemd_resolved "$DEFAULT_DNS"
+  else
+    apply_dns_resolvconf "$DEFAULT_DNS"
+  fi
+  # Apply MTU now
+  apply_mtu_all_ifaces "$DEFAULT_MTU"
+  # create sysctl and try enable bbr2/bbr
+  enable_bbr2_or_bbr
+  # create apply script and service for persistence
+  create_apply_script
+  create_systemd_service
+  log "Install flow finished. Check status with option 'Show status'."
+  log "If kernel lacks tcp_bbr2, see menu option 'Kernel helper' for guidance."
+}
+
+uninstall_flow(){
+  ensure_root
+  log "Starting uninstall: remove generated files and try restore backups..."
+  systemctl disable --now bbr2-apply.service 2>/dev/null || true
+  rm -f "$SERVICE_FILE" "$APPLY_SCRIPT" "$SYSCTL_CONF" "$MTU_VALUE_FILE" "$DNS_VALUE_FILE" || true
+  systemctl daemon-reload || true
+  if [ -d "$BACKUP_DIR" ]; then
+    log "Restoring any backup files found in $BACKUP_DIR ..."
+    for f in "$BACKUP_DIR"/*; do
+      base="$(basename "$f")"
+      case "$base" in
+        resolv.conf) cp -a "$f" /etc/resolv.conf || true ;;
+        resolved.conf) cp -a "$f" /etc/systemd/resolved.conf || true ;;
+        *) cp -a "$f" "/etc/$base" 2>/dev/null || true ;;
+      esac
+    done
+    log "Backups restored (where present)."
+  else
+    log "No backup dir found at $BACKUP_DIR"
+  fi
+  /sbin/sysctl --system || true
+  log "Uninstall finished."
+}
+
+set_dns_manual(){
+  ensure_root
+  read -rp "Enter new DNS (example: 1.1.1.1): " dns
+  if [ -z "$dns" ]; then
+    echo "Empty input. Aborted."
+    return 1
+  fi
+  echo "$dns" > "$DNS_VALUE_FILE"
+  if detect_systemd_resolved; then
+    apply_dns_systemd_resolved "$dns"
+  else
+    apply_dns_resolvconf "$dns"
+  fi
+  log "DNS set to $dns"
+}
+
+set_mtu_manual(){
+  ensure_root
+  read -rp "Enter new MTU (example: 1420): " mtu
+  if ! [[ "$mtu" =~ ^[0-9]+$ ]]; then
+    echo "Invalid MTU value."
+    return 1
+  fi
+  echo "$mtu" > "$MTU_VALUE_FILE"
+  apply_mtu_all_ifaces "$mtu"
+  log "MTU applied: $mtu"
+}
+
+kernel_helper(){
+  # Explain and offer simple automated assist (non-invasive)
+  echo "=== Kernel helper for BBR2 ==="
+  echo "BBR2 requires kernel support (tcp_bbr2 module)."
+  echo
+  if check_bbr2_module; then
+    echo "tcp_bbr2 appears available on this system."
+    echo "No kernel upgrade needed."
+    return
+  fi
+  echo "tcp_bbr2 not detected in this kernel."
+  echo "Options:"
+  echo "  1) Show instructions to upgrade kernel manually (recommended to use provider console)"
+  echo "  2) Attempt to install a newer Ubuntu generic/hwe kernel via apt (risky on remote servers)"
+  echo "  3) Skip (keep classic BBR fallback)"
+  read -rp "Choose option (1/2/3): " kopt
+  case "$kopt" in
+    1)
+      cat <<INSTR
+Manual upgrade instructions (recommended safe approach):
+ - Use your provider console if network may risk being lost.
+ - On Ubuntu, prefer installing a tested generic or HWE kernel:
+   e.g. apt update && apt install linux-image-generic linux-headers-generic
+ - For mainline kernels, you can download .deb packages and install with dpkg -i.
+ - After kernel install, reboot and run: modinfo tcp_bbr2 || grep -i bbr2 /boot/config-$(uname -r)
+INSTR
+      ;;
+    2)
+      echo "Attempting to install 'linux-image-generic' via apt. This may change your kernel and require reboot."
+      read -rp "Proceed with apt install linux-image-generic? (y/N): " confirm
+      if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        if command -v apt-get >/dev/null 2>&1; then
+          apt-get update -y
+          DEBIAN_FRONTEND=noninteractive apt-get install -y linux-image-generic linux-headers-generic || echo "apt install failed or not supported on this release."
+          echo "If kernel packages were installed, reboot is required. After reboot check for tcp_bbr2."
         else
-            echo -e "network:\n  version: 2\n  ethernets:\n    $INTERFACE:\n      mtu: $NEW_MTU" >> "$NETPLAN_FILE"
+          echo "apt not found. Aborting option 2."
         fi
-    else
-        echo -e "network:\n  version: 2\n  ethernets:\n    $INTERFACE:\n      mtu: $NEW_MTU" > "$NETPLAN_FILE"
-    fi
-    
-    netplan apply >/dev/null 2>&1
-    echo -e "${GREEN}MTU optimized to $NEW_MTU!${NC}"
+      else
+        echo "Aborted."
+      fi
+      ;;
+    *)
+      echo "Skipping kernel actions. System will continue to use classic BBR if available."
+      ;;
+  esac
 }
 
-# Test Network Performance
-test_network_performance() {
-    echo -e "\n${BLUE}=== Network Performance Test ===${NC}"
-    
-    # Test BBR status
-    echo -e "${YELLOW}Congestion Control: $(sysctl -n net.ipv4.tcp_congestion_control)${NC}"
-    lsmod | grep -q bbr && echo -e "${GREEN}BBR module loaded${NC}" || echo -e "${RED}BBR module not loaded${NC}"
-    
-    # Test basic connectivity
-    echo -e "${YELLOW}Testing latency...${NC}"
-    ping -c 4 8.8.8.8 | tail -1 | awk '{print "Average Latency:", $4}'
-    
-    # Test download speed (requires curl)
-    if command -v curl >/dev/null; then
-        echo -e "${YELLOW}Testing download speed...${NC}"
-        curl -s -o /dev/null -w "Download Speed: %{speed_download} bytes/sec\n" https://proof.ovh.net/files/100Mb.dat
-    fi
-    
-    # Test bufferbloat (requires netperf)
-    if command -v netperf >/dev/null; then
-        echo -e "${YELLOW}Testing bufferbloat...${NC}"
-        netperf -H localhost -t TCP_RR -l 10 -- -O min_latency,mean_latency,max_latency,stddev_latency
-    fi
-    
-    echo -e "${BLUE}=============================${NC}"
-}
+# Menu
+menu(){
+  ensure_root
+  while true; do
+    cat <<'MENU'
 
-# Status Check
-show_status() {
-    echo -e "\n${BLUE}=== Current Network Status ===${NC}"
-    echo -e "${YELLOW}TCP Algorithm:${NC} $(sysctl -n net.ipv4.tcp_congestion_control)"
-    echo -e "${YELLOW}Queue Discipline:${NC} $(sysctl -n net.core.default_qdisc)"
-    echo -e "${YELLOW}TCP Fast Open:${NC} $(sysctl -n net.ipv4.tcp_fastopen)"
-    
-    INTERFACE=$(ip route | grep default | awk '{print $5}')
-    [ -n "$INTERFACE" ] && {
-        echo -e "${YELLOW}Interface:${NC} $INTERFACE"
-        echo -e "${YELLOW}MTU:${NC} $(ip link show $INTERFACE | grep -o 'mtu [0-9]*' | awk '{print $2}')"
-    }
-    
-    echo -e "${YELLOW}DNS:${NC} $(grep '^DNS=' "$DNS_FILE" 2>/dev/null | cut -d= -f2 || echo 'System Default')"
-    echo -e "${BLUE}=============================${NC}"
-}
-
-# Main Menu
-while true; do
-    clear
-    echo -e "${BLUE}=== Network Optimizer Pro v7.0 ===${NC}"
-    echo "1. Apply Ultimate Optimizations (BBR3)"
-    echo "2. Configure DNS"
-    echo "3. Optimize MTU"
-    echo "4. Show Current Status"
-    echo "5. Test Network Performance"
-    echo "6. Exit"
-    echo -n "Select option [1-6]: "
-    read choice
-    case $choice in
-        1) apply_optimizations ;;
-        2) configure_dns ;;
-        3) optimize_mtu ;;
-        4) show_status ;;
-        5) test_network_performance ;;
-        6) exit 0 ;;
-        *) echo -e "${RED}Invalid option!${NC}" ;;
+===== BBR2-SUPER (English) =====
+1) Install / Apply BBR2 tuning (defaults: DNS=1.1.1.1, MTU=1420)
+2) Uninstall / Restore (attempt to restore backups)
+3) Set DNS manually
+4) Set MTU manually
+5) Show status / settings
+6) Kernel helper (check BBR2 availability & guidance)
+7) Reboot server
+8) Exit
+===============================
+MENU
+    read -rp "Your choice: " opt
+    case "$opt" in
+      1) install_flow ;;
+      2) read -rp "Confirm full uninstall? (y/N): " yn; [[ $yn =~ ^[Yy]$ ]] && uninstall_flow || echo "Cancelled" ;;
+      3) set_dns_manual ;;
+      4) set_mtu_manual ;;
+      5) show_status ;;
+      6) kernel_helper ;;
+      7) echo "Rebooting..."; sleep 1; reboot ;;
+      8) echo "Exit."; exit 0 ;;
+      *) echo "Invalid option." ;;
     esac
-    
-    echo
-    read -p "Press Enter to continue..."
-done
+  done
+}
+
+menu
