@@ -48,6 +48,36 @@ set_dns() {
   fi
   log "DNS set to $dns_value"
 }
+detect_package_manager() {
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "apt"
+  elif command -v dnf >/dev/null 2>&1; then
+    echo "dnf"
+  elif command -v yum >/dev/null 2>&1; then
+    echo "yum"
+  else
+    error "No supported package manager found (apt/yum/dnf)."
+    exit 1
+  fi
+}
+check_repos() {
+  local pkg_manager
+  pkg_manager=$(detect_package_manager)
+  case $pkg_manager in
+    apt)
+      if ! apt-get update -y; then
+        error "Failed to update package repositories. Check your sources.list."
+        exit 1
+      fi
+      ;;
+    dnf|yum)
+      if ! $pkg_manager makecache; then
+        error "Failed to update package repositories. Check your repo configuration."
+        exit 1
+      fi
+      ;;
+  esac
+}
 check_kernel_version() {
   local kv
   kv=$(uname -r | cut -d'-' -f1)
@@ -55,18 +85,52 @@ check_kernel_version() {
 }
 install_kernel_hwe() {
   log "Updating package lists..."
-  apt-get update -y
-  log "Installing latest HWE kernel for better BBR2 support..."
-  local release=$(lsb_release -rs)
-  apt-get install -y --install-recommends linux-generic-hwe-"$release" linux-headers-generic-hwe-"$release"
+  check_repos
+  local pkg_manager
+  pkg_manager=$(detect_package_manager)
+  case $pkg_manager in
+    apt)
+      local release
+      release=$(lsb_release -rs 2>/dev/null || grep '^VERSION_ID=' /etc/os-release | cut -d'"' -f2)
+      if [[ -n "$release" ]]; then
+        apt-get install -y --install-recommends linux-generic-hwe-"$release" linux-headers-generic-hwe-"$release" || \
+        apt-get install -y linux-image-amd64 linux-headers-amd64
+      else
+        apt-get install -y linux-image-amd64 linux-headers-amd64
+      fi
+      ;;
+    dnf)
+      dnf install -y kernel kernel-devel kernel-headers
+      ;;
+    yum)
+      yum install -y kernel kernel-devel kernel-headers
+      ;;
+  esac
   log "Kernel installation done. Please reboot your server and rerun the script."
 }
 enable_bbr2_module() {
+  if ! ls /lib/modules/$(uname -r)/kernel/net/ipv4/tcp_bbr2.ko* >/dev/null 2>&1; then
+    error "tcp_bbr2 module not found in kernel modules directory. Please update your kernel to 5.10 or higher."
+    log "If using a custom kernel, ensure CONFIG_TCP_CONG_BBR2=m is enabled in kernel configuration."
+    log "To compile, install kernel sources, run 'make menuconfig', enable CONFIG_TCP_CONG_BBR2, and rebuild."
+    return 1
+  fi
   if ! modprobe tcp_bbr2 >/dev/null 2>&1; then
-    error "tcp_bbr2 module not found in kernel. BBR2 not supported. Please update your kernel."
+    error "Failed to load tcp_bbr2 module. Check kernel configuration."
+    return 1
+  fi
+  if ! lsmod | grep -q tcp_bbr2; then
+    error "tcp_bbr2 module is not loaded."
     return 1
   fi
   log "tcp_bbr2 kernel module loaded."
+}
+check_qdisc_fq() {
+  if ! tc qdisc show | grep -q fq; then
+    log "Fair Queue (fq) qdisc not available. Falling back to default qdisc."
+    return 1
+  fi
+  return 0
 }
 apply_sysctl() {
   local sysctl_file="/etc/sysctl.d/99-bbr2-tuned.conf"
@@ -75,6 +139,7 @@ apply_sysctl() {
 # BBR2 optimized sysctl settings
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr2
+net.ipv6.tcp_congestion_control = bbr2
 
 net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
@@ -90,6 +155,7 @@ net.ipv4.tcp_sack = 1
 net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_mtu_probing = 1
+net.ipv6.tcp_mtu_probing = 1
 
 net.ipv4.tcp_bbr2_bw_probe_cwnd_gain = 2
 net.ipv4.tcp_bbr2_extra_acked_gain = 1
@@ -99,19 +165,45 @@ net.ipv4.tcp_ecn = 0
 net.ipv4.tcp_retries2 = 5
 net.ipv4.tcp_orphan_retries = 2
 EOF
+  if ! check_qdisc_fq; then
+    sed -i '/net.core.default_qdisc/d' "$sysctl_file"
+  fi
   sysctl --system
   log "Sysctl parameters applied."
+}
+tune_bbr2_params() {
+  read -rp "Enter tcp_bbr2_bw_probe_cwnd_gain (default 2): " cwnd_gain
+  cwnd_gain=${cwnd_gain:-2}
+  read -rp "Enter tcp_bbr2_extra_acked_gain (default 1): " acked_gain
+  acked_gain=${acked_gain:-1}
+  read -rp "Enter tcp_bbr2_cwnd_min (default 4): " cwnd_min
+  cwnd_min=${cwnd_min:-4}
+  backup_file /etc/sysctl.d/99-bbr2-tuned.conf
+  sed -i "/tcp_bbr2_bw_probe_cwnd_gain/c\net.ipv4.tcp_bbr2_bw_probe_cwnd_gain=$cwnd_gain" /etc/sysctl.d/99-bbr2-tuned.conf
+  sed -i "/tcp_bbr2_extra_acked_gain/c\net.ipv4.tcp_bbr2_extra_acked_gain=$acked_gain" /etc/sysctl.d/99-bbr2-tuned.conf
+  sed -i "/tcp_bbr2_cwnd_min/c\net.ipv4.tcp_bbr2_cwnd_min=$cwnd_min" /etc/sysctl.d/99-bbr2-tuned.conf
+  sysctl --system
+  log "BBR2 parameters updated."
+  pause
 }
 check_bbr2_enabled() {
   local cc
   cc=$(sysctl -n net.ipv4.tcp_congestion_control)
-  [[ "$cc" == "bbr2" ]]
+  if [[ "$cc" != "bbr2" ]]; then
+    return 1
+  fi
+  if ! lsmod | grep -q tcp_bbr2; then
+    return 1
+  fi
+  return 0
 }
 show_status() {
   echo "----- Current Status -----"
   echo "Kernel version: $(uname -r)"
-  echo "TCP Congestion Control: $(sysctl -n net.ipv4.tcp_congestion_control)"
+  echo "TCP Congestion Control (IPv4): $(sysctl -n net.ipv4.tcp_congestion_control)"
+  echo "TCP Congestion Control (IPv6): $(sysctl -n net.ipv6.tcp_congestion_control)"
   echo "Default qdisc: $(sysctl -n net.core.default_qdisc)"
+  echo "Loaded modules: $(lsmod | grep bbr || echo 'No BBR modules loaded')"
   echo "MTU values:"
   for iface in $(get_interfaces); do
     mtu=$(ip link show "$iface" | awk '/mtu/ {print $5}')
@@ -131,6 +223,7 @@ remove_bbr2() {
   restore_backup /etc/systemd/resolved.conf
   restore_backup /etc/resolv.conf
   sysctl -w net.ipv4.tcp_congestion_control=cubic || true
+  sysctl -w net.ipv6.tcp_congestion_control=cubic || true
   sysctl -w net.core.default_qdisc=fq || true
   for iface in $(get_interfaces); do
     ip link set dev "$iface" mtu 1500 || true
@@ -182,7 +275,7 @@ install_bbr2_flow() {
   if (( kernel_ver_num < required_ver )); then
     log "Kernel version $kernel_ver is too old for BBR2."
     install_kernel_hwe
-    log "Please reboot your server and rerun this script."
+    log "Please reboot your server and rerun the script."
     exit 0
   fi
 
@@ -193,7 +286,7 @@ install_bbr2_flow() {
   if check_bbr2_enabled; then
     log "BBR2 enabled successfully!"
   else
-    error "Failed to enable BBR2."
+    error "Failed to enable BBR2. Check kernel module and sysctl settings."
     exit 1
   fi
   pause
@@ -203,12 +296,18 @@ menu() {
   echo "======================================"
   echo "   Ultra Fast & Stable BBR2 Setup     "
   echo "======================================"
+  echo "System Info:"
+  echo "  Kernel: $(uname -r)"
+  echo "  Distro: $(lsb_release -ds 2>/dev/null || grep '^PRETTY_NAME=' /etc/os-release | cut -d'"' -f2 || echo 'Unknown')"
+  echo "  TCP CC: $(sysctl -n net.ipv4.tcp_congestion_control)"
+  echo "======================================"
   echo "1) Install/Enable BBR2 (with kernel check)"
   echo "2) Remove BBR2 & Restore Defaults"
   echo "3) Change DNS (current: $(get_current_dns))"
   echo "4) Change MTU (current: $(get_current_mtu))"
   echo "5) Show Status"
-  echo "6) Reboot Server"
+  echo "6) Tune BBR2 Parameters"
+  echo "7) Reboot Server"
   echo "0) Exit"
   echo "======================================"
   read -rp "Select option: " choice
@@ -218,7 +317,8 @@ menu() {
     3) change_dns ;;
     4) change_mtu ;;
     5) show_status; pause ;;
-    6) log "Rebooting now..."; reboot ;;
+    6) tune_bbr2_params ;;
+    7) log "Rebooting now..."; reboot ;;
     0) exit 0 ;;
     *) error "Invalid option"; pause ;;
   esac
