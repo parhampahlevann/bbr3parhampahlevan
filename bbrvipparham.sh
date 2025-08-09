@@ -31,7 +31,6 @@ get_interfaces() {
 }
 set_mtu() {
   local mtu_value=$1
-  # تنظیم MTU فقط برای اینترفیس‌های فیزیکی (غیر از VPN)
   for iface in $(get_interfaces); do
     ip link set dev "$iface" mtu "$mtu_value" || log "Failed to set MTU on $iface"
   done
@@ -51,9 +50,10 @@ set_dns() {
   log "DNS set to $dns_value"
 }
 check_kernel_version() {
-  local kv
-  kv=$(uname -r | cut -d'-' -f1)
-  echo "$kv"
+  local major minor
+  major=$(uname -r | cut -d '.' -f1)
+  minor=$(uname -r | cut -d '.' -f2 | cut -d '-' -f1)
+  echo "$major.$minor"
 }
 install_kernel_hwe() {
   log "Installing latest HWE kernel for better BBR2 support..."
@@ -65,18 +65,16 @@ apply_sysctl() {
   local sysctl_file="/etc/sysctl.d/99-bbr2-tuned.conf"
   backup_file "$sysctl_file"
   cat >"$sysctl_file" <<EOF
-# بهینه‌سازی اصلی BBR2
+# BBR2 Optimized Settings
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr2
 
-# بهینه‌سازی بافرها (کاهش جیتر و افزایش پایداری)
 net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
 net.ipv4.tcp_rmem = 4096 87380 16777216
 net.ipv4.tcp_wmem = 4096 65536 16777216
 net.core.netdev_max_backlog = 10000
 
-# بهینه‌سازی TCP برای کاهش پینگ و جیتر
 net.ipv4.tcp_low_latency = 1
 net.ipv4.tcp_no_metrics_save = 1
 net.ipv4.tcp_slow_start_after_idle = 0
@@ -86,12 +84,10 @@ net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_mtu_probing = 1
 
-# تنظیمات اختصاصی BBR2 برای پایداری و کاهش جیتر
 net.ipv4.tcp_bbr2_bw_probe_cwnd_gain = 2
 net.ipv4.tcp_bbr2_extra_acked_gain = 1
 net.ipv4.tcp_bbr2_cwnd_min = 4
 
-# بهینه‌سازی برای VPN (جلوگیری از افت سرعت)
 net.ipv4.tcp_ecn = 0
 net.ipv4.tcp_retries2 = 5
 net.ipv4.tcp_orphan_retries = 2
@@ -105,6 +101,10 @@ enable_bbr2_module() {
     return 1
   fi
   log "tcp_bbr2 kernel module loaded."
+}
+enable_bbr2_module_load_on_boot() {
+  echo "tcp_bbr2" > /etc/modules-load.d/bbr2.conf
+  log "tcp_bbr2 module will be loaded on boot."
 }
 check_bbr2_enabled() {
   local cc
@@ -134,10 +134,9 @@ remove_bbr2() {
   restore_backup /etc/sysctl.d/99-bbr2-tuned.conf
   restore_backup /etc/systemd/resolved.conf
   restore_backup /etc/resolv.conf
-  # Reset kernel params to defaults
+  rm -f /etc/modules-load.d/bbr2.conf
   sysctl -w net.ipv4.tcp_congestion_control=cubic || true
   sysctl -w net.core.default_qdisc=fq || true
-  # Reset MTU to 1500
   for iface in $(get_interfaces); do
     ip link set dev "$iface" mtu 1500 || true
   done
@@ -196,7 +195,6 @@ get_current_dns() {
   fi
 }
 get_current_mtu() {
-  # just return mtu of first interface
   for iface in $(get_interfaces); do
     ip link show "$iface" | awk '/mtu/ {print $5; exit}'
     return
@@ -214,7 +212,7 @@ change_dns() {
   pause
 }
 change_mtu() {
-  read -rp "Enter new MTU (e.g. 1500): " new_mtu
+  read -rp "Enter new MTU (1280-9000, e.g. 1420): " new_mtu
   if ! [[ "$new_mtu" =~ ^[0-9]+$ ]] || ((new_mtu < 1280 || new_mtu > 9000)); then
     error "MTU must be a number between 1280 and 9000."
     pause
@@ -226,31 +224,29 @@ change_mtu() {
 install_bbr2_flow() {
   ensure_root
   log "Starting BBR2 installation and setup..."
-  local kernel_ver
-  kernel_ver=$(uname -r | cut -d'-' -f1)
-  # Remove .x in kernel if any for numeric compare
-  kernel_ver_num=$(echo "$kernel_ver" | awk -F. '{print $1*10000 + $2*100 + $3}')
-  required_ver=51000  # 5.10.0
-  if (( kernel_ver_num < required_ver )); then
-    log "Kernel version too old ($kernel_ver). Installing HWE kernel..."
+  local kernel_major kernel_minor
+  kernel_major=$(uname -r | cut -d '.' -f1)
+  kernel_minor=$(uname -r | cut -d '.' -f2 | cut -d '-' -f1)
+  if (( kernel_major < 5 || (kernel_major == 5 && kernel_minor < 10) )); then
+    log "Kernel version too old ($(uname -r)). Installing HWE kernel..."
     install_kernel_hwe
     log "Please reboot your server and rerun the script to continue BBR2 setup."
     exit 0
   fi
   enable_bbr2_module || exit 1
+  enable_bbr2_module_load_on_boot
   apply_sysctl
   set_dns "1.1.1.1"
-  set_mtu 1500  # تغییر MTU پیش‌فرض به 1500 برای بهینه‌سازی TCP
-  # Verify
+  set_mtu 1420
   if check_bbr2_enabled; then
     log "BBR2 enabled successfully."
-    log "Important: For VPN connections, set MTU to 1420 in your VPN client settings."
   else
     error "Failed to enable BBR2 congestion control."
     exit 1
   fi
   pause
 }
+
 # -------- Main --------
 while true; do
   menu
