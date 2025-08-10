@@ -135,11 +135,9 @@ set_mtu_persistent() {
                 cp "$netplan_file" "${netplan_file}.bak"
                 
                 # Remove existing MTU setting for the interface
-                sed -i "/$interface:/,/^[^ ]/ {
-                    /mtu:/d
-                }" "$netplan_file"
+                sed -i "/$interface:/,/^    [^ ]/ { /mtu:/d }" "$netplan_file"
                 
-                # Add new MTU setting
+                # Add new MTU setting (assuming standard 4-space indentation for interface level)
                 sed -i "/$interface:/a\      mtu: $mtu" "$netplan_file"
                 
                 netplan apply
@@ -151,25 +149,27 @@ set_mtu_persistent() {
             ;;
         systemd-networkd)
             local network_file="/etc/systemd/network/10-${interface}.network"
-            [ -f "$network_file" ] && cp "$network_file" "${network_file}.bak"
+            [ -f "$network_file" ] || touch "$network_file"
+            cp "$network_file" "${network_file}.bak"
             
-            cat > "$network_file" <<EOF
-[Match]
-Name=$interface
-
-[Network]
-DHCP=yes
-
-[Link]
-MTUBytes=$mtu
-EOF
+            # Remove existing [Link] if needed or update
+            sed -i '/\[Link\]/,/^\[/ {/MTUBytes=/d}' "$network_file"
+            if ! grep -q "\[Link\]" "$network_file"; then
+                echo "[Link]" >> "$network_file"
+            fi
+            sed -i '/\[Link\]/a MTUBytes='"$mtu" "$network_file"
             
             systemctl restart systemd-networkd
             echo -e "${GREEN}MTU set persistently via systemd-networkd.${NC}"
             ;;
         networkmanager)
-            nmcli connection modify "$interface" ipv4.mtu "$mtu"
-            nmcli connection up "$interface"
+            local conn=$(nmcli -t -f NAME,DEVICE con show | grep ":$interface$" | cut -d: -f1)
+            if [ -z "$conn" ]; then
+                echo -e "${BOLD_RED}No connection found for interface $interface.${NC}"
+                return 1
+            fi
+            nmcli con mod "$conn" 802-3-ethernet.mtu "$mtu"
+            nmcli con up "$conn"
             echo -e "${GREEN}MTU set persistently via NetworkManager.${NC}"
             ;;
         ifupdown)
@@ -177,9 +177,7 @@ EOF
             cp "$interfaces_file" "${interfaces_file}.bak"
             
             # Remove existing MTU setting
-            sed -i "/iface $interface inet/,/^$/ {
-                /mtu /d
-            }" "$interfaces_file"
+            sed -i "/iface $interface inet/,/^$/ { /mtu /d }" "$interfaces_file"
             
             # Add new MTU setting
             sed -i "/iface $interface inet/a\    mtu $mtu" "$interfaces_file"
@@ -198,7 +196,8 @@ EOF
 set_dns_persistent() {
     local dns_servers=("$@")
     local manager=$(detect_network_manager)
-    local dns_csv=$(IFS=,; echo "${dns_servers[*]}")
+    local dns_csv=$(IFS=','; echo "${dns_servers[*]}")
+    local dns_list="${dns_servers[*]}"
     
     echo -e "${YELLOW}Setting DNS servers: ${dns_servers[*]}...${NC}"
     
@@ -208,11 +207,14 @@ set_dns_persistent() {
             if [ -n "$netplan_file" ]; then
                 cp "$netplan_file" "${netplan_file}.bak"
                 
-                # Remove existing DNS settings
-                sed -i '/nameservers:/,/^[^ ]/d' "$netplan_file"
-                
-                # Add new DNS settings to all interfaces
-                sed -i "/ethernets:/a\\      nameservers:\n        addresses: [$dns_csv]" "$netplan_file"
+                # Set per interface
+                for iface in "${ALL_INTERFACES[@]}"; do
+                    # Remove existing nameservers block for this interface
+                    sed -i "/$iface:/,/^    [^ ]/ { /nameservers:/,/^      [^ ]/d }" "$netplan_file"
+                    
+                    # Add new nameservers
+                    sed -i "/$iface:/a\        nameservers:\n          addresses: [$dns_csv]" "$netplan_file"
+                done
                 
                 netplan apply
                 echo -e "${GREEN}DNS set persistently via Netplan.${NC}"
@@ -222,21 +224,34 @@ set_dns_persistent() {
             fi
             ;;
         systemd-networkd)
-            # Create systemd-resolved configuration
-            mkdir -p /etc/systemd/resolved.conf.d
-            cat > /etc/systemd/resolved.conf.d/dns_servers.conf <<EOF
-[Resolve]
-DNS=$dns_csv
+            for iface in "${ALL_INTERFACES[@]}"; do
+                local network_file="/etc/systemd/network/10-${iface}.network"
+                if [ ! -f "$network_file" ]; then
+                    cat > "$network_file" <<EOF
+[Match]
+Name=$iface
+
+[Network]
+DHCP=yes
 EOF
+                fi
+                cp "$network_file" "${network_file}.bak"
+                
+                # Remove existing DNS
+                sed -i '/DNS=/d' "$network_file"
+                
+                # Add DNS under [Network]
+                sed -i '/\[Network\]/a DNS='"$dns_list" "$network_file"
+            done
             
-            systemctl restart systemd-resolved
-            echo -e "${GREEN}DNS set persistently via systemd-resolved.${NC}"
+            systemctl restart systemd-networkd
+            echo -e "${GREEN}DNS set persistently via systemd-networkd.${NC}"
             ;;
         networkmanager)
             # Apply to all active connections
-            for conn in $(nmcli connection show --active | awk 'NR>1 {print $1}'); do
-                nmcli connection modify "$conn" ipv4.dns "$dns_csv"
-                nmcli connection up "$conn"
+            for conn in $(nmcli -g NAME con show --active); do
+                nmcli con mod "$conn" ipv4.dns "$dns_list"
+                nmcli con up "$conn"
             done
             echo -e "${GREEN}DNS set persistently via NetworkManager.${NC}"
             ;;
@@ -244,12 +259,14 @@ EOF
             local interfaces_file="/etc/network/interfaces"
             cp "$interfaces_file" "${interfaces_file}.bak"
             
-            # Remove existing DNS settings
-            sed -i '/dns-nameservers /d' "$interfaces_file"
-            
-            # Add new DNS settings
-            echo -e "\n# DNS servers set by $SCRIPT_NAME" >> "$interfaces_file"
-            echo "dns-nameservers ${dns_servers[*]}" >> "$interfaces_file"
+            # Add per interface
+            for iface in "${ALL_INTERFACES[@]}"; do
+                # Remove existing DNS settings for this iface
+                sed -i "/iface $iface inet/,/^$/ { /dns-nameservers /d }" "$interfaces_file"
+                
+                # Add new DNS settings
+                sed -i "/iface $iface inet/a\    dns-nameservers $dns_list" "$interfaces_file"
+            done
             
             # Restart all interfaces
             for iface in "${ALL_INTERFACES[@]}"; do
@@ -628,7 +645,7 @@ configure_dns() {
         
         # Update DNS_SERVERS array and CURRENT_DNS
         DNS_SERVERS=("${valid_dns[@]}")
-        CURRENT_DNS="${valid_dns[@]}"
+        CURRENT_DNS="${valid_dns[*]}"
         
         echo -e "${GREEN}DNS servers updated successfully!${NC}"
         echo -e "New DNS: ${BOLD}${DNS_SERVERS[@]}${NC}"
