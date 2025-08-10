@@ -1,24 +1,30 @@
 #!/bin/bash
 # Global Configuration
 SCRIPT_NAME="BBR VIP Optimizer Pro"
-SCRIPT_VERSION="4.1"
+SCRIPT_VERSION="5.0"
 AUTHOR="Parham Pahlevan"
 CONFIG_FILE="/etc/bbr_vip.conf"
 LOG_FILE="/var/log/bbr_vip.log"
 SYSCTL_BACKUP="/etc/sysctl.conf.bak"
 CRON_JOB_FILE="/etc/cron.d/bbr_vip_autoreset"
-NETWORK_INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
+
+# Network Interface Configuration
+PREFERRED_INTERFACES=("ens160" "eth0")
+NETWORK_INTERFACE=""
+ALL_INTERFACES=()
 VIP_MODE=false
 VIP_SUBNET=""
 VIP_GATEWAY=""
 DEFAULT_MTU=1420
-CURRENT_MTU=$(cat /sys/class/net/$NETWORK_INTERFACE/mtu 2>/dev/null || echo $DEFAULT_MTU)
+CURRENT_MTU=""
 DNS_SERVERS=("1.1.1.1" "8.8.8.8")
-CURRENT_DNS=$(grep nameserver /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ')
+CURRENT_DNS=""
 OS=""
 VER=""
+
 # Initialize logging
 exec > >(tee -a "$LOG_FILE") 2>&1
+
 # Color Codes
 RED='\033[0;31m'
 BOLD_RED='\033[1;31m'
@@ -29,18 +35,20 @@ CYAN='\033[0;36m'
 PURPLE='\033[0;35m'
 NC='\033[0m'
 BOLD='\033[1m'
+
 # Header Display
 show_header() {
     clear
     echo -e "${BLUE}${BOLD}╔══════════════════════════════════════════════════════════╗"
     echo -e "║   ${SCRIPT_NAME} ${SCRIPT_VERSION} - ${AUTHOR}              ║"
     echo -e "╚══════════════════════════════════════════════════════════╝${NC}"
-    echo -e "${YELLOW}Network Interface: ${BOLD}$NETWORK_INTERFACE${NC}"
+    echo -e "${YELLOW}Network Interfaces: ${BOLD}${ALL_INTERFACES[*]}${NC}"
     echo -e "${YELLOW}VIP Mode: ${BOLD}$([ "$VIP_MODE" = true ] && echo "Enabled" || echo "Disabled")${NC}"
     echo -e "${YELLOW}Current MTU: ${BOLD}$CURRENT_MTU${NC}"
     echo -e "${YELLOW}Current DNS: ${BOLD}$CURRENT_DNS${NC}"
     echo -e "${YELLOW}OS Detected: ${BOLD}$OS $VER${NC}\n"
 }
+
 # Check Root
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -48,6 +56,7 @@ check_root() {
         exit 1
     fi
 }
+
 # Detect Distribution
 detect_distro() {
     if [ -f /etc/os-release ]; then
@@ -69,6 +78,7 @@ detect_distro() {
         VER=$(uname -r)
     fi
 }
+
 # Detect Network Manager
 detect_network_manager() {
     if [ -d /etc/netplan ] && [ -n "$(ls -A /etc/netplan/*.yaml 2>/dev/null)" ]; then
@@ -83,11 +93,40 @@ detect_network_manager() {
         echo "unknown"
     fi
 }
+
+# Detect Available Interfaces
+detect_interfaces() {
+    ALL_INTERFACES=()
+    
+    # First check for preferred interfaces
+    for iface in "${PREFERRED_INTERFACES[@]}"; do
+        if ip link show "$iface" >/dev/null 2>&1; then
+            ALL_INTERFACES+=("$iface")
+        fi
+    done
+    
+    # If no preferred interfaces found, add all available interfaces
+    if [ ${#ALL_INTERFACES[@]} -eq 0 ]; then
+        ALL_INTERFACES=($(ip -o link show | awk -F': ' '{print $2}' | grep -v lo))
+    fi
+    
+    # Set primary interface
+    if [ ${#ALL_INTERFACES[@]} -gt 0 ]; then
+        NETWORK_INTERFACE="${ALL_INTERFACES[0]}"
+        CURRENT_MTU=$(cat /sys/class/net/$NETWORK_INTERFACE/mtu 2>/dev/null || echo $DEFAULT_MTU)
+    fi
+    
+    # Get current DNS
+    CURRENT_DNS=$(grep nameserver /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ')
+}
+
 # Set MTU Persistently
 set_mtu_persistent() {
     local interface=$1
     local mtu=$2
     local manager=$(detect_network_manager)
+    
+    echo -e "${YELLOW}Setting MTU $mtu on interface $interface...${NC}"
     
     case $manager in
         netplan)
@@ -104,10 +143,10 @@ set_mtu_persistent() {
                 sed -i "/$interface:/a\      mtu: $mtu" "$netplan_file"
                 
                 netplan apply
-                echo "MTU set persistently via Netplan."
+                echo -e "${GREEN}MTU set persistently via Netplan.${NC}"
             else
-                echo "No Netplan configuration file found. Using temporary method."
-                ip link set dev $interface mtu $mtu
+                echo -e "${BOLD_RED}No Netplan configuration file found.${NC}"
+                return 1
             fi
             ;;
         systemd-networkd)
@@ -126,12 +165,12 @@ MTUBytes=$mtu
 EOF
             
             systemctl restart systemd-networkd
-            echo "MTU set persistently via systemd-networkd."
+            echo -e "${GREEN}MTU set persistently via systemd-networkd.${NC}"
             ;;
         networkmanager)
             nmcli connection modify "$interface" ipv4.mtu "$mtu"
             nmcli connection up "$interface"
-            echo "MTU set persistently via NetworkManager."
+            echo -e "${GREEN}MTU set persistently via NetworkManager.${NC}"
             ;;
         ifupdown)
             local interfaces_file="/etc/network/interfaces"
@@ -146,19 +185,22 @@ EOF
             sed -i "/iface $interface inet/a\    mtu $mtu" "$interfaces_file"
             
             ifdown $interface && ifup $interface
-            echo "MTU set persistently via ifupdown."
+            echo -e "${GREEN}MTU set persistently via ifupdown.${NC}"
             ;;
         *)
-            echo "Unknown network manager. Using temporary method."
+            echo -e "${BOLD_RED}Unknown network manager. Using temporary method.${NC}"
             ip link set dev $interface mtu $mtu
             ;;
     esac
 }
+
 # Set DNS Persistently
 set_dns_persistent() {
     local dns_servers=("$@")
     local manager=$(detect_network_manager)
     local dns_csv=$(IFS=,; echo "${dns_servers[*]}")
+    
+    echo -e "${YELLOW}Setting DNS servers: ${dns_servers[*]}...${NC}"
     
     case $manager in
         netplan)
@@ -167,77 +209,69 @@ set_dns_persistent() {
                 cp "$netplan_file" "${netplan_file}.bak"
                 
                 # Remove existing DNS settings
-                sed -i "/$NETWORK_INTERFACE:/,/^[^ ]/ {
-                    /nameservers:/,/^[^ ]/d
-                }" "$netplan_file"
+                sed -i '/nameservers:/,/^[^ ]/d' "$netplan_file"
                 
-                # Add new DNS settings
-                sed -i "/$NETWORK_INTERFACE:/a\      nameservers:\n        addresses: [$dns_csv]" "$netplan_file"
+                # Add new DNS settings to all interfaces
+                sed -i "/ethernets:/a\\      nameservers:\n        addresses: [$dns_csv]" "$netplan_file"
                 
                 netplan apply
-                echo "DNS set persistently via Netplan."
+                echo -e "${GREEN}DNS set persistently via Netplan.${NC}"
             else
-                echo "No Netplan configuration file found. Using temporary method."
-                update_dns_temp
+                echo -e "${BOLD_RED}No Netplan configuration file found.${NC}"
+                return 1
             fi
             ;;
         systemd-networkd)
-            local network_file="/etc/systemd/network/10-${NETWORK_INTERFACE}.network"
-            [ -f "$network_file" ] && cp "$network_file" "${network_file}.bak"
-            
-            cat > "$network_file" <<EOF
-[Match]
-Name=$NETWORK_INTERFACE
-
-[Network]
-DHCP=yes
+            # Create systemd-resolved configuration
+            mkdir -p /etc/systemd/resolved.conf.d
+            cat > /etc/systemd/resolved.conf.d/dns_servers.conf <<EOF
+[Resolve]
 DNS=$dns_csv
-
-[Link]
-MTUBytes=$CURRENT_MTU
 EOF
             
-            systemctl restart systemd-networkd
-            echo "DNS set persistently via systemd-networkd."
+            systemctl restart systemd-resolved
+            echo -e "${GREEN}DNS set persistently via systemd-resolved.${NC}"
             ;;
         networkmanager)
-            nmcli connection modify "$NETWORK_INTERFACE" ipv4.dns "$dns_csv"
-            nmcli connection up "$NETWORK_INTERFACE"
-            echo "DNS set persistently via NetworkManager."
+            # Apply to all active connections
+            for conn in $(nmcli connection show --active | awk 'NR>1 {print $1}'); do
+                nmcli connection modify "$conn" ipv4.dns "$dns_csv"
+                nmcli connection up "$conn"
+            done
+            echo -e "${GREEN}DNS set persistently via NetworkManager.${NC}"
             ;;
         ifupdown)
             local interfaces_file="/etc/network/interfaces"
             cp "$interfaces_file" "${interfaces_file}.bak"
             
             # Remove existing DNS settings
-            sed -i "/iface $NETWORK_INTERFACE inet/,/^$/ {
-                /dns-nameservers /d
-            }" "$interfaces_file"
+            sed -i '/dns-nameservers /d' "$interfaces_file"
             
             # Add new DNS settings
-            sed -i "/iface $NETWORK_INTERFACE inet/a\    dns-nameservers ${dns_servers[*]}" "$interfaces_file"
+            echo -e "\n# DNS servers set by $SCRIPT_NAME" >> "$interfaces_file"
+            echo "dns-nameservers ${dns_servers[*]}" >> "$interfaces_file"
             
-            ifdown $NETWORK_INTERFACE && ifup $NETWORK_INTERFACE
-            echo "DNS set persistently via ifupdown."
+            # Restart all interfaces
+            for iface in "${ALL_INTERFACES[@]}"; do
+                ifdown $iface && ifup $iface
+            done
+            echo -e "${GREEN}DNS set persistently via ifupdown.${NC}"
             ;;
         *)
-            echo "Unknown network manager. Using temporary method."
-            update_dns_temp
+            echo -e "${BOLD_RED}Unknown network manager. Using temporary method.${NC}"
+            echo "# Generated by $SCRIPT_NAME" > /etc/resolv.conf
+            for dns in "${dns_servers[@]}"; do
+                echo "nameserver $dns" >> /etc/resolv.conf
+            done
             ;;
     esac
 }
-# Update DNS Configuration (Temporary)
-update_dns_temp() {
-    echo "# Generated by $SCRIPT_NAME" > /etc/resolv.conf
-    for dns in "${DNS_SERVERS[@]}"; do
-        echo "nameserver $dns" >> /etc/resolv.conf
-    done
-    CURRENT_DNS="${DNS_SERVERS[@]}"
-}
+
 # Load Configuration
 load_config() {
     if [[ -f "$CONFIG_FILE" ]]; then
         source "$CONFIG_FILE"
+        detect_interfaces
     else
         # Default values
         ENABLE_BBR=true
@@ -275,20 +309,21 @@ load_config() {
             "net.ipv4.tcp_low_latency=1"
         )
         
-        # Apply default MTU using persistent method
-        set_mtu_persistent "$NETWORK_INTERFACE" "$DEFAULT_MTU"
+        detect_interfaces
+        
+        # Apply default MTU to all interfaces
+        for iface in "${ALL_INTERFACES[@]}"; do
+            set_mtu_persistent "$iface" "$DEFAULT_MTU"
+        done
         CURRENT_MTU=$DEFAULT_MTU
         
-        # Apply default DNS using persistent method
+        # Apply default DNS
         set_dns_persistent "${DNS_SERVERS[@]}"
         
         save_config
     fi
 }
-# Update DNS Configuration (Legacy - kept for compatibility)
-update_dns() {
-    set_dns_persistent "${DNS_SERVERS[@]}"
-}
+
 # Backup current sysctl settings
 backup_sysctl() {
     if [[ ! -f "$SYSCTL_BACKUP" ]]; then
@@ -296,6 +331,7 @@ backup_sysctl() {
         echo -e "${GREEN}Current sysctl configuration backed up to $SYSCTL_BACKUP${NC}"
     fi
 }
+
 # Apply Kernel Parameters
 apply_kernel_params() {
     echo -e "${YELLOW}Applying optimized kernel parameters...${NC}"
@@ -346,6 +382,29 @@ apply_kernel_params() {
     echo -e "${GREEN}Kernel parameters applied successfully!${NC}"
     return 0
 }
+
+# Enable BBR on specific interface
+enable_bbr_interface() {
+    local interface=$1
+    echo -e "${YELLOW}Enabling BBR on interface $interface...${NC}"
+    
+    # Remove existing qdisc
+    tc qdisc del dev $interface root 2>/dev/null
+    
+    # Add FQ qdisc
+    if ! tc qdisc add dev $interface root fq; then
+        echo -e "${BOLD_RED}Failed to add FQ qdisc on $interface${NC}"
+        return 1
+    fi
+    
+    # Enable TCP BBR
+    sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1
+    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1
+    
+    echo -e "${GREEN}BBR enabled successfully on $interface${NC}"
+    return 0
+}
+
 # Verify BBR Status
 verify_bbr() {
     echo -e "${YELLOW}Verifying BBR status...${NC}"
@@ -358,10 +417,21 @@ verify_bbr() {
         return 1
     fi
     
-    if [[ "$current_congestion" == "$TCP_CONGESTION" && "$current_qdisc" == "fq" ]]; then
+    if [[ "$current_congestion" == "bbr" && "$current_qdisc" == "fq" ]]; then
         echo -e "${GREEN}BBR is active and properly configured!${NC}"
         echo -e "Congestion control: ${BOLD}$current_congestion${NC}"
         echo -e "Queue discipline: ${BOLD}$current_qdisc${NC}"
+        
+        # Check per-interface
+        for iface in "${ALL_INTERFACES[@]}"; do
+            local qdisc=$(tc qdisc show dev $iface | awk '{print $3}')
+            if [[ "$qdisc" == "fq" ]]; then
+                echo -e "Interface $iface: ${GREEN}BBR enabled${NC}"
+            else
+                echo -e "Interface $iface: ${BOLD_RED}BBR not enabled${NC}"
+            fi
+        done
+        
         return 0
     else
         echo -e "${BOLD_RED}BBR is not properly configured!${NC}"
@@ -370,6 +440,7 @@ verify_bbr() {
         return 1
     fi
 }
+
 # Setup Cron Job for Auto Reset
 setup_cron_job() {
     local cron_time="0 4 * * *"  # Default: 4 AM daily
@@ -398,6 +469,7 @@ setup_cron_job() {
     echo -e "The system will automatically reset network settings at: ${BOLD}$cron_time${NC}"
     return 0
 }
+
 # Reset Network Settings
 reset_network() {
     echo -e "${YELLOW}Resetting network settings to default...${NC}"
@@ -413,11 +485,13 @@ reset_network() {
             return 1
         fi
         
-        # Reset MTU to default using persistent method
-        set_mtu_persistent "$NETWORK_INTERFACE" "$DEFAULT_MTU"
+        # Reset MTU to default on all interfaces
+        for iface in "${ALL_INTERFACES[@]}"; do
+            set_mtu_persistent "$iface" "$DEFAULT_MTU"
+        done
         CURRENT_MTU=$DEFAULT_MTU
         
-        # Reset DNS to default using persistent method
+        # Reset DNS to default
         DNS_SERVERS=("1.1.1.1" "8.8.8.8")
         set_dns_persistent "${DNS_SERVERS[@]}"
         
@@ -432,6 +506,7 @@ reset_network() {
         return 1
     fi
 }
+
 # Restart Network Services
 restart_network_services() {
     echo -e "${YELLOW}Restarting network services...${NC}"
@@ -459,6 +534,7 @@ restart_network_services() {
         return 1
     fi
 }
+
 # Configure VIP Settings
 configure_vip() {
     echo -e "\n${YELLOW}Configuring VIP Optimization${NC}"
@@ -480,9 +556,17 @@ configure_vip() {
     
     save_config
 }
+
 # Configure MTU
 configure_mtu() {
     echo -e "\n${YELLOW}Configuring Network Interface MTU${NC}"
+    
+    echo -e "Available interfaces: ${ALL_INTERFACES[*]}"
+    read -p "Enter interface name (or leave blank for all): " target_iface
+    
+    if [ -z "$target_iface" ]; then
+        target_iface="${ALL_INTERFACES[*]}"
+    fi
     
     echo -e "Current MTU: ${BOLD}$CURRENT_MTU${NC}"
     read -p "Do you want to change MTU? (y/n): " change_mtu
@@ -495,16 +579,22 @@ configure_mtu() {
             return 1
         fi
         
-        # Use persistent method to set MTU
-        set_mtu_persistent "$NETWORK_INTERFACE" "$new_mtu"
+        # Apply to specified interfaces
+        for iface in $target_iface; do
+            if [[ " ${ALL_INTERFACES[*]} " =~ " ${iface} " ]]; then
+                set_mtu_persistent "$iface" "$new_mtu"
+            else
+                echo -e "${BOLD_RED}Interface $iface not found!${NC}"
+            fi
+        done
         
-        # Update current MTU variable
         CURRENT_MTU=$new_mtu
         echo -e "${GREEN}MTU successfully changed to $new_mtu!${NC}"
         
         save_config
     fi
 }
+
 # Configure DNS
 configure_dns() {
     echo -e "\n${YELLOW}Configuring DNS Servers${NC}"
@@ -546,6 +636,7 @@ configure_dns() {
         save_config
     fi
 }
+
 # Save Configuration
 save_config() {
     echo -e "${YELLOW}Saving configuration to $CONFIG_FILE...${NC}"
@@ -561,27 +652,33 @@ VIP_SUBNET="$VIP_SUBNET"
 VIP_GATEWAY="$VIP_GATEWAY"
 MTU=$CURRENT_MTU
 DNS_SERVERS=(${DNS_SERVERS[@]})
+ALL_INTERFACES=(${ALL_INTERFACES[@]})
 EOL
     echo -e "${GREEN}Configuration saved successfully!${NC}"
 }
+
 # Network Interface Configuration
 configure_interface() {
-    echo -e "\n${YELLOW}Configuring network interface: $NETWORK_INTERFACE${NC}"
+    echo -e "\n${YELLOW}Configuring network interfaces...${NC}"
     
-    # Enable BBR for the specific interface
-    if ! tc qdisc add dev $NETWORK_INTERFACE root fq 2>/dev/null; then
-        echo -e "${YELLOW}Queue discipline already configured or failed to set.${NC}"
-    fi
+    # Apply BBR to all interfaces
+    for iface in "${ALL_INTERFACES[@]}"; do
+        echo -e "${CYAN}Configuring interface: $iface${NC}"
+        
+        # Enable BBR for the interface
+        enable_bbr_interface "$iface"
+        
+        # Apply additional interface-specific settings
+        ethtool -K $iface tso on gso on gro on 2>/dev/null
+        ethtool -C $iface rx-usecs 30 2>/dev/null
+        
+        # Set MTU
+        set_mtu_persistent "$iface" "$CURRENT_MTU"
+    done
     
-    # Apply additional interface-specific settings
-    ethtool -K $NETWORK_INTERFACE tso on gso on gro on 2>/dev/null
-    ethtool -C $NETWORK_INTERFACE rx-usecs 30 2>/dev/null
-    
-    # Set MTU using persistent method
-    set_mtu_persistent "$NETWORK_INTERFACE" "$CURRENT_MTU"
-    
-    echo -e "${GREEN}Interface configuration applied to $NETWORK_INTERFACE${NC}"
+    echo -e "${GREEN}All interfaces configured successfully!${NC}"
 }
+
 # Test Network Speed
 test_speed() {
     echo -e "\n${YELLOW}Running network speed test...${NC}"
@@ -603,6 +700,7 @@ test_speed() {
     echo -e "\n${CYAN}Testing latency to 1.1.1.1...${NC}"
     ping -c 5 1.1.1.1 | grep -A1 "statistics"
 }
+
 # Show Current Settings
 show_settings() {
     echo -e "\n${YELLOW}Current Configuration:${NC}"
@@ -611,6 +709,7 @@ show_settings() {
     echo -e "VIP Mode: ${BOLD}$VIP_MODE${NC}"
     echo -e "MTU: ${BOLD}$CURRENT_MTU${NC}"
     echo -e "DNS Servers: ${BOLD}${DNS_SERVERS[@]}${NC}"
+    echo -e "Network Interfaces: ${BOLD}${ALL_INTERFACES[*]}${NC}"
     
     if [ "$VIP_MODE" = true ]; then
         echo -e "VIP Subnet: ${BOLD}$VIP_SUBNET${NC}"
@@ -621,9 +720,22 @@ show_settings() {
     sysctl -a 2>/dev/null | grep -E "net.core.default_qdisc|net.ipv4.tcp_congestion_control|net.ipv4.tcp_fastopen"
     
     echo -e "\n${YELLOW}Interface Settings:${NC}"
-    ethtool -k $NETWORK_INTERFACE 2>/dev/null | grep -E "tcp-segmentation-offload:|generic-segmentation-offload:|generic-receive-offload:"
-    echo -e "Current Interface MTU: ${BOLD}$(cat /sys/class/net/$NETWORK_INTERFACE/mtu 2>/dev/null)${NC}"
+    for iface in "${ALL_INTERFACES[@]}"; do
+        echo -e "Interface: ${BOLD}$iface${NC}"
+        ethtool -k $iface 2>/dev/null | grep -E "tcp-segmentation-offload:|generic-segmentation-offload:|generic-receive-offload:"
+        echo -e "Current MTU: ${BOLD}$(cat /sys/class/net/$iface/mtu 2>/dev/null)${NC}"
+        
+        # Check BBR status
+        local qdisc=$(tc qdisc show dev $iface | awk '{print $3}')
+        if [[ "$qdisc" == "fq" ]]; then
+            echo -e "BBR Status: ${GREEN}Enabled${NC}"
+        else
+            echo -e "BBR Status: ${BOLD_RED}Disabled${NC}"
+        fi
+        echo
+    done
 }
+
 # Show System Information
 show_system_info() {
     echo -e "\n${YELLOW}System Information:${NC}"
@@ -638,7 +750,13 @@ show_system_info() {
     echo -e "Public IP: ${BOLD}$(curl -s ifconfig.me)${NC}"
     echo -e "Local IP: ${BOLD}$(hostname -I | awk '{print $1}')${NC}"
     echo -e "Gateway: ${BOLD}$(ip route | grep default | awk '{print $3}')${NC}"
+    
+    echo -e "\n${YELLOW}Network Interfaces:${NC}"
+    ip -o link show | awk -F': ' '{print $2}' | grep -v lo | while read iface; do
+        echo -e "  ${BOLD}$iface${NC}: $(ip addr show $iface | grep -oP 'inet \K[\d.]+')"
+    done
 }
+
 # Main Menu
 show_menu() {
     while true; do
@@ -720,13 +838,16 @@ show_menu() {
         read -p "Press [Enter] to return to main menu..."
     done
 }
+
 # Main Execution
 main() {
     check_root
     detect_distro
+    detect_interfaces
     load_config
     show_menu
 }
+
 # Handle command line arguments
 case "$1" in
     "--reset")
