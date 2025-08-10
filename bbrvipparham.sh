@@ -1,409 +1,739 @@
-#!/usr/bin/env bash
-set -euo pipefail
-LANG=C.UTF-8
-
-log() { echo -e "\e[32m[$(date '+%F %T')]\e[0m $*"; }
-error() { echo -e "\e[31mError: $*\e[0m" >&2; }
-pause() { read -rp "Press Enter to continue..."; }
-ensure_root() {
-  if [[ $EUID -ne 0 ]]; then
-    error "Please run as root."
-    exit 1
-  fi
+#!/bin/bash
+# Global Configuration
+SCRIPT_NAME="BBR VIP Optimizer Pro"
+SCRIPT_VERSION="4.1"
+AUTHOR="Parham Pahlevan"
+CONFIG_FILE="/etc/bbr_vip.conf"
+LOG_FILE="/var/log/bbr_vip.log"
+SYSCTL_BACKUP="/etc/sysctl.conf.bak"
+CRON_JOB_FILE="/etc/cron.d/bbr_vip_autoreset"
+NETWORK_INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
+VIP_MODE=false
+VIP_SUBNET=""
+VIP_GATEWAY=""
+DEFAULT_MTU=1420
+CURRENT_MTU=$(cat /sys/class/net/$NETWORK_INTERFACE/mtu 2>/dev/null || echo $DEFAULT_MTU)
+DNS_SERVERS=("1.1.1.1" "8.8.8.8")
+CURRENT_DNS=$(grep nameserver /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ')
+OS=""
+VER=""
+# Initialize logging
+exec > >(tee -a "$LOG_FILE") 2>&1
+# Color Codes
+RED='\033[0;31m'
+BOLD_RED='\033[1;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+PURPLE='\033[0;35m'
+NC='\033[0m'
+BOLD='\033[1m'
+# Header Display
+show_header() {
+    clear
+    echo -e "${BLUE}${BOLD}╔══════════════════════════════════════════════════════════╗"
+    echo -e "║   ${SCRIPT_NAME} ${SCRIPT_VERSION} - ${AUTHOR}              ║"
+    echo -e "╚══════════════════════════════════════════════════════════╝${NC}"
+    echo -e "${YELLOW}Network Interface: ${BOLD}$NETWORK_INTERFACE${NC}"
+    echo -e "${YELLOW}VIP Mode: ${BOLD}$([ "$VIP_MODE" = true ] && echo "Enabled" || echo "Disabled")${NC}"
+    echo -e "${YELLOW}Current MTU: ${BOLD}$CURRENT_MTU${NC}"
+    echo -e "${YELLOW}Current DNS: ${BOLD}$CURRENT_DNS${NC}"
+    echo -e "${YELLOW}OS Detected: ${BOLD}$OS $VER${NC}\n"
 }
-check_internet() {
-  if ! ping -c 1 8.8.8.8 >/dev/null 2>&1; then
-    error "No internet connection. Please check your network and try again."
-    exit 1
-  fi
-  log "Internet connection verified."
+# Check Root
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${BOLD_RED}Error: This script must be run as root!${NC}"
+        exit 1
+    fi
 }
-check_disk_space() {
-  local required_space=2048  # 2GB in MB
-  local available_space
-  available_space=$(df -m / | tail -1 | awk '{print $4}')
-  if (( available_space < required_space )); then
-    error "Insufficient disk space. At least 2GB is required. Available: ${available_space}MB"
-    exit 1
-  fi
-  log "Sufficient disk space available: ${available_space}MB"
-}
-backup_file() {
-  local file=$1
-  if [[ -f "$file" && ! -f "$file.bak-bbr2" ]]; then
-    cp "$file" "$file.bak-bbr2"
-    log "Backup created for $file"
-  fi
-}
-restore_backup() {
-  local file=$1
-  if [[ -f "$file.bak-bbr2" ]]; then
-    mv -f "$file.bak-bbr2" "$file"
-    log "Backup restored for $file"
-  fi
-}
-get_interfaces() {
-  ip -o link show | awk -F': ' '{print $2}' | grep -Ev '^(lo|docker.*|veth.*|br-|tun|tap|wg|virbr|lxc|vnet)'
-}
-set_mtu() {
-  local mtu_value=$1
-  for iface in $(get_interfaces); do
-    ip link set dev "$iface" mtu "$mtu_value" || log "Failed to set MTU on $iface"
-  done
-  log "MTU set to $mtu_value on physical interfaces."
-}
-set_dns() {
-  local dns_value=$1
-  if systemctl is-active --quiet systemd-resolved; then
-    backup_file /etc/systemd/resolved.conf
-    echo -e "[Resolve]\nDNS=$dns_value\n" > /etc/systemd/resolved.conf
-    systemctl restart systemd-resolved
-    ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
-  else
-    backup_file /etc/resolv.conf
-    echo "nameserver $dns_value" > /etc/resolv.conf
-  fi
-  log "DNS set to $dns_value"
-}
-detect_package_manager() {
-  if command -v apt-get >/dev/null 2>&1; then
-    echo "apt"
-  elif command -v dnf >/dev/null 2>&1; then
-    echo "dnf"
-  elif command -v yum >/dev/null 2>&1; then
-    echo "yum"
-  else
-    error "No supported package manager found (apt/yum/dnf)."
-    exit 1
-  fi
-}
-configure_repos() {
-  local pkg_manager
-  pkg_manager=$(detect_package_manager)
-  case $pkg_manager in
-    apt)
-      if [[ -f /etc/os-release ]]; then
+# Detect Distribution
+detect_distro() {
+    if [ -f /etc/os-release ]; then
         . /etc/os-release
-        if [[ "$ID" == "ubuntu" ]]; then
-          log "Configuring Ubuntu repositories..."
-          cat >/etc/apt/sources.list <<EOF
-deb http://archive.ubuntu.com/ubuntu $VERSION_CODENAME main restricted universe multiverse
-deb http://archive.ubuntu.com/ubuntu $VERSION_CODENAME-updates main restricted universe multiverse
-deb http://security.ubuntu.com/ubuntu $VERSION_CODENAME-security main restricted universe multiverse
+        OS=$NAME
+        VER=$VERSION_ID
+    elif type lsb_release >/dev/null 2>&1; then
+        OS=$(lsb_release -si)
+        VER=$(lsb_release -sr)
+    elif [ -f /etc/lsb-release ]; then
+        . /etc/lsb-release
+        OS=$DISTRIB_ID
+        VER=$DISTRIB_RELEASE
+    elif [ -f /etc/debian_version ]; then
+        OS=Debian
+        VER=$(cat /etc/debian_version)
+    else
+        OS=$(uname -s)
+        VER=$(uname -r)
+    fi
+}
+# Detect Network Manager
+detect_network_manager() {
+    if [ -d /etc/netplan ] && [ -n "$(ls -A /etc/netplan/*.yaml 2>/dev/null)" ]; then
+        echo "netplan"
+    elif [ -d /etc/systemd/network ] && systemctl is-active --quiet systemd-networkd; then
+        echo "systemd-networkd"
+    elif systemctl is-active --quiet NetworkManager; then
+        echo "networkmanager"
+    elif [ -f /etc/network/interfaces ]; then
+        echo "ifupdown"
+    else
+        echo "unknown"
+    fi
+}
+# Set MTU Persistently
+set_mtu_persistent() {
+    local interface=$1
+    local mtu=$2
+    local manager=$(detect_network_manager)
+    
+    case $manager in
+        netplan)
+            local netplan_file=$(ls /etc/netplan/*.yaml | head -1)
+            if [ -n "$netplan_file" ]; then
+                cp "$netplan_file" "${netplan_file}.bak"
+                
+                # Remove existing MTU setting for the interface
+                sed -i "/$interface:/,/^[^ ]/ {
+                    /mtu:/d
+                }" "$netplan_file"
+                
+                # Add new MTU setting
+                sed -i "/$interface:/a\      mtu: $mtu" "$netplan_file"
+                
+                netplan apply
+                echo "MTU set persistently via Netplan."
+            else
+                echo "No Netplan configuration file found. Using temporary method."
+                ip link set dev $interface mtu $mtu
+            fi
+            ;;
+        systemd-networkd)
+            local network_file="/etc/systemd/network/10-${interface}.network"
+            [ -f "$network_file" ] && cp "$network_file" "${network_file}.bak"
+            
+            cat > "$network_file" <<EOF
+[Match]
+Name=$interface
+
+[Network]
+DHCP=yes
+
+[Link]
+MTUBytes=$mtu
 EOF
-        elif [[ "$ID" == "debian" ]]; then
-          log "Configuring Debian repositories..."
-          cat >/etc/apt/sources.list <<EOF
-deb http://deb.debian.org/debian $VERSION_CODENAME main contrib non-free
-deb http://deb.debian.org/debian $VERSION_CODENAME-updates main contrib non-free
-deb http://security.debian.org/debian-security $VERSION_CODENAME-security main contrib non-free
+            
+            systemctl restart systemd-networkd
+            echo "MTU set persistently via systemd-networkd."
+            ;;
+        networkmanager)
+            nmcli connection modify "$interface" ipv4.mtu "$mtu"
+            nmcli connection up "$interface"
+            echo "MTU set persistently via NetworkManager."
+            ;;
+        ifupdown)
+            local interfaces_file="/etc/network/interfaces"
+            cp "$interfaces_file" "${interfaces_file}.bak"
+            
+            # Remove existing MTU setting
+            sed -i "/iface $interface inet/,/^$/ {
+                /mtu /d
+            }" "$interfaces_file"
+            
+            # Add new MTU setting
+            sed -i "/iface $interface inet/a\    mtu $mtu" "$interfaces_file"
+            
+            ifdown $interface && ifup $interface
+            echo "MTU set persistently via ifupdown."
+            ;;
+        *)
+            echo "Unknown network manager. Using temporary method."
+            ip link set dev $interface mtu $mtu
+            ;;
+    esac
+}
+# Set DNS Persistently
+set_dns_persistent() {
+    local dns_servers=("$@")
+    local manager=$(detect_network_manager)
+    local dns_csv=$(IFS=,; echo "${dns_servers[*]}")
+    
+    case $manager in
+        netplan)
+            local netplan_file=$(ls /etc/netplan/*.yaml | head -1)
+            if [ -n "$netplan_file" ]; then
+                cp "$netplan_file" "${netplan_file}.bak"
+                
+                # Remove existing DNS settings
+                sed -i "/$NETWORK_INTERFACE:/,/^[^ ]/ {
+                    /nameservers:/,/^[^ ]/d
+                }" "$netplan_file"
+                
+                # Add new DNS settings
+                sed -i "/$NETWORK_INTERFACE:/a\      nameservers:\n        addresses: [$dns_csv]" "$netplan_file"
+                
+                netplan apply
+                echo "DNS set persistently via Netplan."
+            else
+                echo "No Netplan configuration file found. Using temporary method."
+                update_dns_temp
+            fi
+            ;;
+        systemd-networkd)
+            local network_file="/etc/systemd/network/10-${NETWORK_INTERFACE}.network"
+            [ -f "$network_file" ] && cp "$network_file" "${network_file}.bak"
+            
+            cat > "$network_file" <<EOF
+[Match]
+Name=$NETWORK_INTERFACE
+
+[Network]
+DHCP=yes
+DNS=$dns_csv
+
+[Link]
+MTUBytes=$CURRENT_MTU
 EOF
+            
+            systemctl restart systemd-networkd
+            echo "DNS set persistently via systemd-networkd."
+            ;;
+        networkmanager)
+            nmcli connection modify "$NETWORK_INTERFACE" ipv4.dns "$dns_csv"
+            nmcli connection up "$NETWORK_INTERFACE"
+            echo "DNS set persistently via NetworkManager."
+            ;;
+        ifupdown)
+            local interfaces_file="/etc/network/interfaces"
+            cp "$interfaces_file" "${interfaces_file}.bak"
+            
+            # Remove existing DNS settings
+            sed -i "/iface $NETWORK_INTERFACE inet/,/^$/ {
+                /dns-nameservers /d
+            }" "$interfaces_file"
+            
+            # Add new DNS settings
+            sed -i "/iface $NETWORK_INTERFACE inet/a\    dns-nameservers ${dns_servers[*]}" "$interfaces_file"
+            
+            ifdown $NETWORK_INTERFACE && ifup $NETWORK_INTERFACE
+            echo "DNS set persistently via ifupdown."
+            ;;
+        *)
+            echo "Unknown network manager. Using temporary method."
+            update_dns_temp
+            ;;
+    esac
+}
+# Update DNS Configuration (Temporary)
+update_dns_temp() {
+    echo "# Generated by $SCRIPT_NAME" > /etc/resolv.conf
+    for dns in "${DNS_SERVERS[@]}"; do
+        echo "nameserver $dns" >> /etc/resolv.conf
+    done
+    CURRENT_DNS="${DNS_SERVERS[@]}"
+}
+# Load Configuration
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        source "$CONFIG_FILE"
+    else
+        # Default values
+        ENABLE_BBR=true
+        ENABLE_FASTOPEN=true
+        TCP_CONGESTION="bbr"
+        TCP_FASTOPEN=3
+        VIP_MODE=false
+        VIP_SUBNET=""
+        VIP_GATEWAY=""
+        DEFAULT_KERNEL_PARAMS=(
+            "net.core.default_qdisc=fq"
+            "net.ipv4.tcp_congestion_control=$TCP_CONGESTION"
+            "net.ipv4.tcp_fastopen=$TCP_FASTOPEN"
+            "net.ipv4.tcp_syncookies=1"
+            "net.ipv4.tcp_tw_reuse=1"
+            "net.ipv4.tcp_fin_timeout=30"
+            "net.ipv4.tcp_keepalive_time=1200"
+            "net.ipv4.ip_local_port_range=1024 65000"
+            "net.ipv4.tcp_max_syn_backlog=8192"
+            "net.ipv4.tcp_max_tw_buckets=5000"
+            "net.core.somaxconn=65535"
+            "net.core.netdev_max_backlog=16384"
+            "net.ipv4.tcp_slow_start_after_idle=0"
+            "net.ipv4.tcp_mtu_probing=1"
+            "net.ipv4.tcp_rfc1337=1"
+        )
+        VIP_KERNEL_PARAMS=(
+            "net.ipv4.tcp_window_scaling=1"
+            "net.ipv4.tcp_timestamps=1"
+            "net.ipv4.tcp_sack=1"
+            "net.ipv4.tcp_dsack=1"
+            "net.ipv4.tcp_fack=1"
+            "net.ipv4.tcp_adv_win_scale=1"
+            "net.ipv4.tcp_app_win=31"
+            "net.ipv4.tcp_low_latency=1"
+        )
+        
+        # Apply default MTU using persistent method
+        set_mtu_persistent "$NETWORK_INTERFACE" "$DEFAULT_MTU"
+        CURRENT_MTU=$DEFAULT_MTU
+        
+        # Apply default DNS using persistent method
+        set_dns_persistent "${DNS_SERVERS[@]}"
+        
+        save_config
+    fi
+}
+# Update DNS Configuration (Legacy - kept for compatibility)
+update_dns() {
+    set_dns_persistent "${DNS_SERVERS[@]}"
+}
+# Backup current sysctl settings
+backup_sysctl() {
+    if [[ ! -f "$SYSCTL_BACKUP" ]]; then
+        cp /etc/sysctl.conf "$SYSCTL_BACKUP"
+        echo -e "${GREEN}Current sysctl configuration backed up to $SYSCTL_BACKUP${NC}"
+    fi
+}
+# Apply Kernel Parameters
+apply_kernel_params() {
+    echo -e "${YELLOW}Applying optimized kernel parameters...${NC}"
+    
+    # Create temp file
+    local temp_file=$(mktemp)
+    
+    # Process existing sysctl.conf
+    while IFS= read -r line; do
+        # Skip existing parameters we want to replace
+        local skip_line=false
+        for param in "${DEFAULT_KERNEL_PARAMS[@]}" "${VIP_KERNEL_PARAMS[@]}"; do
+            key=$(echo "$param" | cut -d= -f1)
+            if [[ "$line" == "$key"* ]]; then
+                skip_line=true
+                break
+            fi
+        done
+        $skip_line || echo "$line" >> "$temp_file"
+    done < /etc/sysctl.conf
+    
+    # Add new parameters
+    {
+        echo -e "\n# Added by $SCRIPT_NAME"
+        # Default parameters
+        for param in "${DEFAULT_KERNEL_PARAMS[@]}"; do
+            echo "$param"
+        done
+        
+        # VIP parameters if enabled
+        if [ "$VIP_MODE" = true ]; then
+            echo -e "\n# VIP Optimization Parameters"
+            for param in "${VIP_KERNEL_PARAMS[@]}"; do
+                echo "$param"
+            done
+        fi
+    } >> "$temp_file"
+    
+    # Replace sysctl.conf
+    mv "$temp_file" /etc/sysctl.conf
+    
+    # Apply changes
+    if ! sysctl -p >/dev/null 2>&1; then
+        echo -e "${BOLD_RED}Error applying sysctl settings!${NC}"
+        return 1
+    fi
+    
+    echo -e "${GREEN}Kernel parameters applied successfully!${NC}"
+    return 0
+}
+# Verify BBR Status
+verify_bbr() {
+    echo -e "${YELLOW}Verifying BBR status...${NC}"
+    
+    local current_congestion=$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}' 2>/dev/null)
+    local current_qdisc=$(sysctl net.core.default_qdisc | awk '{print $3}' 2>/dev/null)
+    
+    if [[ -z "$current_congestion" || -z "$current_qdisc" ]]; then
+        echo -e "${BOLD_RED}Error: Could not read current network settings!${NC}"
+        return 1
+    fi
+    
+    if [[ "$current_congestion" == "$TCP_CONGESTION" && "$current_qdisc" == "fq" ]]; then
+        echo -e "${GREEN}BBR is active and properly configured!${NC}"
+        echo -e "Congestion control: ${BOLD}$current_congestion${NC}"
+        echo -e "Queue discipline: ${BOLD}$current_qdisc${NC}"
+        return 0
+    else
+        echo -e "${BOLD_RED}BBR is not properly configured!${NC}"
+        echo -e "Current congestion control: ${BOLD}$current_congestion${NC}"
+        echo -e "Current queue discipline: ${BOLD}$current_qdisc${NC}"
+        return 1
+    fi
+}
+# Setup Cron Job for Auto Reset
+setup_cron_job() {
+    local cron_time="0 4 * * *"  # Default: 4 AM daily
+    local script_path=$(readlink -f "$0")
+    
+    echo -e "${YELLOW}Setting up cron job for auto-reset...${NC}"
+    echo -e "${CYAN}Current cron time: $cron_time${NC}"
+    
+    read -p "Do you want to change the schedule? (y/n): " change_schedule
+    if [[ "$change_schedule" =~ ^[Yy] ]]; then
+        echo -e "\n${YELLOW}Cron schedule format:${NC}"
+        echo -e "Minute Hour Day Month DayOfWeek"
+        echo -e "Example: 0 4 * * * (runs daily at 4 AM)"
+        read -p "Enter new cron schedule: " cron_time
+    fi
+    
+    echo "$cron_time root $script_path --reset > /dev/null 2>&1" > "$CRON_JOB_FILE"
+    chmod 644 "$CRON_JOB_FILE"
+    
+    if [[ $? -ne 0 ]]; then
+        echo -e "${BOLD_RED}Error creating cron job!${NC}"
+        return 1
+    fi
+    
+    echo -e "${GREEN}Cron job installed at $CRON_JOB_FILE${NC}"
+    echo -e "The system will automatically reset network settings at: ${BOLD}$cron_time${NC}"
+    return 0
+}
+# Reset Network Settings
+reset_network() {
+    echo -e "${YELLOW}Resetting network settings to default...${NC}"
+    
+    if [[ -f "$SYSCTL_BACKUP" ]]; then
+        if ! cp "$SYSCTL_BACKUP" /etc/sysctl.conf; then
+            echo -e "${BOLD_RED}Error restoring backup!${NC}"
+            return 1
+        fi
+        
+        if ! sysctl -p >/dev/null 2>&1; then
+            echo -e "${BOLD_RED}Error applying restored settings!${NC}"
+            return 1
+        fi
+        
+        # Reset MTU to default using persistent method
+        set_mtu_persistent "$NETWORK_INTERFACE" "$DEFAULT_MTU"
+        CURRENT_MTU=$DEFAULT_MTU
+        
+        # Reset DNS to default using persistent method
+        DNS_SERVERS=("1.1.1.1" "8.8.8.8")
+        set_dns_persistent "${DNS_SERVERS[@]}"
+        
+        echo -e "${GREEN}Network settings restored from backup!${NC}"
+        
+        # Restart network service
+        restart_network_services
+        
+        return 0
+    else
+        echo -e "${BOLD_RED}No backup found! Cannot reset network settings.${NC}"
+        return 1
+    fi
+}
+# Restart Network Services
+restart_network_services() {
+    echo -e "${YELLOW}Restarting network services...${NC}"
+    
+    case $OS in
+        *Ubuntu*|*Debian*)
+            systemctl restart networking 2>/dev/null || service networking restart 2>/dev/null
+            ;;
+        *CentOS*|*Red*Hat*|*Fedora*)
+            systemctl restart network 2>/dev/null || service network restart 2>/dev/null
+            ;;
+        *Arch*)
+            systemctl restart systemd-networkd 2>/dev/null
+            ;;
+        *)
+            echo -e "${YELLOW}Unknown OS! Please restart network manually.${NC}"
+            return 1
+            ;;
+    esac
+    
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}Network services restarted successfully.${NC}"
+    else
+        echo -e "${BOLD_RED}Could not restart network services. You may need to reboot.${NC}"
+        return 1
+    fi
+}
+# Configure VIP Settings
+configure_vip() {
+    echo -e "\n${YELLOW}Configuring VIP Optimization${NC}"
+    
+    read -p "Enable VIP Mode? (y/n): " choice
+    if [[ "$choice" =~ ^[Yy] ]]; then
+        VIP_MODE=true
+        
+        read -p "Enter VIP Subnet (e.g., 10.0.0.0/24): " VIP_SUBNET
+        read -p "Enter VIP Gateway (e.g., 10.0.0.1): " VIP_GATEWAY
+        
+        echo -e "${GREEN}VIP Mode enabled with Subnet: $VIP_SUBNET, Gateway: $VIP_GATEWAY${NC}"
+    else
+        VIP_MODE=false
+        VIP_SUBNET=""
+        VIP_GATEWAY=""
+        echo -e "${YELLOW}VIP Mode disabled${NC}"
+    fi
+    
+    save_config
+}
+# Configure MTU
+configure_mtu() {
+    echo -e "\n${YELLOW}Configuring Network Interface MTU${NC}"
+    
+    echo -e "Current MTU: ${BOLD}$CURRENT_MTU${NC}"
+    read -p "Do you want to change MTU? (y/n): " change_mtu
+    
+    if [[ "$change_mtu" =~ ^[Yy] ]]; then
+        read -p "Enter new MTU value (recommended: 1420): " new_mtu
+        
+        if ! [[ "$new_mtu" =~ ^[0-9]+$ ]]; then
+            echo -e "${BOLD_RED}Error: MTU must be a number!${NC}"
+            return 1
+        fi
+        
+        # Use persistent method to set MTU
+        set_mtu_persistent "$NETWORK_INTERFACE" "$new_mtu"
+        
+        # Update current MTU variable
+        CURRENT_MTU=$new_mtu
+        echo -e "${GREEN}MTU successfully changed to $new_mtu!${NC}"
+        
+        save_config
+    fi
+}
+# Configure DNS
+configure_dns() {
+    echo -e "\n${YELLOW}Configuring DNS Servers${NC}"
+    
+    echo -e "Current DNS: ${BOLD}$CURRENT_DNS${NC}"
+    read -p "Do you want to change DNS servers? (y/n): " change_dns
+    
+    if [[ "$change_dns" =~ ^[Yy] ]]; then
+        echo -e "\n${YELLOW}Enter DNS servers (space separated, max 3)${NC}"
+        echo -e "Example: 1.1.1.1 8.8.8.8 9.9.9.9"
+        read -p "New DNS servers: " new_dns
+        
+        # Validate IP addresses
+        local valid_dns=()
+        for dns in $new_dns; do
+            if [[ "$dns" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                valid_dns+=("$dns")
+            else
+                echo -e "${BOLD_RED}Error: $dns is not a valid IP address!${NC}"
+                return 1
+            fi
+        done
+        
+        if [ ${#valid_dns[@]} -eq 0 ]; then
+            echo -e "${BOLD_RED}Error: No valid DNS servers provided!${NC}"
+            return 1
+        fi
+        
+        # Use persistent method to set DNS
+        set_dns_persistent "${valid_dns[@]}"
+        
+        # Update DNS_SERVERS array and CURRENT_DNS
+        DNS_SERVERS=("${valid_dns[@]}")
+        CURRENT_DNS="${valid_dns[@]}"
+        
+        echo -e "${GREEN}DNS servers updated successfully!${NC}"
+        echo -e "New DNS: ${BOLD}${DNS_SERVERS[@]}${NC}"
+        
+        save_config
+    fi
+}
+# Save Configuration
+save_config() {
+    echo -e "${YELLOW}Saving configuration to $CONFIG_FILE...${NC}"
+    
+    cat > "$CONFIG_FILE" <<EOL
+# BBR VIP Optimizer Configuration
+ENABLE_BBR=$ENABLE_BBR
+ENABLE_FASTOPEN=$ENABLE_FASTOPEN
+TCP_CONGESTION="$TCP_CONGESTION"
+TCP_FASTOPEN=$TCP_FASTOPEN
+VIP_MODE=$VIP_MODE
+VIP_SUBNET="$VIP_SUBNET"
+VIP_GATEWAY="$VIP_GATEWAY"
+MTU=$CURRENT_MTU
+DNS_SERVERS=(${DNS_SERVERS[@]})
+EOL
+    echo -e "${GREEN}Configuration saved successfully!${NC}"
+}
+# Network Interface Configuration
+configure_interface() {
+    echo -e "\n${YELLOW}Configuring network interface: $NETWORK_INTERFACE${NC}"
+    
+    # Enable BBR for the specific interface
+    if ! tc qdisc add dev $NETWORK_INTERFACE root fq 2>/dev/null; then
+        echo -e "${YELLOW}Queue discipline already configured or failed to set.${NC}"
+    fi
+    
+    # Apply additional interface-specific settings
+    ethtool -K $NETWORK_INTERFACE tso on gso on gro on 2>/dev/null
+    ethtool -C $NETWORK_INTERFACE rx-usecs 30 2>/dev/null
+    
+    # Set MTU using persistent method
+    set_mtu_persistent "$NETWORK_INTERFACE" "$CURRENT_MTU"
+    
+    echo -e "${GREEN}Interface configuration applied to $NETWORK_INTERFACE${NC}"
+}
+# Test Network Speed
+test_speed() {
+    echo -e "\n${YELLOW}Running network speed test...${NC}"
+    
+    if ! command -v speedtest-cli &> /dev/null; then
+        echo -e "${YELLOW}Installing speedtest-cli...${NC}"
+        if pip install speedtest-cli 2>/dev/null || apt-get install -y speedtest-cli 2>/dev/null || \
+           yum install -y speedtest-cli 2>/dev/null || dnf install -y speedtest-cli 2>/dev/null; then
+            echo -e "${GREEN}speedtest-cli installed successfully!${NC}"
         else
-          error "Unsupported distribution: $ID. Please configure repositories manually."
-          exit 1
+            echo -e "${BOLD_RED}Could not install speedtest-cli. Please install it manually.${NC}"
+            return 1
         fi
-      fi
-      if ! apt-get update -y; then
-        error "Failed to update package repositories. Check your internet connection or /etc/apt/sources.list."
-        exit 1
-      fi
-      ;;
-    dnf|yum)
-      log "Checking $pkg_manager repositories..."
-      if ! $pkg_manager makecache; then
-        error "Failed to update package repositories. Check your repo configuration or internet connection."
-        exit 1
-      fi
-      ;;
-  esac
+    fi
+    
+    echo -e "${CYAN}Testing download and upload speed...${NC}"
+    speedtest-cli --simple
+    
+    echo -e "\n${CYAN}Testing latency to 1.1.1.1...${NC}"
+    ping -c 5 1.1.1.1 | grep -A1 "statistics"
 }
-check_kernel_version() {
-  local kv
-  kv=$(uname -r | cut -d'-' -f1)
-  echo "$kv"
+# Show Current Settings
+show_settings() {
+    echo -e "\n${YELLOW}Current Configuration:${NC}"
+    echo -e "BBR Enabled: ${BOLD}$ENABLE_BBR${NC}"
+    echo -e "TCP Fast Open: ${BOLD}$TCP_FASTOPEN${NC}"
+    echo -e "VIP Mode: ${BOLD}$VIP_MODE${NC}"
+    echo -e "MTU: ${BOLD}$CURRENT_MTU${NC}"
+    echo -e "DNS Servers: ${BOLD}${DNS_SERVERS[@]}${NC}"
+    
+    if [ "$VIP_MODE" = true ]; then
+        echo -e "VIP Subnet: ${BOLD}$VIP_SUBNET${NC}"
+        echo -e "VIP Gateway: ${BOLD}$VIP_GATEWAY${NC}"
+    fi
+    
+    echo -e "\n${YELLOW}Current Kernel Parameters:${NC}"
+    sysctl -a 2>/dev/null | grep -E "net.core.default_qdisc|net.ipv4.tcp_congestion_control|net.ipv4.tcp_fastopen"
+    
+    echo -e "\n${YELLOW}Interface Settings:${NC}"
+    ethtool -k $NETWORK_INTERFACE 2>/dev/null | grep -E "tcp-segmentation-offload:|generic-segmentation-offload:|generic-receive-offload:"
+    echo -e "Current Interface MTU: ${BOLD}$(cat /sys/class/net/$NETWORK_INTERFACE/mtu 2>/dev/null)${NC}"
 }
-install_kernel_hwe() {
-  log "Checking prerequisites for kernel installation..."
-  check_internet
-  check_disk_space
-  configure_repos
-  local pkg_manager
-  pkg_manager=$(detect_package_manager)
-  log "Installing new kernel using $pkg_manager..."
-  case $pkg_manager in
-    apt)
-      local release
-      release=$(lsb_release -rs 2>/dev/null || grep '^VERSION_ID=' /etc/os-release | cut -d'"' -f2)
-      local distro_id
-      distro_id=$(grep '^ID=' /etc/os-release | cut -d'=' -f2 | tr -d '"')
-      if [[ "$distro_id" == "ubuntu" && -n "$release" ]]; then
-        log "Attempting to install Ubuntu HWE kernel for $release..."
-        if ! apt-get install -y --install-recommends linux-generic-hwe-"$release" linux-headers-generic-hwe-"$release"; then
-          log "HWE kernel installation failed. Trying generic kernel..."
-          if ! apt-get install -y linux-image-amd64 linux-headers-amd64; then
-            error "Failed to install kernel. Try manually with: sudo apt-get install linux-image-amd64"
-            exit 1
-          fi
-        fi
-      else
-        log "Installing generic kernel for $distro_id..."
-        if ! apt-get install -y linux-image-amd64 linux-headers-amd64; then
-          error "Failed to install kernel. Try manually with: sudo apt-get install linux-image-amd64"
-          exit 1
-        fi
-      fi
-      ;;
-    dnf)
-      if ! dnf install -y kernel kernel-devel kernel-headers; then
-        error "Failed to install kernel. Try manually with: sudo dnf install kernel kernel-devel kernel-headers"
-        exit 1
-      fi
-      ;;
-    yum)
-      if ! yum install -y kernel kernel-devel kernel-headers; then
-        error "Failed to install kernel. Try manually with: sudo yum install kernel kernel-devel kernel-headers"
-        exit 1
-      fi
-      ;;
-  esac
-  log "Kernel installation completed. Please reboot your server with 'sudo reboot' and rerun the script."
-  log "After reboot, verify kernel version with 'uname -r'. It should be 5.10 or higher."
-  pause
-  exit 0
+# Show System Information
+show_system_info() {
+    echo -e "\n${YELLOW}System Information:${NC}"
+    echo -e "Hostname: ${BOLD}$(hostname)${NC}"
+    echo -e "Uptime: ${BOLD}$(uptime -p)${NC}"
+    echo -e "OS: ${BOLD}$OS $VER${NC}"
+    echo -e "Kernel: ${BOLD}$(uname -r)${NC}"
+    echo -e "CPU: ${BOLD}$(grep -m1 "model name" /proc/cpuinfo | cut -d: -f2 | sed 's/^[ \t]*//')${NC}"
+    echo -e "Memory: ${BOLD}$(free -h | awk '/Mem/{print $3"/"$2}') used${NC}"
+    
+    echo -e "\n${YELLOW}Network Information:${NC}"
+    echo -e "Public IP: ${BOLD}$(curl -s ifconfig.me)${NC}"
+    echo -e "Local IP: ${BOLD}$(hostname -I | awk '{print $1}')${NC}"
+    echo -e "Gateway: ${BOLD}$(ip route | grep default | awk '{print $3}')${NC}"
 }
-enable_bbr2_module() {
-  if ! ls /lib/modules/$(uname -r)/kernel/net/ipv4/tcp_bbr2.ko* >/dev/null 2>&1; then
-    error "tcp_bbr2 module not found in kernel modules directory."
-    log "Your kernel ($(uname -r)) may not support BBR2. Ensure it is 5.10 or higher and CONFIG_TCP_CONG_BBR2=m is enabled."
-    log "To compile a custom kernel:"
-    log "1. Install kernel sources: sudo apt-get install linux-source (or equivalent for your distro)"
-    log "2. Run 'make menuconfig', enable CONFIG_TCP_CONG_BBR2=m"
-    log "3. Rebuild and install the kernel."
-    return 1
-  fi
-  if ! modprobe tcp_bbr2 >/dev/null 2>&1; then
-    error "Failed to load tcp_bbr2 module. Check kernel configuration."
-    return 1
-  fi
-  if ! lsmod | grep -q tcp_bbr2; then
-    error "tcp_bbr2 module is not loaded."
-    return 1
-  fi
-  log "tcp_bbr2 kernel module loaded successfully."
+# Main Menu
+show_menu() {
+    while true; do
+        show_header
+        echo -e "\n${BOLD}Main Menu:${NC}"
+        echo -e "${CYAN}1) Apply Full Optimization${NC}"
+        echo -e "${CYAN}2) Verify Current Configuration${NC}"
+        echo -e "${CYAN}3) Reset Network Settings${NC}"
+        echo -e "${CYAN}4) Install Auto-Reset Cron Job${NC}"
+        echo -e "${PURPLE}5) Configure Network Interface${NC}"
+        echo -e "${PURPLE}6) Configure VIP Settings${NC}"
+        echo -e "${PURPLE}7) Configure MTU${NC}"
+        echo -e "${PURPLE}8) Configure DNS${NC}"
+        echo -e "${GREEN}9) Show Current Settings${NC}"
+        echo -e "${GREEN}10) Test Network Speed${NC}"
+        echo -e "${GREEN}11) Show System Info${NC}"
+        echo -e "${BLUE}12) Save Configuration${NC}"
+        echo -e "${RED}13) Reboot Server${NC}"
+        echo -e "${BOLD_RED}14) Exit${NC}"
+        
+        read -p "Please enter your choice [1-14]: " choice
+        
+        case $choice in
+            1)
+                backup_sysctl
+                apply_kernel_params
+                configure_interface
+                verify_bbr
+                ;;
+            2)
+                verify_bbr
+                ;;
+            3)
+                reset_network
+                ;;
+            4)
+                setup_cron_job
+                ;;
+            5)
+                configure_interface
+                ;;
+            6)
+                configure_vip
+                ;;
+            7)
+                configure_mtu
+                ;;
+            8)
+                configure_dns
+                ;;
+            9)
+                show_settings
+                ;;
+            10)
+                test_speed
+                ;;
+            11)
+                show_system_info
+                ;;
+            12)
+                save_config
+                ;;
+            13)
+                echo -e "${YELLOW}Preparing to reboot server...${NC}"
+                save_config
+                echo -e "${RED}Server will now reboot...${NC}"
+                sleep 3
+                reboot
+                ;;
+            14)
+                echo -e "${GREEN}Exiting...${NC}"
+                exit 0
+                ;;
+            *)
+                echo -e "${BOLD_RED}Invalid option!${NC}"
+                ;;
+        esac
+        
+        read -p "Press [Enter] to return to main menu..."
+    done
 }
-check_qdisc_fq() {
-  if ! tc qdisc show | grep -q fq; then
-    log "Fair Queue (fq) qdisc not available. Falling back to default qdisc."
-    return 1
-  fi
-  return 0
+# Main Execution
+main() {
+    check_root
+    detect_distro
+    load_config
+    show_menu
 }
-apply_sysctl() {
-  local sysctl_file="/etc/sysctl.d/99-bbr2-tuned.conf"
-  backup_file "$sysctl_file"
-  cat >"$sysctl_file" <<EOF
-# BBR2 optimized sysctl settings
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr2
-net.ipv6.tcp_congestion_control = bbr2
-
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-net.core.netdev_max_backlog = 2500
-
-net.ipv4.tcp_low_latency = 1
-net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_mtu_probing = 1
-net.ipv6.tcp_mtu_probing = 1
-
-net.ipv4.tcp_bbr2_bw_probe_cwnd_gain = 2
-net.ipv4.tcp_bbr2_extra_acked_gain = 1
-net.ipv4.tcp_bbr2_cwnd_min = 4
-
-net.ipv4.tcp_ecn = 0
-net.ipv4.tcp_retries2 = 5
-net.ipv4.tcp_orphan_retries = 2
-EOF
-  if ! check_qdisc_fq; then
-    sed -i '/net.core.default_qdisc/d' "$sysctl_file"
-  fi
-  if ! sysctl --system; then
-    error "Failed to apply sysctl settings. Check /etc/sysctl.d/99-bbr2-tuned.conf for errors."
-    return 1
-  fi
-  log "Sysctl parameters applied."
-}
-tune_bbr2_params() {
-  read -rp "Enter tcp_bbr2_bw_probe_cwnd_gain (default 2): " cwnd_gain
-  cwnd_gain=${cwnd_gain:-2}
-  read -rp "Enter tcp_bbr2_extra_acked_gain (default 1): " acked_gain
-  acked_gain=${acked_gain:-1}
-  read -rp "Enter tcp_bbr2_cwnd_min (default 4): " cwnd_min
-  cwnd_min=${cwnd_min:-4}
-  backup_file /etc/sysctl.d/99-bbr2-tuned.conf
-  sed -i "/tcp_bbr2_bw_probe_cwnd_gain/c\net.ipv4.tcp_bbr2_bw_probe_cwnd_gain=$cwnd_gain" /etc/sysctl.d/99-bbr2-tuned.conf
-  sed -i "/tcp_bbr2_extra_acked_gain/c\net.ipv4.tcp_bbr2_extra_acked_gain=$acked_gain" /etc/sysctl.d/99-bbr2-tuned.conf
-  sed -i "/tcp_bbr2_cwnd_min/c\net.ipv4.tcp_bbr2_cwnd_min=$cwnd_min" /etc/sysctl.d/99-bbr2-tuned.conf
-  if ! sysctl --system; then
-    error "Failed to apply updated BBR2 parameters."
-    pause
-    return
-  fi
-  log "BBR2 parameters updated."
-  pause
-}
-check_bbr2_enabled() {
-  local cc
-  cc=$(sysctl -n net.ipv4.tcp_congestion_control)
-  if [[ "$cc" != "bbr2" ]]; then
-    return 1
-  fi
-  if ! lsmod | grep -q tcp_bbr2; then
-    return 1
-  fi
-  return 0
-}
-show_status() {
-  echo "----- Current Status -----"
-  echo "Kernel version: $(uname -r)"
-  echo "TCP Congestion Control (IPv4): $(sysctl -n net.ipv4.tcp_congestion_control)"
-  echo "TCP Congestion Control (IPv6): $(sysctl -n net.ipv6.tcp_congestion_control)"
-  echo "Default qdisc: $(sysctl -n net.core.default_qdisc)"
-  echo "Loaded modules: $(lsmod | grep bbr || echo 'No BBR modules loaded')"
-  echo "MTU values:"
-  for iface in $(get_interfaces); do
-    mtu=$(ip link show "$iface" | awk '/mtu/ {print $5}')
-    echo "  $iface: $mtu"
-  done
-  echo "DNS settings:"
-  if systemctl is-active --quiet systemd-resolved; then
-    grep '^DNS=' /etc/systemd/resolved.conf || echo "Default systemd-resolved settings"
-  else
-    head -2 /etc/resolv.conf
-  fi
-  echo "--------------------------"
-}
-remove_bbr2() {
-  log "Removing BBR2 settings and restoring backups..."
-  restore_backup /etc/sysctl.d/99-bbr2-tuned.conf
-  restore_backup /etc/systemd/resolved.conf
-  restore_backup /etc/resolv.conf
-  sysctl -w net.ipv4.tcp_congestion_control=cubic || true
-  sysctl -w net.ipv6.tcp_congestion_control=cubic || true
-  sysctl -w net.core.default_qdisc=fq || true
-  for iface in $(get_interfaces); do
-    ip link set dev "$iface" mtu 1500 || true
-  done
-  log "BBR2 and related settings removed. Reboot is recommended."
-}
-get_current_dns() {
-  if systemctl is-active --quiet systemd-resolved; then
-    grep '^DNS=' /etc/systemd/resolved.conf | cut -d= -f2 || echo "1.1.1.1"
-  else
-    grep '^nameserver' /etc/resolv.conf | head -1 | awk '{print $2}' || echo "1.1.1.1"
-  fi
-}
-get_current_mtu() {
-  for iface in $(get_interfaces); do
-    ip link show "$iface" | awk '/mtu/ {print $5; exit}'
-    return
-  done
-  echo "1500"
-}
-change_dns() {
-  read -rp "Enter new DNS IP (e.g. 1.1.1.1): " new_dns
-  if [[ ! "$new_dns" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    error "Invalid IP format."
-    pause
-    return
-  fi
-  set_dns "$new_dns"
-  pause
-}
-change_mtu() {
-  read -rp "Enter new MTU (1280-9000, e.g. 1420): " new_mtu
-  if ! [[ "$new_mtu" =~ ^[0-9]+$ ]] || ((new_mtu < 1280 || new_mtu > 9000)); then
-    error "MTU must be a number between 1280 and 9000."
-    pause
-    return
-  fi
-  set_mtu "$new_mtu"
-  pause
-}
-install_bbr2_flow() {
-  ensure_root
-  log "Starting BBR2 installation and setup..."
-  check_internet
-  check_disk_space
-  local kernel_ver
-  kernel_ver=$(uname -r | cut -d'-' -f1)
-  kernel_ver_num=$(echo "$kernel_ver" | awk -F. '{print $1*10000 + $2*100 + $3}')
-  local required_ver=51000  # 5.10.0 minimum for BBR2
-  
-  if (( kernel_ver_num < required_ver )); then
-    log "Kernel version $kernel_ver is too old for BBR2. Installing a newer kernel..."
-    install_kernel_hwe
-  fi
-
-  if ! enable_bbr2_module; then
-    error "Failed to enable BBR2 module. Please ensure kernel supports tcp_bbr2."
-    exit 1
-  fi
-  if ! apply_sysctl; then
-    error "Failed to apply sysctl settings. Check system configuration."
-    exit 1
-  fi
-  set_dns "1.1.1.1"
-  set_mtu 1420
-  if check_bbr2_enabled; then
-    log "BBR2 enabled successfully!"
-  else
-    error "Failed to enable BBR2. Check kernel module and sysctl settings."
-    exit 1
-  fi
-  pause
-}
-menu() {
-  clear
-  echo "======================================"
-  echo "   Ultra Fast & Stable BBR2 Setup     "
-  echo "======================================"
-  echo "System Info:"
-  echo "  Kernel: $(uname -r)"
-  echo "  Distro: $(lsb_release -ds 2>/dev/null || grep '^PRETTY_NAME=' /etc/os-release | cut -d'"' -f2 || echo 'Unknown')"
-  echo "  TCP CC: $(sysctl -n net.ipv4.tcp_congestion_control)"
-  echo "======================================"
-  echo "1) Install/Enable BBR2 (with kernel check)"
-  echo "2) Remove BBR2 & Restore Defaults"
-  echo "3) Change DNS (current: $(get_current_dns))"
-  echo "4) Change MTU (current: $(get_current_mtu))"
-  echo "5) Show Status"
-  echo "6) Tune BBR2 Parameters"
-  echo "7) Reboot Server"
-  echo "0) Exit"
-  echo "======================================"
-  read -rp "Select option: " choice
-  case $choice in
-    1) install_bbr2_flow ;;
-    2) remove_bbr2; pause ;;
-    3) change_dns ;;
-    4) change_mtu ;;
-    5) show_status; pause ;;
-    6) tune_bbr2_params ;;
-    7) log "Rebooting now..."; reboot ;;
-    0) exit 0 ;;
-    *) error "Invalid option"; pause ;;
-  esac
-}
-
-# Main loop
-while true; do
-  menu
-done
+# Handle command line arguments
+case "$1" in
+    "--reset")
+        reset_network
+        exit $?
+        ;;
+    *)
+        main
+        ;;
+esac
