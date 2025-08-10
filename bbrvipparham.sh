@@ -1,10 +1,10 @@
 #!/bin/bash
 # BBR VIP Optimizer Pro - Complete Optimized Version
-# Auto-enables VIP mode with BBR, configures MTU, DNS, and reboot option
+# Auto-enables VIP mode with BBR, configures MTU, DNS on all interfaces, and reboot option
 # Optimized for Hetzner servers
 
 SCRIPT_NAME="BBR VIP Optimizer Pro"
-SCRIPT_VERSION="7.1"  # Updated version
+SCRIPT_VERSION="7.2"  # Updated version
 AUTHOR="Parham Pahlevan"
 CONFIG_FILE="/etc/bbr_vip.conf"
 LOG_FILE="/var/log/bbr_vip.log"
@@ -20,9 +20,9 @@ ALL_INTERFACES=()
 VIP_MODE=true
 VIP_SUBNET=""
 VIP_GATEWAY=""
-DEFAULT_MTU=1400  # Optimized for Hetzner (was 1420)
+DEFAULT_MTU=1400  # Optimized for Hetzner
 CURRENT_MTU=""
-DNS_SERVERS=("1.1.1.1" "8.8.8.8")  # Default DNS servers
+DNS_SERVERS=("1.1.1.1" "8.8.8.8")
 CURRENT_DNS=""
 
 # Color Codes
@@ -95,16 +95,24 @@ backup_network_configs() {
     echo -e "${GREEN}Full network configuration backed up to $BACKUP_DIR${NC}"
 }
 
-# ==================== NEW FUNCTION: CONFIGURE DNS FOR ETH0 ==================== #
+# ==================== NEW FUNCTION: CONFIGURE DNS FOR ALL INTERFACES ==================== #
 
-configure_dns_eth0() {
-    echo -e "${YELLOW}Configuring DNS servers for eth0...${NC}"
+configure_dns_all_interfaces() {
+    echo -e "${YELLOW}Configuring DNS servers for all interfaces...${NC}"
     echo -n "Enter DNS servers (space separated, e.g., 1.1.1.1 8.8.8.8): "
     read -a dns_servers
     if [ ${#dns_servers[@]} -eq 0 ]; then
         dns_servers=("${DNS_SERVERS[@]}")
         echo -e "${YELLOW}Using default DNS servers: ${dns_servers[*]}${NC}"
     fi
+
+    # Validate DNS servers
+    for dns in "${dns_servers[@]}"; do
+        if ! [[ $dns =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo -e "${RED}Invalid DNS address: $dns${NC}"
+            return 1
+        fi
+    done
 
     # Backup resolv.conf
     backup_network_configs
@@ -118,28 +126,44 @@ configure_dns_eth0() {
         done
     } > /etc/resolv.conf
 
-    # Apply DNS to eth0 specifically
-    if command -v nmcli &>/dev/null && ip link show eth0 >/dev/null 2>&1; then
-        nmcli con mod "$(nmcli -t -f DEVICE,NAME con show | grep eth0 | cut -d: -f2)" ipv4.dns "${dns_servers[*]}"
-        nmcli con up "$(nmcli -t -f DEVICE,NAME con show | grep eth0 | cut -d: -f2)"
-    elif [ -d /etc/netplan ] && ip link show eth0 >/dev/null 2>&1; then
-        for yaml in /etc/netplan/*.yaml; do
-            if grep -q "eth0:" "$yaml"; then
-                sed -i "/eth0:/,/^ *[^ ]/ { /nameservers:/d; /addresses:/d }" "$yaml"
-                {
-                    echo "      nameservers:"
-                    echo "        addresses: [${dns_servers[*]}]"
-                } | sed -i "/eth0:/r /dev/stdin" "$yaml"
+    # Apply DNS to all interfaces
+    for iface in "${ALL_INTERFACES[@]}"; do
+        if command -v nmcli &>/dev/null; then
+            nm_con=$(nmcli -t -f DEVICE,NAME con show | grep "$iface" | cut -d: -f2)
+            if [ -n "$nm_con" ]; then
+                nmcli con mod "$nm_con" ipv4.dns "${dns_servers[*]}"
+                nmcli con up "$nm_con"
+                echo -e "${GREEN}DNS configured for $iface via NetworkManager${NC}"
+            else
+                echo -e "${YELLOW}No NetworkManager connection found for $iface${NC}"
             fi
-        done
-        netplan apply
-    elif [ -f /etc/network/interfaces ] && ip link show eth0 >/dev/null 2>&1; then
-        sed -i "/iface eth0 inet/,/^$/ { /dns-nameservers/d }" /etc/network/interfaces
-        echo "    dns-nameservers ${dns_servers[*]}" >> /etc/network/interfaces
-        systemctl restart networking
+        elif [ -d /etc/netplan ]; then
+            for yaml in /etc/netplan/*.yaml; do
+                if grep -q "$iface:" "$yaml"; then
+                    sed -i "/$iface:/,/^ *[^ ]/ { /nameservers:/d; /addresses:/d }" "$yaml"
+                    {
+                        echo "      nameservers:"
+                        echo "        addresses: [${dns_servers[*]}]"
+                    } | sed -i "/$iface:/r /dev/stdin" "$yaml"
+                fi
+            done
+            netplan apply
+            echo -e "${GREEN}DNS configured for $iface via netplan${NC}"
+        elif [ -f /etc/network/interfaces ]; then
+            sed -i "/iface $iface inet/,/^$/ { /dns-nameservers/d }" /etc/network/interfaces
+            sed -i "/iface $iface inet/a\    dns-nameservers ${dns_servers[*]}" /etc/network/interfaces
+            echo -e "${GREEN}DNS configured for $iface via interfaces file${NC}"
+        else
+            echo -e "${RED}Unsupported configuration method for $iface${NC}"
+            continue
+        fi
+    done
+
+    # Apply networking changes
+    if systemctl is-active --quiet NetworkManager; then
+        systemctl restart NetworkManager
     else
-        echo -e "${RED}eth0 not found or unsupported configuration method${NC}"
-        return 1
+        systemctl restart networking 2>/dev/null || true
     fi
 
     # Verify DNS
@@ -150,10 +174,10 @@ configure_dns_eth0() {
             echo -e "${RED}DNS $dns is unreachable${NC}"
         fi
     done
-    echo -e "${GREEN}DNS configured for eth0${NC}"
+    echo -e "${GREEN}DNS configured for all interfaces${NC}"
 }
 
-# ==================== NEW FUNCTION: REBOOT SYSTEM ==================== #
+# ==================== REBOOT SYSTEM ==================== #
 
 reboot_system() {
     echo -e "${YELLOW}Are you sure you want to reboot the system? (y/n)${NC}"
@@ -174,7 +198,6 @@ enable_bbr_with_vip() {
     
     backup_network_configs
     
-    # Optimized for Hetzner
     {
         echo "# BBR Configuration with VIP Mode - DO NOT EDIT"
         echo "net.core.default_qdisc=fq"
@@ -191,12 +214,10 @@ enable_bbr_with_vip() {
         echo "net.ipv4.tcp_slow_start_after_idle=0"
         echo "net.ipv4.tcp_mtu_probing=1"
         echo "net.ipv4.tcp_rfc1337=1"
-        # Hetzner-specific optimizations
         echo "net.core.rmem_max=16777216"
         echo "net.core.wmem_max=16777216"
         echo "net.ipv4.tcp_rmem=4096 87380 16777216"
         echo "net.ipv4.tcp_wmem=4096 65536 16777216"
-        # VIP Mode Optimizations
         echo "# VIP Optimizations"
         echo "net.ipv4.tcp_window_scaling=1"
         echo "net.ipv4.tcp_timestamps=1"
@@ -225,7 +246,6 @@ enable_bbr_with_vip() {
 
 set_mtu_all_interfaces() {
     local mtu=$1
-    # Hetzner-specific MTU check
     if [ "$mtu" -lt 1280 ] || [ "$mtu" -gt 1500 ]; then
         echo -e "${RED}MTU must be between 1280 and 1500 for Hetzner compatibility${NC}"
         return 1
@@ -364,7 +384,7 @@ show_menu() {
         echo -e "${YELLOW}Main Menu:${NC}"
         echo -e "1) Enable BBR with VIP Mode (Auto)"
         echo -e "2) Set MTU on ALL Interfaces"
-        echo -e "3) Configure DNS Servers for eth0"
+        echo -e "3) Configure DNS Servers for ALL Interfaces"
         echo -e "4) Show Current Status"
         echo -e "5) Restore Original Settings"
         echo -e "6) Reboot System"
@@ -379,7 +399,7 @@ show_menu() {
                 read mtu
                 set_mtu_all_interfaces "$mtu"
                 ;;
-            3) configure_dns_eth0 ;;
+            3) configure_dns_all_interfaces ;;
             4) show_status ;;
             5) restore_backups ;;
             6) reboot_system ;;
