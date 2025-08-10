@@ -1,10 +1,10 @@
 #!/bin/bash
 # BBR VIP Optimizer Pro - Complete Optimized Version
 # Auto-enables VIP mode with BBR, configures MTU, DNS on all interfaces, and reboot option
-# Optimized for Hetzner servers
+# Optimized for Hetzner servers with enhanced error handling
 
 SCRIPT_NAME="BBR VIP Optimizer Pro"
-SCRIPT_VERSION="7.2"  # Updated version
+SCRIPT_VERSION="7.3"  # Updated version
 AUTHOR="Parham Pahlevan"
 CONFIG_FILE="/etc/bbr_vip.conf"
 LOG_FILE="/var/log/bbr_vip.log"
@@ -36,7 +36,7 @@ NC='\033[0m'
 BOLD='\033[1m'
 
 # Initialize logging
-mkdir -p "$(dirname "$LOG_FILE")"
+mkdir -p "$(dirname "$LOG_FILE")" || { echo -e "${RED}Failed to create log directory${NC}"; exit 1; }
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 # ==================== CORE FUNCTIONS ==================== #
@@ -49,8 +49,8 @@ check_root() {
 }
 
 init_backup_dir() {
-    mkdir -p "$BACKUP_DIR"
-    chmod 600 "$BACKUP_DIR"
+    mkdir -p "$BACKUP_DIR" || { echo -e "${RED}Failed to create backup directory${NC}"; exit 1; }
+    chmod 600 "$BACKUP_DIR" || { echo -e "${RED}Failed to set permissions on backup directory${NC}"; exit 1; }
 }
 
 detect_interfaces() {
@@ -58,44 +58,53 @@ detect_interfaces() {
     for iface in "${PREFERRED_INTERFACES[@]}"; do
         if ip link show "$iface" >/dev/null 2>&1; then
             ALL_INTERFACES+=("$iface")
+            echo -e "${GREEN}Detected interface: $iface${NC}"
         fi
     done
     
     if [ ${#ALL_INTERFACES[@]} -eq 0 ]; then
         ALL_INTERFACES=($(ip -o link show | awk -F': ' '{print $2}' | grep -v lo))
+        echo -e "${YELLOW}No preferred interfaces found, using: ${ALL_INTERFACES[*]}${NC}"
     fi
     
     if [ ${#ALL_INTERFACES[@]} -gt 0 ]; then
         NETWORK_INTERFACE="${ALL_INTERFACES[0]}"
-        CURRENT_MTU=$(cat /sys/class/net/$NETWORK_INTERFACE/mtu 2>/dev/null || echo $DEFAULT_MTU)
+        CURRENT_MTU=$(cat /sys/class/net/"$NETWORK_INTERFACE"/mtu 2>/dev/null || echo "$DEFAULT_MTU")
+    else
+        echo -e "${RED}No network interfaces detected!${NC}"
+        exit 1
     fi
     
-    CURRENT_DNS=$(grep nameserver /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ')
+    CURRENT_DNS=$(grep nameserver /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ' || echo "None")
 }
 
 backup_network_configs() {
     echo -e "${YELLOW}Creating comprehensive backup of network settings...${NC}"
     init_backup_dir
     
-    cp /etc/sysctl.conf "$SYSCTL_BACKUP" 2>/dev/null
-    cp /etc/resolv.conf "$RESOLV_BACKUP" 2>/dev/null
+    if [ -f /etc/sysctl.conf ]; then
+        cp /etc/sysctl.conf "$SYSCTL_BACKUP" || echo -e "${RED}Failed to backup sysctl.conf${NC}"
+    fi
+    if [ -f /etc/resolv.conf ]; then
+        cp /etc/resolv.conf "$RESOLV_BACKUP" || echo -e "${RED}Failed to backup resolv.conf${NC}"
+    fi
     
     if [ -d /etc/netplan ]; then
-        tar -czf "$NETWORK_BACKUP" /etc/netplan/ 2>/dev/null
+        tar -czf "$NETWORK_BACKUP" /etc/netplan/ 2>/dev/null || echo -e "${RED}Failed to backup netplan configs${NC}"
     elif [ -f /etc/network/interfaces ]; then
-        cp /etc/network/interfaces "$BACKUP_DIR/interfaces.bak"
+        cp /etc/network/interfaces "$BACKUP_DIR/interfaces.bak" || echo -e "${RED}Failed to backup interfaces file${NC}"
     fi
     
     if command -v nmcli &>/dev/null; then
         nmcli -f NAME,UUID con show | awk 'NR>1 {print $2}' | while read uuid; do
-            nmcli con show "$uuid" > "$BACKUP_DIR/nm_$uuid.bak"
+            nmcli con show "$uuid" > "$BACKUP_DIR/nm_$uuid.bak" || echo -e "${RED}Failed to backup NetworkManager config for $uuid${NC}"
         done
     fi
     
     echo -e "${GREEN}Full network configuration backed up to $BACKUP_DIR${NC}"
 }
 
-# ==================== NEW FUNCTION: CONFIGURE DNS FOR ALL INTERFACES ==================== #
+# ==================== CONFIGURE DNS FOR ALL INTERFACES ==================== #
 
 configure_dns_all_interfaces() {
     echo -e "${YELLOW}Configuring DNS servers for all interfaces...${NC}"
@@ -116,7 +125,9 @@ configure_dns_all_interfaces() {
 
     # Backup resolv.conf
     backup_network_configs
-    chattr -i /etc/resolv.conf 2>/dev/null
+    if [ -f /etc/resolv.conf ]; then
+        chattr -i /etc/resolv.conf 2>/dev/null || echo -e "${YELLOW}Warning: Could not remove immutable attribute from resolv.conf${NC}"
+    fi
 
     # Generate new resolv.conf
     {
@@ -124,35 +135,41 @@ configure_dns_all_interfaces() {
         for dns in "${dns_servers[@]}"; do
             echo "nameserver $dns"
         done
-    } > /etc/resolv.conf
+    } > /etc/resolv.conf || { echo -e "${RED}Failed to write to resolv.conf${NC}"; return 1; }
+    chmod 644 /etc/resolv.conf
 
     # Apply DNS to all interfaces
+    local any_success=false
     for iface in "${ALL_INTERFACES[@]}"; do
+        echo -e "${YELLOW}Configuring DNS for $iface...${NC}"
         if command -v nmcli &>/dev/null; then
             nm_con=$(nmcli -t -f DEVICE,NAME con show | grep "$iface" | cut -d: -f2)
             if [ -n "$nm_con" ]; then
-                nmcli con mod "$nm_con" ipv4.dns "${dns_servers[*]}"
-                nmcli con up "$nm_con"
+                nmcli con mod "$nm_con" ipv4.dns "${dns_servers[*]}" || echo -e "${RED}Failed to set DNS for $iface via NetworkManager${NC}"
+                nmcli con up "$nm_con" || echo -e "${RED}Failed to apply NetworkManager changes for $iface${NC}"
                 echo -e "${GREEN}DNS configured for $iface via NetworkManager${NC}"
+                any_success=true
             else
                 echo -e "${YELLOW}No NetworkManager connection found for $iface${NC}"
             fi
         elif [ -d /etc/netplan ]; then
             for yaml in /etc/netplan/*.yaml; do
-                if grep -q "$iface:" "$yaml"; then
+                if [ -f "$yaml" ] && grep -q "$iface:" "$yaml"; then
                     sed -i "/$iface:/,/^ *[^ ]/ { /nameservers:/d; /addresses:/d }" "$yaml"
                     {
                         echo "      nameservers:"
                         echo "        addresses: [${dns_servers[*]}]"
                     } | sed -i "/$iface:/r /dev/stdin" "$yaml"
+                    echo -e "${GREEN}DNS configured for $iface in $yaml${NC}"
+                    any_success=true
                 fi
             done
-            netplan apply
-            echo -e "${GREEN}DNS configured for $iface via netplan${NC}"
+            netplan apply 2>/dev/null || echo -e "${RED}Failed to apply netplan changes${NC}"
         elif [ -f /etc/network/interfaces ]; then
             sed -i "/iface $iface inet/,/^$/ { /dns-nameservers/d }" /etc/network/interfaces
             sed -i "/iface $iface inet/a\    dns-nameservers ${dns_servers[*]}" /etc/network/interfaces
             echo -e "${GREEN}DNS configured for $iface via interfaces file${NC}"
+            any_success=true
         else
             echo -e "${RED}Unsupported configuration method for $iface${NC}"
             continue
@@ -161,9 +178,9 @@ configure_dns_all_interfaces() {
 
     # Apply networking changes
     if systemctl is-active --quiet NetworkManager; then
-        systemctl restart NetworkManager
+        systemctl restart NetworkManager 2>/dev/null || echo -e "${RED}Failed to restart NetworkManager${NC}"
     else
-        systemctl restart networking 2>/dev/null || true
+        systemctl restart networking 2>/dev/null || echo -e "${YELLOW}Networking service not found or not restarted${NC}"
     fi
 
     # Verify DNS
@@ -174,7 +191,13 @@ configure_dns_all_interfaces() {
             echo -e "${RED}DNS $dns is unreachable${NC}"
         fi
     done
-    echo -e "${GREEN}DNS configured for all interfaces${NC}"
+
+    if [ "$any_success" = true ]; then
+        echo -e "${GREEN}DNS configured for all interfaces${NC}"
+    else
+        echo -e "${RED}Failed to configure DNS for any interface${NC}"
+        return 1
+    fi
 }
 
 # ==================== REBOOT SYSTEM ==================== #
@@ -227,12 +250,12 @@ enable_bbr_with_vip() {
         echo "net.ipv4.tcp_adv_win_scale=1"
         echo "net.ipv4.tcp_app_win=31"
         echo "net.ipv4.tcp_low_latency=1"
-    } > /etc/sysctl.d/60-bbr.conf
+    } > /etc/sysctl.d/60-bbr.conf || { echo -e "${RED}Failed to write BBR config${NC}"; return 1; }
 
-    sysctl -p /etc/sysctl.d/60-bbr.conf >/dev/null 2>&1
+    sysctl -p /etc/sysctl.d/60-bbr.conf >/dev/null 2>&1 || echo -e "${RED}Failed to apply sysctl settings${NC}"
     
     for iface in "${ALL_INTERFACES[@]}"; do
-        tc qdisc replace dev "$iface" root fq 2>/dev/null
+        tc qdisc replace dev "$iface" root fq 2>/dev/null || echo -e "${RED}Failed to set fq qdisc on $iface${NC}"
     done
     
     if ! grep -q "60-bbr.conf" /etc/rc.local 2>/dev/null; then
@@ -256,22 +279,25 @@ set_mtu_all_interfaces() {
     echo -e "${YELLOW}Configuring MTU $mtu on all interfaces...${NC}"
     
     for iface in "${ALL_INTERFACES[@]}"; do
-        ip link set dev "$iface" mtu "$mtu"
+        ip link set dev "$iface" mtu "$mtu" || echo -e "${RED}Failed to set MTU on $iface${NC}"
         
         if [ -f /etc/network/interfaces ]; then
             sed -i "/iface $iface inet/,/^$/ { /mtu /d }" /etc/network/interfaces
             sed -i "/iface $iface inet/a\    mtu $mtu" /etc/network/interfaces
         elif command -v nmcli &>/dev/null; then
-            nmcli con mod "$(nmcli -t -f DEVICE,NAME con show | grep "$iface" | cut -d: -f2)" 802-3-ethernet.mtu "$mtu"
-            nmcli con up "$(nmcli -t -f DEVICE,NAME con show | grep "$iface" | cut -d: -f2)"
+            nm_con=$(nmcli -t -f DEVICE,NAME con show | grep "$iface" | cut -d: -f2)
+            if [ -n "$nm_con" ]; then
+                nmcli con mod "$nm_con" 802-3-ethernet.mtu "$mtu" || echo -e "${RED}Failed to set MTU for $iface via NetworkManager${NC}"
+                nmcli con up "$nm_con" || echo -e "${RED}Failed to apply NetworkManager changes for $iface${NC}"
+            fi
         elif [ -d /etc/netplan ]; then
             for yaml in /etc/netplan/*.yaml; do
-                if grep -q "$iface:" "$yaml"; then
+                if [ -f "$yaml" ] && grep -q "$iface:" "$yaml"; then
                     sed -i "/$iface:/,/^ *[^ ]/ { /mtu:/d }" "$yaml"
                     sed -i "/$iface:/a\      mtu: $mtu" "$yaml"
                 fi
             done
-            netplan apply
+            netplan apply 2>/dev/null || echo -e "${RED}Failed to apply netplan changes${NC}"
         fi
         
         current_mtu=$(cat /sys/class/net/"$iface"/mtu 2>/dev/null)
@@ -299,39 +325,39 @@ restore_backups() {
     echo -e "${YELLOW}Restoring original network configuration...${NC}"
     
     if [ -f "$SYSCTL_BACKUP" ]; then
-        cp "$SYSCTL_BACKUP" /etc/sysctl.conf
+        cp "$SYSCTL_BACKUP" /etc/sysctl.conf || echo -e "${RED}Failed to restore sysctl.conf${NC}"
         rm -f /etc/sysctl.d/60-bbr.conf
-        sysctl -p >/dev/null 2>&1
+        sysctl -p >/dev/null 2>&1 || echo -e "${RED}Failed to apply sysctl settings${NC}"
     fi
     
     if [ -f "$RESOLV_BACKUP" ]; then
-        chattr -i /etc/resolv.conf 2>/dev/null
-        cp "$RESOLV_BACKUP" /etc/resolv.conf
+        chattr -i /etc/resolv.conf 2>/dev/null || echo -e "${YELLOW}Warning: Could not remove immutable attribute from resolv.conf${NC}"
+        cp "$RESOLV_BACKUP" /etc/resolv.conf || echo -e "${RED}Failed to restore resolv.conf${NC}"
     fi
     
     if [ -f "$NETWORK_BACKUP" ]; then
         if [ -d /etc/netplan ]; then
             rm -f /etc/netplan/*
-            tar -xzf "$NETWORK_BACKUP" -C /etc/
+            tar -xzf "$NETWORK_BACKUP" -C /etc/ || echo -e "${RED}Failed to restore netplan configs${NC}"
         elif [ -f "$BACKUP_DIR/interfaces.bak" ]; then
-            cp "$BACKUP_DIR/interfaces.bak" /etc/network/interfaces
+            cp "$BACKUP_DIR/interfaces.bak" /etc/network/interfaces || echo -e "${RED}Failed to restore interfaces file${NC}"
         fi
     fi
     
     if command -v nmcli &>/dev/null; then
         find "$BACKUP_DIR" -name "nm_*.bak" | while read backup; do
             uuid=$(basename "$backup" | cut -d_ -f2 | cut -d. -f1)
-            nmcli con del "$uuid"
-            nmcli con add < "$backup"
+            nmcli con del "$uuid" 2>/dev/null
+            nmcli con add < "$backup" 2>/dev/null || echo -e "${RED}Failed to restore NetworkManager config $uuid${NC}"
         done
     fi
     
     [ -f /etc/rc.local ] && sed -i '/60-bbr.conf/d;/mtu /d' /etc/rc.local
     
     if systemctl is-active --quiet NetworkManager; then
-        systemctl restart NetworkManager
+        systemctl restart NetworkManager 2>/dev/null || echo -e "${RED}Failed to restart NetworkManager${NC}"
     else
-        systemctl restart networking
+        systemctl restart networking 2>/dev/null || echo -e "${YELLOW}Networking service not found or not restarted${NC}"
     fi
     
     echo -e "${GREEN}All settings restored to original configuration!${NC}"
@@ -345,8 +371,8 @@ show_status() {
     echo -e "${CYAN}=== Current Network Status ===${NC}"
     
     echo -e "\n${YELLOW}BBR Status:${NC}"
-    local congestion=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}')
-    local qdisc=$(sysctl net.core.default_qdisc 2>/dev/null | awk '{print $3}')
+    local congestion=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}' || echo "Unknown")
+    local qdisc=$(sysctl net.core.default_qdisc 2>/dev/null | awk '{print $3}' || echo "Unknown")
     echo -e " Congestion Control: ${BOLD}$congestion${NC}"
     echo -e " Queue Discipline: ${BOLD}$qdisc${NC}"
     echo -e " VIP Mode: ${GREEN}Enabled${NC}"
@@ -354,7 +380,7 @@ show_status() {
     echo -e "\n${YELLOW}Network Interfaces:${NC}"
     for iface in "${ALL_INTERFACES[@]}"; do
         local mtu=$(cat /sys/class/net/"$iface"/mtu 2>/dev/null || echo "Unknown")
-        local state=$(ip -o link show "$iface" | awk '{print $9}')
+        local state=$(ip -o link show "$iface" | awk '{print $9}' || echo "Unknown")
         local ip=$(ip -o -4 addr show "$iface" | awk '{print $4}' | cut -d/ -f1 || echo "None")
         echo -e " ${BOLD}$iface${NC}:"
         echo -e "   State: $state"
