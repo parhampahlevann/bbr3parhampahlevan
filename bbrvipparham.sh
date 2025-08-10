@@ -1,446 +1,476 @@
 #!/bin/bash
-# BBR VIP Optimizer Pro - Complete Optimized Version
-# Auto-enables VIP mode with BBR, configures MTU, DNS on all interfaces, and reboot option
-# Optimized for Hetzner servers with enhanced error handling
 
-SCRIPT_NAME="BBR VIP Optimizer Pro"
-SCRIPT_VERSION="7.3"  # Updated version
+# Global Configuration
+SCRIPT_NAME="BBR VIP Optimizer"
+SCRIPT_VERSION="3.1"
 AUTHOR="Parham Pahlevan"
 CONFIG_FILE="/etc/bbr_vip.conf"
 LOG_FILE="/var/log/bbr_vip.log"
-BACKUP_DIR="/etc/bbr_vip_backups"
-SYSCTL_BACKUP="$BACKUP_DIR/sysctl.conf.bak"
-RESOLV_BACKUP="$BACKUP_DIR/resolv.conf.bak"
-NETWORK_BACKUP="$BACKUP_DIR/network_configs.tar.gz"
-
-# Network Configuration
-PREFERRED_INTERFACES=("ens160" "eth0" "enp0s3" "enp0s8")
-NETWORK_INTERFACE=""
-ALL_INTERFACES=()
-VIP_MODE=true
+SYSCTL_BACKUP="/etc/sysctl.conf.bak"
+CRON_JOB_FILE="/etc/cron.d/bbr_vip_autoreset"
+NETWORK_INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
+VIP_MODE=false
 VIP_SUBNET=""
 VIP_GATEWAY=""
-DEFAULT_MTU=1400  # Optimized for Hetzner
-CURRENT_MTU=""
-DNS_SERVERS=("1.1.1.1" "8.8.8.8")
-CURRENT_DNS=""
+DEFAULT_DNS_SERVERS="8.8.8.8 8.8.4.4 1.1.1.1"
+
+# Initialize logging
+exec > >(tee -a "$LOG_FILE") 2>&1
 
 # Color Codes
 RED='\033[0;31m'
+BOLD_RED='\033[1;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-PURPLE='\033[0;35m'
 NC='\033[0m'
 BOLD='\033[1m'
 
-# Initialize logging
-mkdir -p "$(dirname "$LOG_FILE")" || { echo -e "${RED}Failed to create log directory${NC}"; exit 1; }
-exec > >(tee -a "$LOG_FILE") 2>&1
+# Header Display
+show_header() {
+    clear
+    echo -e "${BLUE}${BOLD}╔══════════════════════════════════════════════════════╗"
+    echo -e "║   ${SCRIPT_NAME} ${SCRIPT_VERSION} - ${AUTHOR}          ║"
+    echo -e "╚══════════════════════════════════════════════════════╝${NC}"
+    echo -e "${YELLOW}Network Interface Detected: ${BOLD}$NETWORK_INTERFACE${NC}"
+    echo -e "${YELLOW}VIP Mode: ${BOLD}$([ "$VIP_MODE" = true ] && echo "Enabled" || echo "Disabled")${NC}\n"
+}
 
-# ==================== CORE FUNCTIONS ==================== #
-
+# Check Root
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}This script must be run as root!${NC}"
+        echo -e "${BOLD_RED}Error: This script must be run as root!${NC}"
         exit 1
     fi
 }
 
-init_backup_dir() {
-    mkdir -p "$BACKUP_DIR" || { echo -e "${RED}Failed to create backup directory${NC}"; exit 1; }
-    chmod 600 "$BACKUP_DIR" || { echo -e "${RED}Failed to set permissions on backup directory${NC}"; exit 1; }
+# Load Configuration
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        source "$CONFIG_FILE"
+    else
+        # Default values
+        ENABLE_BBR=true
+        ENABLE_FASTOPEN=true
+        TCP_CONGESTION="bbr"
+        TCP_FASTOPEN=3
+        VIP_MODE=false
+        VIP_SUBNET=""
+        VIP_GATEWAY=""
+        DEFAULT_KERNEL_PARAMS=(
+            "net.core.default_qdisc=fq"
+            "net.ipv4.tcp_congestion_control=$TCP_CONGESTION"
+            "net.ipv4.tcp_fastopen=$TCP_FASTOPEN"
+            "net.ipv4.tcp_syncookies=1"
+            "net.ipv4.tcp_tw_reuse=1"
+            "net.ipv4.tcp_fin_timeout=30"
+            "net.ipv4.tcp_keepalive_time=1200"
+            "net.ipv4.ip_local_port_range=1024 65000"
+            "net.ipv4.tcp_max_syn_backlog=8192"
+            "net.ipv4.tcp_max_tw_buckets=5000"
+            "net.core.somaxconn=65535"
+            "net.core.netdev_max_backlog=16384"
+            "net.ipv4.tcp_slow_start_after_idle=0"
+            "net.ipv4.tcp_mtu_probing=1"
+            "net.ipv4.tcp_rfc1337=1"
+        )
+        VIP_KERNEL_PARAMS=(
+            "net.ipv4.tcp_window_scaling=1"
+            "net.ipv4.tcp_timestamps=1"
+            "net.ipv4.tcp_sack=1"
+            "net.ipv4.tcp_dsack=1"
+            "net.ipv4.tcp_fack=1"
+            "net.ipv4.tcp_adv_win_scale=1"
+            "net.ipv4.tcp_app_win=31"
+            "net.ipv4.tcp_low_latency=1"
+        )
+    fi
 }
 
-detect_interfaces() {
-    ALL_INTERFACES=()
-    for iface in "${PREFERRED_INTERFACES[@]}"; do
-        if ip link show "$iface" >/dev/null 2>&1; then
-            ALL_INTERFACES+=("$iface")
-            echo -e "${GREEN}Detected interface: $iface${NC}"
+# Backup current sysctl settings
+backup_sysctl() {
+    if [[ ! -f "$SYSCTL_BACKUP" ]]; then
+        cp /etc/sysctl.conf "$SYSCTL_BACKUP"
+        echo -e "${GREEN}Current sysctl configuration backed up to $SYSCTL_BACKUP${NC}"
+    fi
+}
+
+# Apply Kernel Parameters
+apply_kernel_params() {
+    echo -e "${YELLOW}Applying optimized kernel parameters...${NC}"
+    
+    # Apply default parameters
+    for param in "${DEFAULT_KERNEL_PARAMS[@]}"; do
+        key=$(echo "$param" | cut -d= -f1)
+        value=$(echo "$param" | cut -d= -f2)
+        
+        if grep -q "^$key" /etc/sysctl.conf; then
+            sed -i "s/^$key.*/$param/" /etc/sysctl.conf
+        else
+            echo "$param" >> /etc/sysctl.conf
         fi
     done
     
-    if [ ${#ALL_INTERFACES[@]} -eq 0 ]; then
-        ALL_INTERFACES=($(ip -o link show | awk -F': ' '{print $2}' | grep -v lo))
-        echo -e "${YELLOW}No preferred interfaces found, using: ${ALL_INTERFACES[*]}${NC}"
-    fi
-    
-    if [ ${#ALL_INTERFACES[@]} -gt 0 ]; then
-        NETWORK_INTERFACE="${ALL_INTERFACES[0]}"
-        CURRENT_MTU=$(cat /sys/class/net/"$NETWORK_INTERFACE"/mtu 2>/dev/null || echo "$DEFAULT_MTU")
-    else
-        echo -e "${RED}No network interfaces detected!${NC}"
-        exit 1
-    fi
-    
-    CURRENT_DNS=$(grep nameserver /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ' || echo "None")
-}
-
-backup_network_configs() {
-    echo -e "${YELLOW}Creating comprehensive backup of network settings...${NC}"
-    init_backup_dir
-    
-    if [ -f /etc/sysctl.conf ]; then
-        cp /etc/sysctl.conf "$SYSCTL_BACKUP" || echo -e "${RED}Failed to backup sysctl.conf${NC}"
-    fi
-    if [ -f /etc/resolv.conf ]; then
-        cp /etc/resolv.conf "$RESOLV_BACKUP" || echo -e "${RED}Failed to backup resolv.conf${NC}"
-    fi
-    
-    if [ -d /etc/netplan ]; then
-        tar -czf "$NETWORK_BACKUP" /etc/netplan/ 2>/dev/null || echo -e "${RED}Failed to backup netplan configs${NC}"
-    elif [ -f /etc/network/interfaces ]; then
-        cp /etc/network/interfaces "$BACKUP_DIR/interfaces.bak" || echo -e "${RED}Failed to backup interfaces file${NC}"
-    fi
-    
-    if command -v nmcli &>/dev/null; then
-        nmcli -f NAME,UUID con show | awk 'NR>1 {print $2}' | while read uuid; do
-            nmcli con show "$uuid" > "$BACKUP_DIR/nm_$uuid.bak" || echo -e "${RED}Failed to backup NetworkManager config for $uuid${NC}"
+    # Apply VIP parameters if enabled
+    if [ "$VIP_MODE" = true ]; then
+        echo -e "${YELLOW}Applying VIP optimization parameters...${NC}"
+        for param in "${VIP_KERNEL_PARAMS[@]}"; do
+            key=$(echo "$param" | cut -d= -f1)
+            value=$(echo "$param" | cut -d= -f2)
+            
+            if grep -q "^$key" /etc/sysctl.conf; then
+                sed -i "s/^$key.*/$param/" /etc/sysctl.conf
+            else
+                echo "$param" >> /etc/sysctl.conf
+            fi
         done
     fi
     
-    echo -e "${GREEN}Full network configuration backed up to $BACKUP_DIR${NC}"
+    # Apply changes
+    if ! sysctl -p >/dev/null 2>&1; then
+        echo -e "${BOLD_RED}Error applying sysctl settings!${NC}"
+        return 1
+    fi
+    
+    echo -e "${GREEN}Kernel parameters applied successfully!${NC}"
+    return 0
 }
 
-# ==================== CONFIGURE DNS FOR ALL INTERFACES ==================== #
-
-configure_dns_all_interfaces() {
-    echo -e "${YELLOW}Configuring DNS servers for all interfaces...${NC}"
-    echo -n "Enter DNS servers (space separated, e.g., 1.1.1.1 8.8.8.8): "
-    read -a dns_servers
-    if [ ${#dns_servers[@]} -eq 0 ]; then
-        dns_servers=("${DNS_SERVERS[@]}")
-        echo -e "${YELLOW}Using default DNS servers: ${dns_servers[*]}${NC}"
+# Verify BBR Status
+verify_bbr() {
+    echo -e "${YELLOW}Verifying BBR status...${NC}"
+    
+    local current_congestion=$(sysctl net.ipv4.tcp_congestion_control | awk '{print $3}' 2>/dev/null)
+    local current_qdisc=$(sysctl net.core.default_qdisc | awk '{print $3}' 2>/dev/null)
+    
+    if [[ -z "$current_congestion" || -z "$current_qdisc" ]]; then
+        echo -e "${BOLD_RED}Error: Could not read current network settings!${NC}"
+        return 1
     fi
+    
+    if [[ "$current_congestion" == "$TCP_CONGESTION" && "$current_qdisc" == "fq" ]]; then
+        echo -e "${GREEN}BBR is active and properly configured!${NC}"
+        echo -e "Congestion control: ${BOLD}$current_congestion${NC}"
+        echo -e "Queue discipline: ${BOLD}$current_qdisc${NC}"
+        return 0
+    else
+        echo -e "${BOLD_RED}BBR is not properly configured!${NC}"
+        echo -e "Current congestion control: ${BOLD}$current_congestion${NC}"
+        echo -e "Current queue discipline: ${BOLD}$current_qdisc${NC}"
+        return 1
+    fi
+}
 
-    # Validate DNS servers
-    for dns in "${dns_servers[@]}"; do
-        if ! [[ $dns =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo -e "${RED}Invalid DNS address: $dns${NC}"
+# Setup Cron Job for Auto Reset
+setup_cron_job() {
+    local cron_time="0 4 * * *"  # Default: 4 AM daily
+    local script_path=$(readlink -f "$0")
+    
+    echo -e "${YELLOW}Setting up cron job for auto-reset...${NC}"
+    
+    echo "$cron_time root $script_path --reset > /dev/null 2>&1" > "$CRON_JOB_FILE"
+    chmod 644 "$CRON_JOB_FILE"
+    
+    if [[ $? -ne 0 ]]; then
+        echo -e "${BOLD_RED}Error creating cron job!${NC}"
+        return 1
+    fi
+    
+    echo -e "${GREEN}Cron job installed at $CRON_JOB_FILE${NC}"
+    echo -e "The system will automatically reset network settings daily at 4 AM"
+    return 0
+}
+
+# Reset Network Settings
+reset_network() {
+    echo -e "${YELLOW}Resetting network settings to default...${NC}"
+    
+    if [[ -f "$SYSCTL_BACKUP" ]]; then
+        if ! cp "$SYSCTL_BACKUP" /etc/sysctl.conf; then
+            echo -e "${BOLD_RED}Error restoring backup!${NC}"
             return 1
         fi
-    done
-
-    # Backup resolv.conf
-    backup_network_configs
-    if [ -f /etc/resolv.conf ]; then
-        chattr -i /etc/resolv.conf 2>/dev/null || echo -e "${YELLOW}Warning: Could not remove immutable attribute from resolv.conf${NC}"
-    fi
-
-    # Generate new resolv.conf
-    {
-        echo "# Generated by $SCRIPT_NAME"
-        for dns in "${dns_servers[@]}"; do
-            echo "nameserver $dns"
-        done
-    } > /etc/resolv.conf || { echo -e "${RED}Failed to write to resolv.conf${NC}"; return 1; }
-    chmod 644 /etc/resolv.conf
-
-    # Apply DNS to all interfaces
-    local any_success=false
-    for iface in "${ALL_INTERFACES[@]}"; do
-        echo -e "${YELLOW}Configuring DNS for $iface...${NC}"
-        if command -v nmcli &>/dev/null; then
-            nm_con=$(nmcli -t -f DEVICE,NAME con show | grep "$iface" | cut -d: -f2)
-            if [ -n "$nm_con" ]; then
-                nmcli con mod "$nm_con" ipv4.dns "${dns_servers[*]}" || echo -e "${RED}Failed to set DNS for $iface via NetworkManager${NC}"
-                nmcli con up "$nm_con" || echo -e "${RED}Failed to apply NetworkManager changes for $iface${NC}"
-                echo -e "${GREEN}DNS configured for $iface via NetworkManager${NC}"
-                any_success=true
-            else
-                echo -e "${YELLOW}No NetworkManager connection found for $iface${NC}"
-            fi
-        elif [ -d /etc/netplan ]; then
-            for yaml in /etc/netplan/*.yaml; do
-                if [ -f "$yaml" ] && grep -q "$iface:" "$yaml"; then
-                    sed -i "/$iface:/,/^ *[^ ]/ { /nameservers:/d; /addresses:/d }" "$yaml"
-                    {
-                        echo "      nameservers:"
-                        echo "        addresses: [${dns_servers[*]}]"
-                    } | sed -i "/$iface:/r /dev/stdin" "$yaml"
-                    echo -e "${GREEN}DNS configured for $iface in $yaml${NC}"
-                    any_success=true
-                fi
-            done
-            netplan apply 2>/dev/null || echo -e "${RED}Failed to apply netplan changes${NC}"
-        elif [ -f /etc/network/interfaces ]; then
-            sed -i "/iface $iface inet/,/^$/ { /dns-nameservers/d }" /etc/network/interfaces
-            sed -i "/iface $iface inet/a\    dns-nameservers ${dns_servers[*]}" /etc/network/interfaces
-            echo -e "${GREEN}DNS configured for $iface via interfaces file${NC}"
-            any_success=true
-        else
-            echo -e "${RED}Unsupported configuration method for $iface${NC}"
-            continue
+        
+        if ! sysctl -p >/dev/null 2>&1; then
+            echo -e "${BOLD_RED}Error applying restored settings!${NC}"
+            return 1
         fi
-    done
-
-    # Apply networking changes
-    if systemctl is-active --quiet NetworkManager; then
-        systemctl restart NetworkManager 2>/dev/null || echo -e "${RED}Failed to restart NetworkManager${NC}"
+        
+        echo -e "${GREEN}Network settings restored from backup!${NC}"
+        
+        # Restart network service
+        restart_network_services
+        
+        return 0
     else
-        systemctl restart networking 2>/dev/null || echo -e "${YELLOW}Networking service not found or not restarted${NC}"
-    fi
-
-    # Verify DNS
-    for dns in "${dns_servers[@]}"; do
-        if ping -c1 -W1 "$dns" &>/dev/null; then
-            echo -e "${GREEN}DNS $dns is reachable${NC}"
-        else
-            echo -e "${RED}DNS $dns is unreachable${NC}"
-        fi
-    done
-
-    if [ "$any_success" = true ]; then
-        echo -e "${GREEN}DNS configured for all interfaces${NC}"
-    else
-        echo -e "${RED}Failed to configure DNS for any interface${NC}"
+        echo -e "${BOLD_RED}No backup found! Cannot reset network settings.${NC}"
         return 1
     fi
 }
 
-# ==================== REBOOT SYSTEM ==================== #
-
-reboot_system() {
-    echo -e "${YELLOW}Are you sure you want to reboot the system? (y/n)${NC}"
-    read -p "Confirm: " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        echo -e "${YELLOW}Rebooting system in 5 seconds...${NC}"
-        sleep 5
-        reboot
+# Restart Network Services
+restart_network_services() {
+    echo -e "${YELLOW}Restarting network services...${NC}"
+    
+    if systemctl restart networking 2>/dev/null || \
+       systemctl restart network 2>/dev/null || \
+       service networking restart 2>/dev/null || \
+       service network restart 2>/dev/null; then
+        echo -e "${GREEN}Network services restarted successfully.${NC}"
     else
-        echo -e "${GREEN}Reboot cancelled${NC}"
-    fi
-}
-
-# ==================== AUTO CONFIGURATION FUNCTIONS ==================== #
-
-enable_bbr_with_vip() {
-    echo -e "${YELLOW}Enabling BBR with AUTO VIP mode (Hetzner optimized)...${NC}"
-    
-    backup_network_configs
-    
-    {
-        echo "# BBR Configuration with VIP Mode - DO NOT EDIT"
-        echo "net.core.default_qdisc=fq"
-        echo "net.ipv4.tcp_congestion_control=bbr"
-        echo "net.ipv4.tcp_fastopen=3"
-        echo "net.ipv4.tcp_tw_reuse=1"
-        echo "net.ipv4.tcp_fin_timeout=30"
-        echo "net.ipv4.tcp_keepalive_time=1200"
-        echo "net.ipv4.ip_local_port_range=1024 65000"
-        echo "net.ipv4.tcp_max_syn_backlog=8192"
-        echo "net.ipv4.tcp_max_tw_buckets=5000"
-        echo "net.core.somaxconn=65535"
-        echo "net.core.netdev_max_backlog=16384"
-        echo "net.ipv4.tcp_slow_start_after_idle=0"
-        echo "net.ipv4.tcp_mtu_probing=1"
-        echo "net.ipv4.tcp_rfc1337=1"
-        echo "net.core.rmem_max=16777216"
-        echo "net.core.wmem_max=16777216"
-        echo "net.ipv4.tcp_rmem=4096 87380 16777216"
-        echo "net.ipv4.tcp_wmem=4096 65536 16777216"
-        echo "# VIP Optimizations"
-        echo "net.ipv4.tcp_window_scaling=1"
-        echo "net.ipv4.tcp_timestamps=1"
-        echo "net.ipv4.tcp_sack=1"
-        echo "net.ipv4.tcp_dsack=1"
-        echo "net.ipv4.tcp_fack=1"
-        echo "net.ipv4.tcp_adv_win_scale=1"
-        echo "net.ipv4.tcp_app_win=31"
-        echo "net.ipv4.tcp_low_latency=1"
-    } > /etc/sysctl.d/60-bbr.conf || { echo -e "${RED}Failed to write BBR config${NC}"; return 1; }
-
-    sysctl -p /etc/sysctl.d/60-bbr.conf >/dev/null 2>&1 || echo -e "${RED}Failed to apply sysctl settings${NC}"
-    
-    for iface in "${ALL_INTERFACES[@]}"; do
-        tc qdisc replace dev "$iface" root fq 2>/dev/null || echo -e "${RED}Failed to set fq qdisc on $iface${NC}"
-    done
-    
-    if ! grep -q "60-bbr.conf" /etc/rc.local 2>/dev/null; then
-        [ -f /etc/rc.local ] || echo -e "#!/bin/bash\nexit 0" > /etc/rc.local
-        sed -i "/^exit 0/i sysctl -p /etc/sysctl.d/60-bbr.conf" /etc/rc.local
-        chmod +x /etc/rc.local
-    fi
-    
-    echo -e "${GREEN}BBR with VIP mode enabled successfully (Hetzner optimized)!${NC}"
-}
-
-set_mtu_all_interfaces() {
-    local mtu=$1
-    if [ "$mtu" -lt 1280 ] || [ "$mtu" -gt 1500 ]; then
-        echo -e "${RED}MTU must be between 1280 and 1500 for Hetzner compatibility${NC}"
+        echo -e "${BOLD_RED}Could not restart network services. You may need to reboot.${NC}"
         return 1
     fi
-    
-    backup_network_configs
-    
-    echo -e "${YELLOW}Configuring MTU $mtu on all interfaces...${NC}"
-    
-    for iface in "${ALL_INTERFACES[@]}"; do
-        ip link set dev "$iface" mtu "$mtu" || echo -e "${RED}Failed to set MTU on $iface${NC}"
-        
-        if [ -f /etc/network/interfaces ]; then
-            sed -i "/iface $iface inet/,/^$/ { /mtu /d }" /etc/network/interfaces
-            sed -i "/iface $iface inet/a\    mtu $mtu" /etc/network/interfaces
-        elif command -v nmcli &>/dev/null; then
-            nm_con=$(nmcli -t -f DEVICE,NAME con show | grep "$iface" | cut -d: -f2)
-            if [ -n "$nm_con" ]; then
-                nmcli con mod "$nm_con" 802-3-ethernet.mtu "$mtu" || echo -e "${RED}Failed to set MTU for $iface via NetworkManager${NC}"
-                nmcli con up "$nm_con" || echo -e "${RED}Failed to apply NetworkManager changes for $iface${NC}"
-            fi
-        elif [ -d /etc/netplan ]; then
-            for yaml in /etc/netplan/*.yaml; do
-                if [ -f "$yaml" ] && grep -q "$iface:" "$yaml"; then
-                    sed -i "/$iface:/,/^ *[^ ]/ { /mtu:/d }" "$yaml"
-                    sed -i "/$iface:/a\      mtu: $mtu" "$yaml"
-                fi
-            done
-            netplan apply 2>/dev/null || echo -e "${RED}Failed to apply netplan changes${NC}"
-        fi
-        
-        current_mtu=$(cat /sys/class/net/"$iface"/mtu 2>/dev/null)
-        if [ "$current_mtu" -eq "$mtu" ]; then
-            echo -e "${GREEN}Successfully set MTU $mtu on $iface${NC}"
-        else
-            echo -e "${RED}Failed to set MTU $mtu on $iface${NC}"
-        fi
-    done
-    
-    [ -f /etc/rc.local ] || echo -e "#!/bin/bash\nexit 0" > /etc/rc.local
-    for iface in "${ALL_INTERFACES[@]}"; do
-        if ! grep -q "ip link set dev $iface mtu $mtu" /etc/rc.local; then
-            sed -i "/^exit 0/i ip link set dev $iface mtu $mtu" /etc/rc.local
-        fi
-    done
-    chmod +x /etc/rc.local
-    
-    echo -e "${GREEN}MTU $mtu configured on ALL interfaces!${NC}"
 }
 
-# ==================== RESTORATION FUNCTIONS ==================== #
+# Configure VIP Settings
+configure_vip() {
+    echo -e "\n${YELLOW}Configuring VIP Optimization${NC}"
+    
+    read -p "Enable VIP Mode? (y/n): " choice
+    if [[ "$choice" =~ ^[Yy] ]]; then
+        VIP_MODE=true
+        
+        read -p "Enter VIP Subnet (e.g., 10.0.0.0/24): " VIP_SUBNET
+        read -p "Enter VIP Gateway (e.g., 10.0.0.1): " VIP_GATEWAY
+        
+        echo -e "${GREEN}VIP Mode enabled with Subnet: $VIP_SUBNET, Gateway: $VIP_GATEWAY${NC}"
+    else
+        VIP_MODE=false
+        echo -e "${YELLOW}VIP Mode disabled${NC}"
+    fi
+    
+    # Save to config file
+    save_config
+}
 
-restore_backups() {
-    echo -e "${YELLOW}Restoring original network configuration...${NC}"
+# Save Configuration
+save_config() {
+    echo -e "${YELLOW}Saving configuration to $CONFIG_FILE...${NC}"
     
-    if [ -f "$SYSCTL_BACKUP" ]; then
-        cp "$SYSCTL_BACKUP" /etc/sysctl.conf || echo -e "${RED}Failed to restore sysctl.conf${NC}"
-        rm -f /etc/sysctl.d/60-bbr.conf
-        sysctl -p >/dev/null 2>&1 || echo -e "${RED}Failed to apply sysctl settings${NC}"
+    cat > "$CONFIG_FILE" <<EOL
+# BBR VIP Optimizer Configuration
+ENABLE_BBR=$ENABLE_BBR
+ENABLE_FASTOPEN=$ENABLE_FASTOPEN
+TCP_CONGESTION="$TCP_CONGESTION"
+TCP_FASTOPEN=$TCP_FASTOPEN
+VIP_MODE=$VIP_MODE
+VIP_SUBNET="$VIP_SUBNET"
+VIP_GATEWAY="$VIP_GATEWAY"
+EOL
+
+    echo -e "${GREEN}Configuration saved successfully!${NC}"
+}
+
+# Network Interface Configuration
+configure_interface() {
+    echo -e "\n${YELLOW}Configuring network interface: $NETWORK_INTERFACE${NC}"
+    
+    # Enable BBR for the specific interface
+    if ! tc qdisc add dev $NETWORK_INTERFACE root fq 2>/dev/null; then
+        echo -e "${YELLOW}Queue discipline already configured or failed to set.${NC}"
     fi
     
-    if [ -f "$RESOLV_BACKUP" ]; then
-        chattr -i /etc/resolv.conf 2>/dev/null || echo -e "${YELLOW}Warning: Could not remove immutable attribute from resolv.conf${NC}"
-        cp "$RESOLV_BACKUP" /etc/resolv.conf || echo -e "${RED}Failed to restore resolv.conf${NC}"
-    fi
+    # Apply additional interface-specific settings
+    ethtool -K $NETWORK_INTERFACE tso on gso on gro on 2>/dev/null
+    ethtool -C $NETWORK_INTERFACE rx-usecs 30 2>/dev/null
     
-    if [ -f "$NETWORK_BACKUP" ]; then
+    echo -e "${GREEN}Interface configuration applied to $NETWORK_INTERFACE${NC}"
+}
+
+# Configure DNS on all interfaces
+configure_dns() {
+    echo -e "\n${YELLOW}Configuring DNS on all interfaces...${NC}"
+    
+    read -p "Enter DNS servers (space separated, default: $DEFAULT_DNS_SERVERS): " DNS_SERVERS
+    DNS_SERVERS=${DNS_SERVERS:-$DEFAULT_DNS_SERVERS}
+    
+    local INTERFACES=$(ls /sys/class/net/ | grep -v lo)
+
+    for IFACE in $INTERFACES; do
+        echo -e "${YELLOW}Setting DNS for interface $IFACE...${NC}"
+        
+        # برای سیستم‌های با netplan (Ubuntu 18.04 به بعد)
         if [ -d /etc/netplan ]; then
-            rm -f /etc/netplan/*
-            tar -xzf "$NETWORK_BACKUP" -C /etc/ || echo -e "${RED}Failed to restore netplan configs${NC}"
-        elif [ -f "$BACKUP_DIR/interfaces.bak" ]; then
-            cp "$BACKUP_DIR/interfaces.bak" /etc/network/interfaces || echo -e "${RED}Failed to restore interfaces file${NC}"
+            local NETPLAN_FILE=$(ls /etc/netplan/*.yaml | head -n 1)
+            if [ -f "$NETPLAN_FILE" ]; then
+                if grep -q "$IFACE:" "$NETPLAN_FILE"; then
+                    if grep -q "nameservers:" "$NETPLAN_FILE"; then
+                        sed -i "/$IFACE:/,/^[^ ]/ {/nameservers:/!b; /addresses:/! {N; /addresses:/!b}; s/addresses:.*/addresses: [$DNS_SERVERS]/}" "$NETPLAN_FILE"
+                    else
+                        sed -i "/$IFACE:/a \    nameservers:\n      addresses: [$DNS_SERVERS]" "$NETPLAN_FILE"
+                    fi
+                    netplan apply
+                fi
+            fi
+        fi
+        
+        # برای سیستم‌های با NetworkManager
+        if command -v nmcli &> /dev/null; then
+            nmcli con mod "$IFACE" ipv4.dns "$DNS_SERVERS"
+            nmcli con up "$IFACE"
+        fi
+        
+        # برای سیستم‌های قدیمی با resolv.conf
+        if [ -f /etc/resolv.conf ]; then
+            chattr -i /etc/resolv.conf 2>/dev/null
+            echo -e "# Generated by $SCRIPT_NAME\nnameserver $DNS_SERVERS" > /etc/resolv.conf
+            chattr +i /etc/resolv.conf 2>/dev/null
+        fi
+    done
+    
+    echo -e "${GREEN}DNS configuration applied to all interfaces!${NC}"
+}
+
+# Add system reboot option
+add_reboot_option() {
+    echo -e "\n${YELLOW}Adding reboot option to the system...${NC}"
+    
+    # برای سیستم‌های با systemd
+    if command -v systemctl &> /dev/null; then
+        cat << EOF > /etc/systemd/system/reboot-me.service
+[Unit]
+Description=Reboot System
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c "sleep 5 && /sbin/reboot"
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        systemctl daemon-reload
+        systemctl enable reboot-me.service
+        echo -e "${GREEN}Reboot service created and enabled.${NC}"
+        echo -e "Use ${BOLD}systemctl start reboot-me${NC} to reboot the system."
+    fi
+
+    # برای سیستم‌های قدیمی
+    if [ -f /etc/inittab ]; then
+        if ! grep -q "reboot:12345:respawn:/sbin/reboot" /etc/inittab; then
+            echo "reboot:12345:respawn:/sbin/reboot" >> /etc/inittab
+            echo -e "${GREEN}Reboot option added to inittab.${NC}"
+            echo -e "Use ${BOLD}init 6${NC} to reboot the system."
+        else
+            echo -e "${YELLOW}Reboot option already exists in inittab.${NC}"
         fi
     fi
     
-    if command -v nmcli &>/dev/null; then
-        find "$BACKUP_DIR" -name "nm_*.bak" | while read backup; do
-            uuid=$(basename "$backup" | cut -d_ -f2 | cut -d. -f1)
-            nmcli con del "$uuid" 2>/dev/null
-            nmcli con add < "$backup" 2>/dev/null || echo -e "${RED}Failed to restore NetworkManager config $uuid${NC}"
-        done
-    fi
-    
-    [ -f /etc/rc.local ] && sed -i '/60-bbr.conf/d;/mtu /d' /etc/rc.local
-    
-    if systemctl is-active --quiet NetworkManager; then
-        systemctl restart NetworkManager 2>/dev/null || echo -e "${RED}Failed to restart NetworkManager${NC}"
-    else
-        systemctl restart networking 2>/dev/null || echo -e "${YELLOW}Networking service not found or not restarted${NC}"
-    fi
-    
-    echo -e "${GREEN}All settings restored to original configuration!${NC}"
+    echo -e "\n${GREEN}Reboot options successfully configured!${NC}"
 }
 
-# ==================== STATUS MONITORING ==================== #
-
-show_status() {
-    clear
-    echo -e "${BLUE}${BOLD}=== $SCRIPT_NAME $SCRIPT_VERSION ===${NC}"
-    echo -e "${CYAN}=== Current Network Status ===${NC}"
+# Show Current Settings
+show_settings() {
+    echo -e "\n${YELLOW}Current Configuration:${NC}"
+    echo -e "BBR Enabled: ${BOLD}$ENABLE_BBR${NC}"
+    echo -e "TCP Fast Open: ${BOLD}$TCP_FASTOPEN${NC}"
+    echo -e "VIP Mode: ${BOLD}$VIP_MODE${NC}"
     
-    echo -e "\n${YELLOW}BBR Status:${NC}"
-    local congestion=$(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk '{print $3}' || echo "Unknown")
-    local qdisc=$(sysctl net.core.default_qdisc 2>/dev/null | awk '{print $3}' || echo "Unknown")
-    echo -e " Congestion Control: ${BOLD}$congestion${NC}"
-    echo -e " Queue Discipline: ${BOLD}$qdisc${NC}"
-    echo -e " VIP Mode: ${GREEN}Enabled${NC}"
-    
-    echo -e "\n${YELLOW}Network Interfaces:${NC}"
-    for iface in "${ALL_INTERFACES[@]}"; do
-        local mtu=$(cat /sys/class/net/"$iface"/mtu 2>/dev/null || echo "Unknown")
-        local state=$(ip -o link show "$iface" | awk '{print $9}' || echo "Unknown")
-        local ip=$(ip -o -4 addr show "$iface" | awk '{print $4}' | cut -d/ -f1 || echo "None")
-        echo -e " ${BOLD}$iface${NC}:"
-        echo -e "   State: $state"
-        echo -e "   IP: $ip"
-        echo -e "   MTU: $mtu"
-    done
-    
-    echo -e "\n${YELLOW}DNS Status:${NC}"
-    if [ -f /etc/resolv.conf ]; then
-        grep nameserver /etc/resolv.conf | while read line; do
-            local dns=$(echo "$line" | awk '{print $2}')
-            echo -e " $line" $(ping -c1 -W1 "$dns" &>/dev/null && echo -e "${GREEN}(Reachable)${NC}" || echo -e "${RED}(Unreachable)${NC}")
-        done
-    else
-        echo -e " ${RED}No resolv.conf found${NC}"
+    if [ "$VIP_MODE" = true ]; then
+        echo -e "VIP Subnet: ${BOLD}$VIP_SUBNET${NC}"
+        echo -e "VIP Gateway: ${BOLD}$VIP_GATEWAY${NC}"
     fi
     
-    read -p $'\nPress Enter to continue...'
+    echo -e "\n${YELLOW}Current Kernel Parameters:${NC}"
+    sysctl -a 2>/dev/null | grep -E "net.core.default_qdisc|net.ipv4.tcp_congestion_control|net.ipv4.tcp_fastopen"
+    
+    echo -e "\n${YELLOW}Interface Settings:${NC}"
+    ethtool -k $NETWORK_INTERFACE 2>/dev/null | grep -E "tcp-segmentation-offload:|generic-segmentation-offload:|generic-receive-offload:"
+    
+    echo -e "\n${YELLOW}Current DNS Settings:${NC}"
+    cat /etc/resolv.conf 2>/dev/null | grep -v "^#"
 }
 
-# ==================== MAIN MENU ==================== #
-
+# Main Menu
 show_menu() {
     while true; do
-        clear
-        echo -e "${BLUE}${BOLD}$SCRIPT_NAME $SCRIPT_VERSION${NC}"
-        echo -e "${YELLOW}Main Menu:${NC}"
-        echo -e "1) Enable BBR with VIP Mode (Auto)"
-        echo -e "2) Set MTU on ALL Interfaces"
-        echo -e "3) Configure DNS Servers for ALL Interfaces"
-        echo -e "4) Show Current Status"
-        echo -e "5) Restore Original Settings"
-        echo -e "6) Reboot System"
-        echo -e "7) Exit"
+        show_header
+        echo -e "\n${BOLD}Main Menu:${NC}"
+        echo -e "1) Apply Full Optimization (BBR + VIP + Interface)"
+        echo -e "2) Verify Current Configuration"
+        echo -e "3) Reset Network Settings"
+        echo -e "4) Install Auto-Reset Cron Job"
+        echo -e "5) Configure Network Interface"
+        echo -e "6) Configure VIP Settings"
+        echo -e "7) Configure DNS on all interfaces"
+        echo -e "8) Add System Reboot Option"
+        echo -e "9) Show Current Settings"
+        echo -e "10) Save Configuration"
+        echo -e "11) Exit"
         
-        read -p "Please select an option: " choice
+        read -p "Please enter your choice [1-11]: " choice
         
         case $choice in
-            1) enable_bbr_with_vip ;;
-            2)
-                echo -n "Enter MTU value [recommended 1400 for Hetzner]: "
-                read mtu
-                set_mtu_all_interfaces "$mtu"
+            1)
+                backup_sysctl
+                apply_kernel_params
+                configure_interface
+                configure_dns
+                verify_bbr
                 ;;
-            3) configure_dns_all_interfaces ;;
-            4) show_status ;;
-            5) restore_backups ;;
-            6) reboot_system ;;
-            7) exit 0 ;;
+            2)
+                verify_bbr
+                ;;
+            3)
+                reset_network
+                ;;
+            4)
+                setup_cron_job
+                ;;
+            5)
+                configure_interface
+                ;;
+            6)
+                configure_vip
+                ;;
+            7)
+                configure_dns
+                ;;
+            8)
+                add_reboot_option
+                ;;
+            9)
+                show_settings
+                ;;
+            10)
+                save_config
+                ;;
+            11)
+                echo -e "${GREEN}Exiting...${NC}"
+                exit 0
+                ;;
             *)
-                echo -e "${RED}Invalid option!${NC}"
-                sleep 1
+                echo -e "${BOLD_RED}Invalid option!${NC}"
                 ;;
         esac
+        
+        read -p "Press [Enter] to return to main menu..."
     done
 }
 
-# ==================== INITIALIZATION ==================== #
+# Main Execution
+main() {
+    check_root
+    load_config
+    show_menu
+}
 
-check_root
-init_backup_dir
-detect_interfaces
-show_menu
+# Handle command line arguments
+case "$1" in
+    "--reset")
+        reset_network
+        exit $?
+        ;;
+    "--dns")
+        configure_dns
+        exit $?
+        ;;
+    "--reboot-option")
+        add_reboot_option
+        exit $?
+        ;;
+    *)
+        main
+        ;;
+esac
