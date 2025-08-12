@@ -80,7 +80,6 @@ detect_distro() {
 
 # Helper: test connectivity after MTU change
 _test_connectivity() {
-    # try gateway first, else 1.1.1.1
     local gw
     gw=$(ip route | awk '/default/ {print $3; exit}')
     local target
@@ -90,15 +89,12 @@ _test_connectivity() {
         target="1.1.1.1"
     fi
 
-    # give kernel a moment to settle
     sleep 2
 
-    # ping for a short time (2 packets, wait 3s each)
     if ping -c 2 -W 3 "$target" >/dev/null 2>&1; then
         return 0
     fi
 
-    # fallback: try 1.1.1.1 if we tested gateway and failed
     if [[ "$target" != "1.1.1.1" ]]; then
         if ping -c 2 -W 3 1.1.1.1 >/dev/null 2>&1; then
             return 0
@@ -108,50 +104,40 @@ _test_connectivity() {
     return 1
 }
 
-# Configure MTU Permanently (Safe Mode)
+# Configure MTU Permanently (Improved Version)
 configure_mtu_permanent() {
-    echo -e "${YELLOW}Attempting to set permanent MTU $CURRENT_MTU on $NETWORK_INTERFACE...${NC}"
+    echo -e "${YELLOW}Setting permanent MTU $CURRENT_MTU on $NETWORK_INTERFACE...${NC}"
 
-    # read old mtu for rollback
     local OLD_MTU
     OLD_MTU=$(cat /sys/class/net/"$NETWORK_INTERFACE"/mtu 2>/dev/null || echo "$DEFAULT_MTU")
 
-    # set temporary MTU
+    # 1. First try to set temporary MTU and test connectivity
     if ! ip link set dev "$NETWORK_INTERFACE" mtu "$CURRENT_MTU" 2>>"$LOG_FILE"; then
         echo -e "${BOLD_RED}Error: could not set temporary MTU on $NETWORK_INTERFACE${NC}"
         return 1
     fi
 
-    echo -e "${CYAN}Temporary MTU set to $CURRENT_MTU — testing connectivity...${NC}"
-
-    # test connectivity; if fails, rollback
     if ! _test_connectivity; then
-        echo -e "${BOLD_RED}Connectivity test FAILED after temporary MTU change. Rolling back to $OLD_MTU...${NC}"
+        echo -e "${BOLD_RED}Connectivity test FAILED after MTU change. Rolling back to $OLD_MTU...${NC}"
         ip link set dev "$NETWORK_INTERFACE" mtu "$OLD_MTU" 2>>"$LOG_FILE"
         CURRENT_MTU=$OLD_MTU
         return 1
     fi
 
-    echo -e "${GREEN}Connectivity OK with MTU $CURRENT_MTU — applying permanent configuration...${NC}"
-
-    # Apply permanent configuration based on network manager
-    # 1) Netplan
+    # 2. Apply permanent configuration
+    # Priority: Netplan > NetworkManager > systemd-networkd > ifcfg > interfaces
+    
+    # Netplan (Ubuntu 18.04+)
     if [[ -d /etc/netplan ]] && ls /etc/netplan/*.yaml >/dev/null 2>&1; then
         NETPLAN_FILE=$(ls /etc/netplan/*.yaml | head -n1)
-
-        # If interface name exists in file, try to set its mtu, else add simple ethernets block
-        if grep -qE "^[[:space:]]*$NETWORK_INTERFACE:" "$NETPLAN_FILE" >/dev/null 2>&1; then
-            # interface entry exists; try to insert/replace mtu within that block
-            # naive but practical approach: if 'mtu:' exists anywhere, replace first occurrence under that iface; else insert after iface line
+        if grep -qE "^[[:space:]]*$NETWORK_INTERFACE:" "$NETPLAN_FILE"; then
             if grep -A3 -n "^[[:space:]]*$NETWORK_INTERFACE:" "$NETPLAN_FILE" | grep -q "mtu:"; then
                 sed -i "/^[[:space:]]*$NETWORK_INTERFACE:/, /^$/ s/mtu: .*/mtu: $CURRENT_MTU/" "$NETPLAN_FILE"
             else
                 sed -i "/^[[:space:]]*$NETWORK_INTERFACE:/a\      mtu: $CURRENT_MTU" "$NETPLAN_FILE"
             fi
         else
-            # try to add under ethernets if present
             if grep -q "^[[:space:]]*ethernets:" "$NETPLAN_FILE"; then
-                # append a minimal entry for the interface
                 awk -v iface="$NETWORK_INTERFACE" -v mtu="$CURRENT_MTU" '
                     BEGIN {added=0}
                     /^([[:space:]]*)ethernets:/ && added==0 {
@@ -160,7 +146,6 @@ configure_mtu_permanent() {
                     {print}
                 ' "$NETPLAN_FILE" > "$NETPLAN_FILE.tmp" && mv "$NETPLAN_FILE.tmp" "$NETPLAN_FILE"
             else
-                # fallback: append full network section
                 cat >> "$NETPLAN_FILE" <<EOF
 
 network:
@@ -174,30 +159,24 @@ EOF
         fi
 
         if netplan apply 2>>"$LOG_FILE"; then
-            echo -e "${GREEN}Netplan updated and applied.${NC}"
+            echo -e "${GREEN}Netplan configuration updated successfully.${NC}"
             return 0
-        else
-            echo -e "${YELLOW}Warning: netplan apply failed — continuing to try other methods (if available).${NC}"
         fi
     fi
 
-    # 2) NetworkManager (nmcli)
+    # NetworkManager
     if command -v nmcli >/dev/null 2>&1 && systemctl is-active NetworkManager >/dev/null 2>&1; then
         CONNECTION=$(nmcli -t -f NAME,DEVICE connection show | grep "$NETWORK_INTERFACE" | cut -d: -f1 | head -n1)
         if [[ -n "$CONNECTION" ]]; then
             if nmcli connection modify "$CONNECTION" 802-3-ethernet.mtu "$CURRENT_MTU" 2>>"$LOG_FILE"; then
                 nmcli connection up "$CONNECTION" 2>>"$LOG_FILE" || true
-                echo -e "${GREEN}NetworkManager connection modified.${NC}"
+                echo -e "${GREEN}NetworkManager configuration updated successfully.${NC}"
                 return 0
-            else
-                echo -e "${YELLOW}Warning: nmcli modify failed.${NC}"
             fi
-        else
-            echo -e "${YELLOW}No NetworkManager connection matching $NETWORK_INTERFACE found.${NC}"
         fi
     fi
 
-    # 3) systemd-networkd
+    # systemd-networkd
     if systemctl is-active systemd-networkd >/dev/null 2>&1; then
         mkdir -p /etc/systemd/network
         cat <<EOF > /etc/systemd/network/20-"$NETWORK_INTERFACE".network
@@ -208,14 +187,12 @@ Name=$NETWORK_INTERFACE
 MTUBytes=$CURRENT_MTU
 EOF
         if systemctl restart systemd-networkd 2>>"$LOG_FILE"; then
-            echo -e "${GREEN}systemd-networkd configured and restarted.${NC}"
+            echo -e "${GREEN}systemd-networkd configuration updated successfully.${NC}"
             return 0
-        else
-            echo -e "${YELLOW}Warning: restarting systemd-networkd failed.${NC}"
         fi
     fi
 
-    # 4) CentOS/RHEL ifcfg
+    # CentOS/RHEL ifcfg
     if [[ -d /etc/sysconfig/network-scripts ]]; then
         IFCFG_FILE="/etc/sysconfig/network-scripts/ifcfg-$NETWORK_INTERFACE"
         if [[ -f "$IFCFG_FILE" ]]; then
@@ -224,11 +201,7 @@ EOF
             else
                 echo "MTU=$CURRENT_MTU" >> "$IFCFG_FILE"
             fi
-            systemctl restart network 2>>"$LOG_FILE" || nmcli connection reload 2>>"$LOG_FILE" || true
-            echo -e "${GREEN}ifcfg file updated.${NC}"
-            return 0
         else
-            # create a basic ifcfg file as fallback
             cat > "$IFCFG_FILE" <<EOF
 DEVICE=$NETWORK_INTERFACE
 BOOTPROTO=dhcp
@@ -236,29 +209,72 @@ ONBOOT=yes
 MTU=$CURRENT_MTU
 EOF
             chmod 600 "$IFCFG_FILE"
-            systemctl restart network 2>>"$LOG_FILE" || true
-            echo -e "${GREEN}Created ifcfg file as fallback.${NC}"
-            return 0
         fi
+        systemctl restart network 2>>"$LOG_FILE" || true
+        echo -e "${GREEN}ifcfg configuration updated successfully.${NC}"
+        return 0
     fi
 
-    # 5) /etc/network/interfaces (Debian legacy)
+    # Debian interfaces
     if [[ -f /etc/network/interfaces ]]; then
         if grep -q "iface $NETWORK_INTERFACE" /etc/network/interfaces; then
-            # remove any existing mtu line in the iface block, then insert
             sed -i "/iface $NETWORK_INTERFACE/,/^\s*$/ {/mtu /d}" /etc/network/interfaces
             sed -i "/iface $NETWORK_INTERFACE/a\    mtu $CURRENT_MTU" /etc/network/interfaces
         else
             echo -e "\nauto $NETWORK_INTERFACE\niface $NETWORK_INTERFACE inet dhcp\n    mtu $CURRENT_MTU" >> /etc/network/interfaces
         fi
-        systemctl restart networking 2>>"$LOG_FILE" || service networking restart 2>>"$LOG_FILE" || true
-        echo -e "${GREEN}/etc/network/interfaces updated.${NC}"
+        systemctl restart networking 2>>"$LOG_FILE" || true
+        echo -e "${GREEN}/etc/network/interfaces updated successfully.${NC}"
         return 0
     fi
 
-    # If reached here, we couldn't detect a supported config — but the temporary change works.
-    echo -e "${YELLOW}Warning: could not write permanent config to known network managers. Temporary MTU applied successfully.${NC}"
+    # If all methods failed, at least the temporary change is working
+    echo -e "${YELLOW}Warning: Could not persist MTU configuration, but temporary change is active.${NC}"
     return 0
+}
+
+# Update DNS Configuration (Improved Version)
+update_dns() {
+    echo -e "${YELLOW}Updating DNS configuration...${NC}"
+
+    # Backup current resolv.conf if it's not our own
+    if ! grep -q "Generated by $SCRIPT_NAME" /etc/resolv.conf 2>/dev/null; then
+        cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null || true
+    fi
+
+    # Create new resolv.conf
+    echo "# Generated by $SCRIPT_NAME" > /etc/resolv.conf
+    for dns in "${DNS_SERVERS[@]}"; do
+        echo "nameserver $dns" >> /etc/resolv.conf
+    done
+
+    # Make resolv.conf immutable to prevent overwrites
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+    chattr +i /etc/resolv.conf 2>/dev/null || true
+
+    # For systems using resolvconf
+    if command -v resolvconf >/dev/null 2>&1; then
+        echo -e "${YELLOW}System is using resolvconf, updating...${NC}"
+        {
+            echo "# Generated by $SCRIPT_NAME"
+            for dns in "${DNS_SERVERS[@]}"; do
+                echo "nameserver $dns"
+            done
+        } | resolvconf -a "$NETWORK_INTERFACE" 2>>"$LOG_FILE" || true
+    fi
+
+    # For NetworkManager systems
+    if command -v nmcli >/dev/null 2>&1 && systemctl is-active NetworkManager >/dev/null 2>&1; then
+        echo -e "${YELLOW}System is using NetworkManager, updating DNS...${NC}"
+        CONNECTION=$(nmcli -t -f NAME,DEVICE connection show | grep "$NETWORK_INTERFACE" | cut -d: -f1 | head -n1)
+        if [[ -n "$CONNECTION" ]]; then
+            nmcli connection modify "$CONNECTION" ipv4.dns "${DNS_SERVERS[*]}" 2>>"$LOG_FILE" || true
+            nmcli connection up "$CONNECTION" 2>>"$LOG_FILE" || true
+        fi
+    fi
+
+    CURRENT_DNS="${DNS_SERVERS[*]}"
+    echo -e "${GREEN}DNS servers updated successfully: ${BOLD}${DNS_SERVERS[*]}${NC}"
 }
 
 # Load Configuration
@@ -302,22 +318,16 @@ load_config() {
             "net.ipv4.tcp_low_latency=1"
         )
 
-        # Apply default MTU (safe)
+        # Apply default MTU
         ip link set dev "$NETWORK_INTERFACE" mtu "$DEFAULT_MTU" 2>>"$LOG_FILE" || true
         CURRENT_MTU=$DEFAULT_MTU
         configure_mtu_permanent || true
+        
+        # Apply default DNS
         update_dns
+        
         save_config
     fi
-}
-
-# Update DNS Configuration
-update_dns() {
-    echo "# Generated by $SCRIPT_NAME" > /etc/resolv.conf
-    for dns in "${DNS_SERVERS[@]}"; do
-        echo "nameserver $dns" >> /etc/resolv.conf
-    done
-    CURRENT_DNS="${DNS_SERVERS[*]}"
 }
 
 # Backup current sysctl settings
@@ -444,14 +454,14 @@ reset_network() {
             return 1
         fi
 
-        # Reset MTU to default (safe)
+        # Reset MTU to default
         local old_mtu
         old_mtu=$(cat /sys/class/net/"$NETWORK_INTERFACE"/mtu 2>/dev/null || echo "$DEFAULT_MTU")
         CURRENT_MTU=$DEFAULT_MTU
         ip link set dev "$NETWORK_INTERFACE" mtu "$CURRENT_MTU" 2>>"$LOG_FILE" || true
-        configure_mtu_permanent || {
-            echo -e "${YELLOW}Warning: could not persist default MTU, temporary set only.${NC}"
-        }
+        configure_mtu_permanent || true
+        
+        # Reset DNS
         update_dns
 
         echo -e "${GREEN}Network settings restored from backup!${NC}"
@@ -491,25 +501,6 @@ restart_network_services() {
     fi
 }
 
-# Configure VIP Settings
-configure_vip() {
-    echo -e "\n${YELLOW}Configuring VIP Optimization${NC}"
-
-    read -p "Enable VIP Mode? (y/n): " choice
-    if [[ "$choice" =~ ^[Yy] ]]; then
-        VIP_MODE=true
-        read -p "Enter VIP Subnet (e.g., 10.0.0.0/24): " VIP_SUBNET
-        read -p "Enter VIP Gateway (e.g., 10.0.0.1): " VIP_GATEWAY
-        echo -e "${GREEN}VIP Mode enabled with Subnet: $VIP_SUBNET, Gateway: $VIP_GATEWAY${NC}"
-    else
-        VIP_MODE=false
-        VIP_SUBNET=""
-        VIP_GATEWAY=""
-        echo -e "${YELLOW}VIP Mode disabled${NC}"
-    fi
-    save_config
-}
-
 # Configure MTU
 configure_mtu() {
     echo -e "\n${YELLOW}Configuring Network Interface MTU${NC}"
@@ -530,7 +521,6 @@ configure_mtu() {
             return 1
         fi
 
-        # update CURRENT_MTU and try to persist safely
         CURRENT_MTU=$new_mtu
         if configure_mtu_permanent; then
             echo -e "${GREEN}MTU successfully changed to $new_mtu!${NC}"
@@ -593,28 +583,6 @@ EOL
     echo -e "${GREEN}Configuration saved successfully!${NC}"
 }
 
-# Test Network Speed
-test_speed() {
-    echo -e "\n${YELLOW}Running network speed test...${NC}"
-
-    if ! command -v speedtest-cli &> /dev/null; then
-        echo -e "${YELLOW}Installing speedtest-cli...${NC}"
-        if pip install speedtest-cli 2>>"$LOG_FILE" || apt-get install -y speedtest-cli 2>>"$LOG_FILE" || \
-           yum install -y speedtest-cli 2>>"$LOG_FILE" || dnf install -y speedtest-cli 2>>"$LOG_FILE"; then
-            echo -e "${GREEN}speedtest-cli installed successfully!${NC}"
-        else
-            echo -e "${BOLD_RED}Could not install speedtest-cli. Please install it manually.${NC}"
-            return 1
-        fi
-    fi
-
-    echo -e "${CYAN}Testing download and upload speed...${NC}"
-    speedtest-cli --simple >>"$LOG_FILE" 2>&1
-
-    echo -e "\n${CYAN}Testing latency to 1.1.1.1...${NC}"
-    ping -c 5 1.1.1.1 | grep -A1 "statistics" | tee -a "$LOG_FILE"
-}
-
 # Show Current Settings
 show_settings() {
     echo -e "\n${YELLOW}Current Configuration:${NC}"
@@ -657,15 +625,21 @@ uninstall_all() {
     configure_mtu_permanent || true
     echo -e "${GREEN}Reset MTU to default 1500 (if possible)${NC}"
 
-    echo "nameserver 8.8.8.8" > /etc/resolv.conf
-    echo "nameserver 8.8.4.4" >> /etc/resolv.conf
-    echo -e "${GREEN}Reset DNS to Google DNS${NC}"
+    # Restore original DNS
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+    if [[ -f /etc/resolv.conf.bak ]]; then
+        cp /etc/resolv.conf.bak /etc/resolv.conf
+    else
+        echo "nameserver 8.8.8.8" > /etc/resolv.conf
+        echo "nameserver 8.8.4.4" >> /etc/resolv.conf
+    fi
+    echo -e "${GREEN}Reset DNS to default servers${NC}"
 
     echo -e "\n${GREEN}Uninstallation complete!${NC}"
     read -p "Press [Enter] to continue..."
 }
 
-# Main Menu
+# Main Menu (Modified)
 show_menu() {
     while true; do
         show_header
@@ -673,12 +647,9 @@ show_menu() {
         echo -e "${CYAN}1) Apply Full Optimization${NC}"
         echo -e "${CYAN}3) Reset Network Settings${NC}"
         echo -e "${CYAN}4) Install Auto-Reset Cron Job${NC}"
-        echo -e "${PURPLE}6) Configure VIP Settings${NC}"
         echo -e "${PURPLE}7) Configure MTU${NC}"
         echo -e "${PURPLE}8) Configure DNS${NC}"
         echo -e "${GREEN}9) Show Current Settings${NC}"
-        echo -e "${GREEN}10) Test Network Speed${NC}"
-        echo -e "${BLUE}12) Save Configuration${NC}"
         echo -e "${RED}13) Reboot Server${NC}"
         echo -e "${BOLD_RED}14) Uninstall (Remove All Changes)${NC}"
         echo -e "${BOLD_RED}15) Exit${NC}"
@@ -697,9 +668,6 @@ show_menu() {
             4)
                 setup_cron_job
                 ;;
-            6)
-                configure_vip
-                ;;
             7)
                 configure_mtu
                 ;;
@@ -708,12 +676,6 @@ show_menu() {
                 ;;
             9)
                 show_settings
-                ;;
-            10)
-                test_speed
-                ;;
-            12)
-                save_config
                 ;;
             13)
                 echo -e "${YELLOW}Preparing to reboot server...${NC}"
