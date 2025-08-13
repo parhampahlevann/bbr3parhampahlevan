@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Ultimate Xray Optimizer with Media Support
-# Now with Instagram Music & Spotify on All Ports
+# Ultimate Xray Optimizer - Complete Edition
+# Supports Sanaei Panel (Protected Ports: 8880, 443, 23902)
 
 # Colors
 RED='\033[0;31m'
@@ -10,99 +10,164 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# Backup Directory
+# Protected Ports
+PROTECTED_PORTS=(8880 443 23902)
 BACKUP_DIR="/opt/xray_backup_$(date +%Y%m%d)"
 mkdir -p "$BACKUP_DIR"
 
-# Function 1: Install Dependencies
-install_deps() {
-    echo -e "${YELLOW}[1] Installing dependencies...${NC}"
-    apt-get update > /dev/null
-    apt-get install -y \
-        jq net-tools dnsutils \
-        iptables-persistent fail2ban \
-        brotli zlib1g-dev docker.io > /dev/null
-    echo -e "${GREEN}Dependencies installed!${NC}"
+# Detect Xray Installation
+detect_xray() {
+    local paths=(
+        "/usr/local/bin/xray"
+        "/usr/sbin/xray" 
+        "/usr/bin/xray"
+        "$(which xray)"
+    )
+    
+    for path in "${paths[@]}"; do
+        if [ -f "$path" ]; then
+            XRAY_PATH="$path"
+            
+            # Try common config locations
+            local configs=(
+                "/usr/local/etc/xray/config.json"
+                "/etc/xray/config.json"
+                "$(dirname $XRAY_PATH)/../etc/xray/config.json"
+            )
+            
+            for config in "${configs[@]}"; do
+                if [ -f "$config" ]; then
+                    CONFIG_PATH="$config"
+                    echo -e "${GREEN}Xray found at: $XRAY_PATH${NC}"
+                    echo -e "${GREEN}Config found at: $CONFIG_PATH${NC}"
+                    return 0
+                fi
+            done
+        fi
+    done
+    
+    echo -e "${RED}Xray installation not detected!${NC}"
+    return 1
 }
 
-# Function 2: Optimize Network Stack
-optimize_network() {
-    echo -e "${YELLOW}[2] Optimizing network stack...${NC}"
+# Backup Config
+backup_config() {
+    echo -e "${YELLOW}Creating backup...${NC}"
+    cp "$CONFIG_PATH" "$BACKUP_DIR/xray_config_$(date +%s).json"
+    echo -e "${GREEN}Backup created in $BACKUP_DIR${NC}"
+}
+
+# Function 1: Full TCP Optimization (Safe Mode)
+optimize_tcp() {
+    echo -e "${YELLOW}[1] Optimizing TCP Stack (Safe Mode)...${NC}"
+    
+    # Backup
     cp /etc/sysctl.conf "$BACKUP_DIR/sysctl.conf.bak"
     
+    # Apply optimizations (excluding protected ports)
     cat > /etc/sysctl.conf << EOL
-# Optimized Network Settings
+# TCP Optimizations (Protected Ports: ${PROTECTED_PORTS[@]})
 net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
 net.ipv4.tcp_rmem = 4096 87380 16777216
 net.ipv4.tcp_wmem = 4096 87380 16777216
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 30
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_keepalive_intvl = 15
 net.core.default_qdisc = fq
 net.ipv4.tcp_mtu_probing = 1
 fs.file-max = 1000000
+fs.nr_open = 1000000
+vm.swappiness = 10
+vm.vfs_cache_pressure = 50
+net.core.netdev_max_backlog = 50000
+net.core.somaxconn = 32768
+net.ipv4.tcp_max_tw_buckets = 2000000
+
 # Traffic Saving
 net.ipv4.tcp_sack = 0
 net.ipv4.tcp_dsack = 0
 net.ipv4.tcp_fack = 0
 EOL
-    
+
     sysctl -p > /dev/null
-    echo -e "${GREEN}Network optimization complete!${NC}"
+    
+    # Protect specific ports
+    for port in "${PROTECTED_PORTS[@]}"; do
+        echo 0 > /proc/sys/net/ipv4/tcp_slow_start_after_idle_port_$port 2>/dev/null
+    done
+    
+    echo -e "${GREEN}TCP stack optimized (Protected ports excluded)!${NC}"
 }
 
-# Function 3: Enable Traffic Compression
-enable_compression() {
-    echo -e "${YELLOW}[3] Enabling traffic compression...${NC}"
-    
-    if [ -f "/usr/local/etc/xray/config.json" ]; then
-        cp /usr/local/etc/xray/config.json "$BACKUP_DIR/xray_config.json.bak"
-        
-        jq '.inbounds[].streamSettings += {"compression": "auto"}' \
-            /usr/local/etc/xray/config.json > /tmp/xray_compressed.json
-        
-        mv /tmp/xray_compressed.json /usr/local/etc/xray/config.json
-        systemctl restart xray
-        echo -e "${GREEN}Traffic compression enabled!${NC}"
-    else
-        echo -e "${RED}Xray not found! Skipping...${NC}"
+# Function 2: Xray Core Optimization
+optimize_xray_core() {
+    if ! detect_xray; then
+        echo -e "${RED}Skipping Xray optimization...${NC}"
+        return 1
     fi
-}
-
-# Function 4: Optimize WebSocket (WS)
-optimize_websocket() {
-    echo -e "${YELLOW}[4] Optimizing WebSocket connections...${NC}"
     
-    if [ -f "/usr/local/etc/xray/config.json" ]; then
-        jq '(.inbounds[] | select(.streamSettings.network == "ws")).streamSettings += {
-            "wsSettings": {
-                "maxEarlyData": 2048,
-                "acceptProxyProtocol": false,
-                "path": "/graphql",
-                "headers": {
-                    "Host": "$host"
+    backup_config
+    
+    echo -e "${YELLOW}[2] Optimizing Xray Core...${NC}"
+    
+    # Create temp config
+    TEMP_CONFIG="/tmp/xray_optimized_$(date +%s).json"
+    
+    # Process config with jq (protecting specified ports)
+    jq --argjson protected "$(printf '%s\n' "${PROTECTED_PORTS[@]}" | jq -R . | jq -s .)" '
+    .inbounds |= map(
+        if (.port | tonumber) as $port | ($protected | index($port)) == null then
+            .streamSettings += {
+                "sockopt": {
+                    "tcpFastOpen": true,
+                    "tproxy": "off"
+                },
+                "compression": "auto",
+                "tcpSettings": {
+                    "header": {
+                        "type": "none"
+                    },
+                    "acceptProxyProtocol": false
                 }
-            },
-            "sockopt": {
-                "tcpFastOpen": true,
-                "tproxy": "off"
             }
-        }' /usr/local/etc/xray/config.json > /tmp/xray_ws_optimized.json
-        
-        mv /tmp/xray_ws_optimized.json /usr/local/etc/xray/config.json
+        else
+            .
+        end
+    )' "$CONFIG_PATH" > "$TEMP_CONFIG"
+    
+    # Validate config
+    if "$XRAY_PATH" -test -c "$TEMP_CONFIG" 2>/dev/null; then
+        mv "$TEMP_CONFIG" "$CONFIG_PATH"
         systemctl restart xray
-        echo -e "${GREEN}WebSocket optimized!${NC}"
+        echo -e "${GREEN}Xray core optimized!${NC}"
     else
-        echo -e "${RED}Xray not found! Skipping...${NC}"
+        echo -e "${RED}Invalid configuration generated! Keeping original config.${NC}"
+        rm -f "$TEMP_CONFIG"
     fi
 }
 
-# Function 5: Optimize VLESS/TCP
+# Function 3: VLESS/TCP Optimization
 optimize_vless_tcp() {
-    echo -e "${YELLOW}[5] Optimizing VLESS/TCP protocol...${NC}"
+    if ! detect_xray; then
+        echo -e "${RED}Skipping VLESS optimization...${NC}"
+        return 1
+    fi
     
-    if [ -f "/usr/local/etc/xray/config.json" ]; then
-        jq '(.inbounds[] | select(.protocol == "vless" and .streamSettings.network == "tcp")).streamSettings += {
+    echo -e "${YELLOW}[3] Optimizing VLESS/TCP...${NC}"
+    
+    TEMP_CONFIG="/tmp/xray_vless_$(date +%s).json"
+    
+    jq --argjson protected "$(printf '%s\n' "${PROTECTED_PORTS[@]}" | jq -R . | jq -s .)" '
+    (.inbounds[] | select(.protocol == "vless" and .streamSettings.network == "tcp")) |= 
+    if (.port | tonumber) as $port | ($protected | index($port)) == null then
+        .streamSettings += {
             "xtlsSettings": {
                 "minVersion": "1.2",
                 "maxVersion": "1.3",
@@ -113,187 +178,225 @@ optimize_vless_tcp() {
                 "tcpFastOpen": true,
                 "tproxy": "off"
             }
-        }' /usr/local/etc/xray/config.json > /tmp/xray_vless_tcp.json
-        
-        mv /tmp/xray_vless_tcp.json /usr/local/etc/xray/config.json
+        }
+    else
+        .
+    end' "$CONFIG_PATH" > "$TEMP_CONFIG"
+    
+    if "$XRAY_PATH" -test -c "$TEMP_CONFIG" 2>/dev/null; then
+        mv "$TEMP_CONFIG" "$CONFIG_PATH"
         systemctl restart xray
         echo -e "${GREEN}VLESS/TCP optimized!${NC}"
     else
-        echo -e "${RED}Xray not found! Skipping...${NC}"
+        echo -e "${RED}Failed to optimize VLESS!${NC}"
+        rm -f "$TEMP_CONFIG"
     fi
 }
 
-# Function 6: Secure DNS Settings
+# Function 4: WebSocket Optimization
+optimize_websocket() {
+    if ! detect_xray; then
+        echo -e "${RED}Skipping WebSocket optimization...${NC}"
+        return 1
+    fi
+    
+    echo -e "${YELLOW}[4] Optimizing WebSocket...${NC}"
+    
+    TEMP_CONFIG="/tmp/xray_ws_$(date +%s).json"
+    
+    jq --argjson protected "$(printf '%s\n' "${PROTECTED_PORTS[@]}" | jq -R . | jq -s .)" '
+    (.inbounds[] | select(.streamSettings.network == "ws")) |= 
+    if (.port | tonumber) as $port | ($protected | index($port)) == null then
+        .streamSettings += {
+            "wsSettings": {
+                "maxEarlyData": 2048,
+                "acceptProxyProtocol": false,
+                "path": "/$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')",
+                "headers": {
+                    "Host": "$host"
+                }
+            },
+            "sockopt": {
+                "tcpFastOpen": true,
+                "tproxy": "off"
+            }
+        }
+    else
+        .
+    end' "$CONFIG_PATH" > "$TEMP_CONFIG"
+    
+    if "$XRAY_PATH" -test -c "$TEMP_CONFIG" 2>/dev/null; then
+        mv "$TEMP_CONFIG" "$CONFIG_PATH"
+        systemctl restart xray
+        echo -e "${GREEN}WebSocket optimized with random path!${NC}"
+    else
+        echo -e "${RED}Failed to optimize WebSocket!${NC}"
+        rm -f "$TEMP_CONFIG"
+    fi
+}
+
+# Function 5: Install Media Services
+install_media() {
+    echo -e "${YELLOW}[5] Installing Media Services...${NC}"
+    
+    # Find available ports (excluding protected ports)
+    find_available_port() {
+        while true; do
+            local port=$(( (RANDOM % 60000) + 2000 ))
+            if [[ ! " ${PROTECTED_PORTS[@]} " =~ " ${port} " ]] && ! ss -tuln | grep -q ":${port} "; then
+                echo $port
+                return
+            fi
+        done
+    }
+    
+    # Instagram Music
+    INSTA_PORT=$(find_available_port)
+    docker run -d \
+        --name insta-music \
+        -p $INSTA_PORT:$INSTA_PORT \
+        -e "PORT=$INSTA_PORT" \
+        -e "BLOCKED_PORTS=${PROTECTED_PORTS[@]}" \
+        --restart unless-stopped \
+        ghcr.io/instagram-music/proxy:latest
+    
+    # Spotify
+    SPOTIFY_PORT=$(find_available_port)
+    docker run -d \
+        --name spotify \
+        -p $SPOTIFY_PORT:$SPOTIFY_PORT \
+        -e "SPOTIFY_USER=your_username" \
+        -e "SPOTIFY_PASSWORD=your_password" \
+        -e "PORT=$SPOTIFY_PORT" \
+        -e "BLOCKED_PORTS=${PROTECTED_PORTS[@]}" \
+        --restart unless-stopped \
+        spotify/spotify-connect
+    
+    echo -e "${GREEN}Media services installed on random safe ports!${NC}"
+    echo -e "Instagram Music: ${BLUE}http://your-server-ip:$INSTA_PORT${NC}"
+    echo -e "Spotify: ${BLUE}http://your-server-ip:$SPOTIFY_PORT${NC}"
+}
+
+# Function 6: Secure DNS
 secure_dns() {
-    echo -e "${YELLOW}[6] Securing DNS settings...${NC}"
+    echo -e "${YELLOW}[6] Securing DNS...${NC}"
+    
+    # Backup
     cp /etc/resolv.conf "$BACKUP_DIR/resolv.conf.bak"
+    
+    # Apply settings (protect Sanaei panel ports)
+    for port in "${PROTECTED_PORTS[@]}"; do
+        iptables -I OUTPUT -p udp --sport $port --dport 53 -j ACCEPT
+        iptables -I OUTPUT -p tcp --sport $port --dport 53 -j ACCEPT
+    done
     
     iptables -A OUTPUT -p udp --dport 53 -j DROP
     iptables -A OUTPUT -p tcp --dport 53 -j DROP
+    
     echo "nameserver 1.1.1.1" > /etc/resolv.conf
     echo "nameserver 1.0.0.1" >> /etc/resolv.conf
     chattr +i /etc/resolv.conf
-    systemctl stop systemd-resolved 2>/dev/null
-    systemctl disable systemd-resolved 2>/dev/null
     
-    echo -e "${GREEN}DNS secured!${NC}"
+    echo -e "${GREEN}DNS secured (Protected ports excluded)!${NC}"
 }
 
-# Function 7: Setup Instagram Music (All Ports)
-setup_instagram_music() {
-    echo -e "${YELLOW}[7] Setting up Instagram Music on all ports...${NC}"
-    
-    # Create Docker network if not exists
-    docker network create xray-net 2>/dev/null
-    
-    # Run Instagram Music proxy
-    docker run -d \
-        --name insta-music \
-        --network xray-net \
-        -p 8080-8090:8080-8090 \
-        -e ENABLE_ALL_PORTS=true \
-        -e MAX_CONNECTIONS=1000 \
-        --restart unless-stopped \
-        ghcr.io/instagram-music/proxy:latest > /dev/null
-    
-    # Allow all ports in firewall
-    for port in {8080..8090}; do
-        iptables -A INPUT -p tcp --dport $port -j ACCEPT
-    done
-    
-    echo -e "${GREEN}Instagram Music ready on ports 8080-8090!${NC}"
-}
-
-# Function 8: Setup Spotify (All Ports)
-setup_spotify() {
-    echo -e "${YELLOW}[8] Setting up Spotify on all ports...${NC}"
-    
-    # Run Spotify Connect with port range
-    docker run -d \
-        --name spotify \
-        --network xray-net \
-        -p 4000-4010:4000-4010 \
-        -e SPOTIFY_USER=your_username \
-        -e SPOTIFY_PASSWORD=your_password \
-        -e EXTRA_PORTS="4001-4010" \
-        --restart unless-stopped \
-        spotify/spotify-connect > /dev/null
-    
-    # Allow all ports in firewall
-    for port in {4000..4010}; do
-        iptables -A INPUT -p tcp --dport $port -j ACCEPT
-    done
-    
-    echo -e "${GREEN}Spotify ready on ports 4000-4010!${NC}"
-}
-
-# Function 9: Reboot Server
-reboot_server() {
-    echo -e "${YELLOW}[9] Rebooting server...${NC}"
-    read -p "Are you sure? (y/n) " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        echo -e "${GREEN}Rebooting now...${NC}"
-        reboot
-    else
-        echo -e "${RED}Reboot cancelled.${NC}"
-    fi
-}
-
-# Function 10: Install Everything
+# Function 7: Install All
 install_all() {
-    echo -e "${YELLOW}[10] Installing ALL optimizations...${NC}"
-    install_deps
-    optimize_network
-    enable_compression
-    optimize_websocket
+    echo -e "${YELLOW}[7] Installing ALL Optimizations...${NC}"
+    optimize_tcp
+    optimize_xray_core
     optimize_vless_tcp
+    optimize_websocket
     secure_dns
-    setup_instagram_music
-    setup_spotify
+    install_media
     echo -e "${GREEN}All optimizations completed!${NC}"
 }
 
-# Function 11: Rollback All Changes
-rollback_changes() {
-    echo -e "${RED}[11] Rolling back all changes...${NC}"
+# Function 8: Rollback
+rollback() {
+    echo -e "${RED}[8] Rolling Back ALL Changes...${NC}"
     
-    # Restore system configs
+    # Restore sysctl
     [ -f "$BACKUP_DIR/sysctl.conf.bak" ] && \
         cp "$BACKUP_DIR/sysctl.conf.bak" /etc/sysctl.conf && \
         sysctl -p > /dev/null
     
-    [ -f "$BACKUP_DIR/xray_config.json.bak" ] && \
-        cp "$BACKUP_DIR/xray_config.json.bak" /usr/local/etc/xray/config.json && \
-        systemctl restart xray
+    # Restore Xray config
+    if detect_xray; then
+        local latest_backup=$(ls -t "$BACKUP_DIR"/xray_config_*.json 2>/dev/null | head -1)
+        [ -f "$latest_backup" ] && \
+            cp "$latest_backup" "$CONFIG_PATH" && \
+            systemctl restart xray
+    fi
     
+    # Restore DNS
     [ -f "$BACKUP_DIR/resolv.conf.bak" ] && \
         chattr -i /etc/resolv.conf 2>/dev/null && \
-        cp "$BACKUP_DIR/resolv.conf.bak" /etc/resolv.conf && \
-        systemctl enable systemd-resolved 2>/dev/null && \
-        systemctl start systemd-resolved 2>/dev/null
+        cp "$BACKUP_DIR/resolv.conf.bak" /etc/resolv.conf
     
-    # Remove media services
+    # Remove media
     docker rm -f spotify insta-music 2>/dev/null
-    docker network rm xray-net 2>/dev/null
     
     # Clean iptables
     iptables -D OUTPUT -p udp --dport 53 -j DROP 2>/dev/null
     iptables -D OUTPUT -p tcp --dport 53 -j DROP 2>/dev/null
-    for port in {4000..4010} {8080..8090}; do
-        iptables -D INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null
-    done
     
     echo -e "${GREEN}Rollback completed!${NC}"
 }
 
-# Show Menu
+# Function 9: Reboot
+reboot_server() {
+    echo -e "${YELLOW}[9] Rebooting Server...${NC}"
+    read -p "Are you sure? (y/n) " -n 1 -r
+    echo
+    [[ $REPLY =~ ^[Yy]$ ]] && reboot
+}
+
+# Menu
 show_menu() {
     clear
     echo -e "${BLUE}"
     cat << "EOF"
-  ___ _   _ _____ _____ _____ _____ _____ _____ 
- / _ \ | | |_   _|_   _| ____|_   _| ____|_   _|
-| | | | | | | |   | | |  _|   | | |  _|   | |  
-| |_| | |_| | |   | | | |___  | | | |___  | |  
- \___/ \___/  |_|  |_| |_____| |_| |_____| |_|  
+   ___  _____ _   _ _____ _____ _   _ 
+  / _ \|_   _| \ | |  ___|  _  | \ | |
+ / /_\ \ | | |  \| | |__ | | | |  \| |
+ |  _  | | | | . ` |  __|| | | | . ` |
+ | | | |_| |_| |\  | |___\ \_/ / |\  |
+ \_| |_/\___/\_| \_\____/ \___/\_| \_/
 EOF
     echo -e "${NC}"
     echo "----------------------------------------"
-    echo -e "${YELLOW}Select an option:${NC}"
-    echo "1) Install dependencies"
-    echo "2) Optimize network stack"
-    echo "3) Enable traffic compression"
-    echo "4) Optimize WebSocket (WS)"
-    echo "5) Optimize VLESS/TCP"
-    echo "6) Secure DNS settings"
-    echo -e "${GREEN}7) Setup Instagram Music (All Ports)"
-    echo -e "${GREEN}8) Setup Spotify (All Ports)${NC}"
-    echo "9) Reboot server"
-    echo "10) Install ALL optimizations"
-    echo -e "${RED}11) Rollback all changes${NC}"
-    echo -e "${RED}q) Quit${NC}"
+    echo -e "${YELLOW}Protected Ports: 8880, 443, 23902${NC}"
+    echo "----------------------------------------"
+    echo "1) Optimize TCP Stack"
+    echo "2) Optimize Xray Core"
+    echo "3) Optimize VLESS/TCP"
+    echo "4) Optimize WebSocket"
+    echo "5) Install Media Services"
+    echo "6) Secure DNS"
+    echo "7) Install ALL"
+    echo -e "${RED}8) Rollback ALL${NC}"
+    echo "9) Reboot Server"
+    echo "q) Quit"
     echo "----------------------------------------"
 }
 
-# Main Execution
+# Main
 while true; do
     show_menu
-    read -p "Enter your choice (1-11/q): " choice
+    read -p "Select option (1-9/q): " choice
     
     case $choice in
-        1) install_deps ;;
-        2) optimize_network ;;
-        3) enable_compression ;;
+        1) optimize_tcp ;;
+        2) optimize_xray_core ;;
+        3) optimize_vless_tcp ;;
         4) optimize_websocket ;;
-        5) optimize_vless_tcp ;;
+        5) install_media ;;
         6) secure_dns ;;
-        7) setup_instagram_music ;;
-        8) setup_spotify ;;
+        7) install_all ;;
+        8) rollback ;;
         9) reboot_server ;;
-        10) install_all ;;
-        11) rollback_changes ;;
-        q|Q) echo -e "${GREEN}Exiting...${NC}"; exit 0 ;;
+        q|Q) exit 0 ;;
         *) echo -e "${RED}Invalid option!${NC}"; sleep 1 ;;
     esac
     
