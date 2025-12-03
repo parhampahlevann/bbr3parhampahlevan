@@ -1,404 +1,582 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# install.sh - Advanced WARP (wgcf) Manager with Cloudflare Multi-Endpoint & Multi-IP SOCKS5
+# Combines ideas from:
+#   - ParsaKSH/Warp-Multi-IP (multi WARP configs + Dante SOCKS5)
+#   - yonggekkk/warp-yg CFwarp.sh (menu-based WARP manager)
+# Focus:
+#   - Ubuntu VPS
+#   - Use Cloudflare WARP IPv4 as main server IP (for Xray core, etc.)
+#   - Optionally create multiple WARP accounts with separate SOCKS5 proxies.
 
-# Ultimate Xray Optimizer - Complete Edition
-# Supports Sanaei Panel (Protected Ports: 8880, 443, 23902)
+WGCF_BIN="/usr/local/bin/wgcf"
+WGCF_DIR="/root/.wgcf"
+WGCF_PROFILE="${WGCF_DIR}/wgcf-profile.conf"
+WGCF_CONF="/etc/wireguard/wgcf.conf"
+WG_IF="wgcf"
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+MULTI_DIR="/root/warp-multi"
+DANTED_DIR="/etc/danted-multi"
+SYSTEMD_DIR="/etc/systemd/system"
 
-# Protected Ports
-PROTECTED_PORTS=(8880 443 23902)
-BACKUP_DIR="/opt/xray_backup_$(date +%Y%m%d)"
-mkdir -p "$BACKUP_DIR"
+# ---------------- Colors ----------------
+red(){ echo -e "\033[31m\033[01m$1\033[0m"; }
+green(){ echo -e "\033[32m\033[01m$1\033[0m"; }
+yellow(){ echo -e "\033[33m\033[01m$1\033[0m"; }
+blue(){ echo -e "\033[36m\033[01m$1\033[0m"; }
+white(){ echo -e "\033[37m\033[01m$1\033[0m"; }
 
-# Detect Xray Installation
-detect_xray() {
-    local paths=(
-        "/usr/local/bin/xray"
-        "/usr/sbin/xray" 
-        "/usr/bin/xray"
-        "$(which xray)"
-    )
-    
-    for path in "${paths[@]}"; do
-        if [ -f "$path" ]; then
-            XRAY_PATH="$path"
-            
-            # Try common config locations
-            local configs=(
-                "/usr/local/etc/xray/config.json"
-                "/etc/xray/config.json"
-                "$(dirname $XRAY_PATH)/../etc/xray/config.json"
-            )
-            
-            for config in "${configs[@]}"; do
-                if [ -f "$config" ]; then
-                    CONFIG_PATH="$config"
-                    echo -e "${GREEN}Xray found at: $XRAY_PATH${NC}"
-                    echo -e "${GREEN}Config found at: $CONFIG_PATH${NC}"
-                    return 0
-                fi
-            done
-        fi
-    done
-    
-    echo -e "${RED}Xray installation not detected!${NC}"
-    return 1
+pause(){ read -rp "Press Enter to continue..." _; }
+
+# ---------------- Basic checks ----------------
+check_root() {
+  if [[ $EUID -ne 0 ]]; then
+    red "This script must be run as root."
+    exit 1
+  fi
 }
 
-# Backup Config
+check_os() {
+  if ! grep -qi "ubuntu" /etc/os-release; then
+    yellow "This script is mainly tested on Ubuntu. Continuing at your own risk."
+  fi
+}
+
+# ---------------- Dependencies ----------------
+install_deps_base() {
+  blue "Updating package list and installing base dependencies (curl, wget, jq)..."
+  apt-get update -y >/dev/null 2>&1
+  apt-get install -y curl wget jq >/dev/null 2>&1
+}
+
+install_deps_wgcf() {
+  blue "Installing WireGuard and resolvconf..."
+  apt-get install -y wireguard wireguard-tools resolvconf >/dev/null 2>&1
+}
+
+install_deps_dante() {
+  blue "Installing Dante SOCKS server for multi-IP proxies..."
+  apt-get install -y dante-server >/dev/null 2>&1
+}
+
+# ---------------- wgcf install & base config ----------------
+install_wgcf() {
+  if command -v wgcf >/dev/null 2>&1; then
+    green "wgcf is already installed."
+    return
+  fi
+
+  blue "Downloading wgcf (amd64) from GitHub releases..."
+  wget -O "$WGCF_BIN" "https://github.com/ViRb3/wgcf/releases/latest/download/wgcf_amd64" >/dev/null 2>&1
+  if [[ $? -ne 0 ]]; then
+    red "Failed to download wgcf binary."
+    exit 1
+  fi
+  chmod +x "$WGCF_BIN"
+  green "wgcf installed at $WGCF_BIN."
+}
+
+generate_wgcf_config() {
+  if [[ -f "$WGCF_CONF" ]]; then
+    yellow "Existing WireGuard config found at $WGCF_CONF."
+    yellow "Skipping wgcf registration and generation."
+    return
+  fi
+
+  blue "Registering a new WARP account with wgcf..."
+  mkdir -p "$WGCF_DIR"
+  cd "$WGCF_DIR" || exit 1
+
+  yes | wgcf register >/dev/null 2>&1
+  if [[ $? -ne 0 ]]; then
+    red "wgcf registration failed."
+    exit 1
+  fi
+  green "wgcf registration successful."
+
+  blue "Generating WireGuard profile with wgcf..."
+  wgcf generate >/dev/null 2>&1
+  if [[ $? -ne 0 ]]; then
+    red "wgcf generate failed."
+    exit 1
+  fi
+
+  if [[ ! -f "$WGCF_PROFILE" ]]; then
+    if [[ -f "${WGCF_DIR}/wgcf-profile.conf" ]]; then
+      WGCF_PROFILE="${WGCF_DIR}/wgcf-profile.conf"
+    else
+      red "Cannot find wgcf-profile.conf after generation."
+      exit 1
+    fi
+  fi
+
+  mkdir -p /etc/wireguard
+  cp "$WGCF_PROFILE" "$WGCF_CONF"
+  chmod 600 "$WGCF_CONF"
+  green "Base WARP WireGuard config created at $WGCF_CONF."
+}
+
+# ---------------- Cloudflare endpoint list ----------------
+CF_IPS=(
+  "1) Europe - Frankfurt   | 162.159.192.1:2408"
+  "2) Europe - Amsterdam   | 188.114.97.3:2408"
+  "3) Asia   - Singapore   | 162.159.195.1:2408"
+  "4) Asia   - Japan       | 172.64.146.3:2408"
+  "5) US     - New York    | 104.16.248.249:2408"
+  "6) US     - Dallas      | 172.67.222.34:2408"
+  "7) Custom Endpoint      | Enter IP:PORT manually"
+)
+
+choose_cf_ip() {
+  echo
+  blue "Cloudflare WARP Endpoint Selector"
+  echo "-------------------------------------------"
+  for i in "${CF_IPS[@]}"; do
+    echo "$i"
+  done
+  echo "-------------------------------------------"
+  read -rp "Choose an option (1-7): " choice
+
+  case "$choice" in
+    1) CF_ENDPOINT="162.159.192.1:2408" ;;
+    2) CF_ENDPOINT="188.114.97.3:2408" ;;
+    3) CF_ENDPOINT="162.159.195.1:2408" ;;
+    4) CF_ENDPOINT="172.64.146.3:2408" ;;
+    5) CF_ENDPOINT="104.16.248.249:2408" ;;
+    6) CF_ENDPOINT="172.67.222.34:2408" ;;
+    7)
+      read -rp "Enter custom endpoint as IP:PORT (e.g. 162.159.192.1:2408): " custom_ep
+      if [[ -z "$custom_ep" ]]; then
+        red "Empty value is not allowed."
+        return 1
+      fi
+      CF_ENDPOINT="$custom_ep"
+      ;;
+    *)
+      red "Invalid choice."
+      return 1
+      ;;
+  esac
+
+  green "Selected Endpoint: $CF_ENDPOINT"
+  return 0
+}
+
 backup_config() {
-    echo -e "${YELLOW}Creating backup...${NC}"
-    cp "$CONFIG_PATH" "$BACKUP_DIR/xray_config_$(date +%s).json"
-    echo -e "${GREEN}Backup created in $BACKUP_DIR${NC}"
+  if [[ -f "$WGCF_CONF" ]]; then
+    TS=$(date +%Y%m%d-%H%M%S)
+    cp "$WGCF_CONF" "${WGCF_CONF}.bak-${TS}"
+    yellow "Backup created: ${WGCF_CONF}.bak-${TS}"
+  fi
 }
 
-# Function 1: Full TCP Optimization (Safe Mode)
-optimize_tcp() {
-    echo -e "${YELLOW}[1] Optimizing TCP Stack (Safe Mode)...${NC}"
-    
-    # Backup
-    cp /etc/sysctl.conf "$BACKUP_DIR/sysctl.conf.bak"
-    
-    # Apply optimizations (excluding protected ports)
-    cat > /etc/sysctl.conf << EOL
-# TCP Optimizations (Protected Ports: ${PROTECTED_PORTS[@]})
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 87380 16777216
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_max_syn_backlog = 8192
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 30
-net.ipv4.tcp_keepalive_time = 300
-net.ipv4.tcp_keepalive_probes = 5
-net.ipv4.tcp_keepalive_intvl = 15
-net.core.default_qdisc = fq
-net.ipv4.tcp_mtu_probing = 1
-fs.file-max = 1000000
-fs.nr_open = 1000000
-vm.swappiness = 10
-vm.vfs_cache_pressure = 50
-net.core.netdev_max_backlog = 50000
-net.core.somaxconn = 32768
-net.ipv4.tcp_max_tw_buckets = 2000000
+set_endpoint_and_routes_main() {
+  if [[ ! -f "$WGCF_CONF" ]]; then
+    red "WireGuard config $WGCF_CONF does not exist."
+    return 1
+  fi
 
-# Traffic Saving
-net.ipv4.tcp_sack = 0
-net.ipv4.tcp_dsack = 0
-net.ipv4.tcp_fack = 0
-EOL
+  # Set Endpoint
+  if grep -q "^Endpoint *= *" "$WGCF_CONF"; then
+    sed -i "s/^Endpoint *= *.*/Endpoint = ${CF_ENDPOINT}/" "$WGCF_CONF"
+  else
+    sed -i "/^\[Peer\]/a Endpoint = ${CF_ENDPOINT}" "$WGCF_CONF"
+  fi
 
-    sysctl -p > /dev/null
-    
-    # Protect specific ports
-    for port in "${PROTECTED_PORTS[@]}"; do
-        echo 0 > /proc/sys/net/ipv4/tcp_slow_start_after_idle_port_$port 2>/dev/null
+  # Force all IPv4 + IPv6 through WARP
+  if grep -q "^AllowedIPs *= *" "$WGCF_CONF"; then
+    sed -i "s/^AllowedIPs *= *.*/AllowedIPs = 0.0.0.0\/0, ::\/0/" "$WGCF_CONF"
+  else
+    sed -i "/^\[Peer\]/a AllowedIPs = 0.0.0.0\/0, ::\/0" "$WGCF_CONF"
+  fi
+
+  green "Endpoint and AllowedIPs updated in $WGCF_CONF."
+}
+
+# ---------------- IP & status helpers ----------------
+detect_ips() {
+  IPV4_NOW=$(curl -4s --max-time 5 icanhazip.com 2>/dev/null)
+  IPV6_NOW=$(curl -6s --max-time 5 icanhazip.com 2>/dev/null)
+}
+
+show_current_status() {
+  echo "-------------------------------------------"
+  blue "Current public IP addresses:"
+  detect_ips
+  echo "IPv4: ${IPV4_NOW:-N/A}"
+  echo "IPv6: ${IPV6_NOW:-N/A}"
+  echo "-------------------------------------------"
+  if command -v wg >/dev/null 2>&1; then
+    if wg show "$WG_IF" >/dev/null 2>&1; then
+      green "WireGuard interface $WG_IF status:"
+      wg show "$WG_IF"
+    else
+      yellow "WireGuard interface $WG_IF is not up."
+    fi
+  else
+    yellow "wg command not found."
+  fi
+
+  echo "-------------------------------------------"
+  blue "Cloudflare trace (if available):"
+  curl -4s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | tail -n 10 || echo "trace failed"
+  echo "-------------------------------------------"
+}
+
+enable_ip_forward() {
+  sed -i 's/^#*net.ipv4.ip_forward *= *.*/net.ipv4.ip_forward = 1/' /etc/sysctl.conf
+  sysctl -p >/dev/null 2>&1
+  green "IPv4 forwarding enabled."
+}
+
+restart_wg_main() {
+  if [[ ! -f "$WGCF_CONF" ]]; then
+    red "WireGuard config $WGCF_CONF not found. Cannot start wg-quick."
+    return 1
+  fi
+
+  systemctl stop "wg-quick@${WG_IF}" >/dev/null 2>&1
+  systemctl enable "wg-quick@${WG_IF}" >/dev/null 2>&1
+  systemctl start "wg-quick@${WG_IF}"
+
+  if systemctl is-active --quiet "wg-quick@${WG_IF}"; then
+    green "Interface ${WG_IF} is up via wg-quick."
+  else
+    red "Failed to start wg-quick@${WG_IF}. Check logs:"
+    journalctl -u "wg-quick@${WG_IF}" --no-pager | tail -n 30
+    return 1
+  fi
+}
+
+test_warp_route_main() {
+  echo
+  blue "Testing IPv4 after WARP activation..."
+  sleep 3
+  NEW_IPv4=$(curl -4s --max-time 8 icanhazip.com 2>/dev/null)
+  echo "New public IPv4: ${NEW_IPv4:-N/A}"
+
+  WARP_STATUS_V4=$(curl -4s --max-time 8 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep '^warp=' | cut -d= -f2)
+  echo "WARP status (IPv4): ${WARP_STATUS_V4:-unknown}"
+
+  if [[ "$WARP_STATUS_V4" =~ ^on|plus$ ]]; then
+    green "IPv4 traffic is going through Cloudflare WARP (good for Xray outbound)."
+  else
+    yellow "It seems WARP is not fully active for IPv4. Please check configuration."
+  fi
+}
+
+enable_warp_main() {
+  enable_ip_forward
+  restart_wg_main
+  test_warp_route_main
+}
+
+disable_warp_main() {
+  blue "Stopping wg-quick@${WG_IF}..."
+  systemctl stop "wg-quick@${WG_IF}" >/dev/null 2>&1
+  systemctl disable "wg-quick@${WG_IF}" >/dev/null 2>&1
+  green "WARP (wg-quick@${WG_IF}) has been stopped and disabled."
+}
+
+uninstall_warp_main() {
+  disable_warp_main
+  blue "Removing main WARP configuration and wgcf files..."
+  rm -f "$WGCF_CONF"
+  rm -rf "$WGCF_DIR"
+  if [[ -f "$WGCF_BIN" ]]; then
+    rm -f "$WGCF_BIN"
+  fi
+  green "Main WARP and wgcf have been removed from this system."
+}
+
+# ---------------- Multi-IP (like Warp-Multi-IP) ----------------
+multi_cleanup_all() {
+  blue "Stopping and removing multi-IP WARP and Dante services..."
+  for i in $(seq 1 8); do
+    systemctl stop "wg-quick@wgcf${i}" 2>/dev/null
+    systemctl disable "wg-quick@wgcf${i}" 2>/dev/null
+    rm -f "/etc/wireguard/wgcf${i}.conf"
+  done
+
+  if [[ -d "$DANTED_DIR" ]]; then
+    for svc in "$SYSTEMD_DIR"/danted-warp*.service; do
+      [[ -e "$svc" ]] || continue
+      name=$(basename "$svc")
+      systemctl stop "$name" 2>/dev/null
+      systemctl disable "$name" 2>/dev/null
+      rm -f "$svc"
     done
-    
-    echo -e "${GREEN}TCP stack optimized (Protected ports excluded)!${NC}"
+    rm -rf "$DANTED_DIR"
+  fi
+
+  systemctl daemon-reload
+  rm -rf "$MULTI_DIR"
+  green "All multi-IP WARP configs and Dante services removed."
 }
 
-# Function 2: Xray Core Optimization
-optimize_xray_core() {
-    if ! detect_xray; then
-        echo -e "${RED}Skipping Xray optimization...${NC}"
-        return 1
+multi_generate() {
+  install_deps_wgcf
+  install_deps_dante
+  install_wgcf
+
+  mkdir -p "$MULTI_DIR"
+  mkdir -p /etc/wireguard
+  mkdir -p "$DANTED_DIR"
+
+  blue "Generating multiple WARP accounts and WireGuard configs (like Warp-Multi-IP)..."
+  # Number of interfaces / proxies
+  local COUNT=5
+  local BASE_IP="172.16.0"
+
+  for i in $(seq 1 "$COUNT"); do
+    local conf_path="/etc/wireguard/wgcf${i}.conf"
+    local work_dir="${MULTI_DIR}/warp${i}"
+    local table_id=$((51820 + i))
+    local ip_addr="${BASE_IP}.$((i+1))"
+
+    if [[ -f "$conf_path" ]]; then
+      yellow "Config wgcf${i}.conf already exists, skipping generation."
+      continue
     fi
-    
-    backup_config
-    
-    echo -e "${YELLOW}[2] Optimizing Xray Core...${NC}"
-    
-    # Create temp config
-    TEMP_CONFIG="/tmp/xray_optimized_$(date +%s).json"
-    
-    # Process config with jq (protecting specified ports)
-    jq --argjson protected "$(printf '%s\n' "${PROTECTED_PORTS[@]}" | jq -R . | jq -s .)" '
-    .inbounds |= map(
-        if (.port | tonumber) as $port | ($protected | index($port)) == null then
-            .streamSettings += {
-                "sockopt": {
-                    "tcpFastOpen": true,
-                    "tproxy": "off"
-                },
-                "compression": "auto",
-                "tcpSettings": {
-                    "header": {
-                        "type": "none"
-                    },
-                    "acceptProxyProtocol": false
-                }
-            }
-        else
-            .
-        end
-    )' "$CONFIG_PATH" > "$TEMP_CONFIG"
-    
-    # Validate config
-    if "$XRAY_PATH" -test -c "$TEMP_CONFIG" 2>/dev/null; then
-        mv "$TEMP_CONFIG" "$CONFIG_PATH"
-        systemctl restart xray
-        echo -e "${GREEN}Xray core optimized!${NC}"
-    else
-        echo -e "${RED}Invalid configuration generated! Keeping original config.${NC}"
-        rm -f "$TEMP_CONFIG"
+
+    mkdir -p "$work_dir"
+    cd "$work_dir" || exit 1
+
+    rm -f wgcf-account.toml
+    blue "Registering WARP account #${i}..."
+    yes | wgcf register >/dev/null 2>&1
+    if [[ $? -ne 0 ]]; then
+      red "wgcf register failed for account #${i}, skipping."
+      continue
     fi
-}
 
-# Function 3: VLESS/TCP Optimization
-optimize_vless_tcp() {
-    if ! detect_xray; then
-        echo -e "${RED}Skipping VLESS optimization...${NC}"
-        return 1
+    wgcf generate >/dev/null 2>&1
+    if [[ ! -f "wgcf-profile.conf" ]]; then
+      red "wgcf-profile.conf not found for account #${i}, skipping."
+      continue
     fi
-    
-    echo -e "${YELLOW}[3] Optimizing VLESS/TCP...${NC}"
-    
-    TEMP_CONFIG="/tmp/xray_vless_$(date +%s).json"
-    
-    jq --argjson protected "$(printf '%s\n' "${PROTECTED_PORTS[@]}" | jq -R . | jq -s .)" '
-    (.inbounds[] | select(.protocol == "vless" and .streamSettings.network == "tcp")) |= 
-    if (.port | tonumber) as $port | ($protected | index($port)) == null then
-        .streamSettings += {
-            "xtlsSettings": {
-                "minVersion": "1.2",
-                "maxVersion": "1.3",
-                "cipherSuites": "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-                "alpn": ["h2", "http/1.1"]
-            },
-            "sockopt": {
-                "tcpFastOpen": true,
-                "tproxy": "off"
-            }
-        }
-    else
-        .
-    end' "$CONFIG_PATH" > "$TEMP_CONFIG"
-    
-    if "$XRAY_PATH" -test -c "$TEMP_CONFIG" 2>/dev/null; then
-        mv "$TEMP_CONFIG" "$CONFIG_PATH"
-        systemctl restart xray
-        echo -e "${GREEN}VLESS/TCP optimized!${NC}"
-    else
-        echo -e "${RED}Failed to optimize VLESS!${NC}"
-        rm -f "$TEMP_CONFIG"
+
+    cp wgcf-profile.conf "$conf_path"
+    chmod 600 "$conf_path"
+
+    # Set private internal IP and policy routing table
+    sed -i "s|^Address *=.*|Address = ${ip_addr}/32|" "$conf_path"
+
+    # Add policy routing rules
+    if ! grep -q "^Table *= *" "$conf_path"; then
+      sed -i "/^\[Interface\]/a Table = ${table_id}\\nPostUp = ip rule add from ${ip_addr}/32 table ${table_id}\\nPostDown = ip rule del from ${ip_addr}/32 table ${table_id}" "$conf_path"
     fi
+
+    green "Generated wgcf${i}.conf with internal IP ${ip_addr} and table ${table_id}."
+  done
+
+  # Reload WireGuard kernel module
+  modprobe -r wireguard 2>/dev/null || true
+  modprobe wireguard 2>/dev/null || true
+
+  blue "Enabling wg-quick@wgcfN interfaces..."
+  for i in $(seq 1 "$COUNT"); do
+    systemctl enable "wg-quick@wgcf${i}" >/dev/null 2>&1
+    systemctl restart "wg-quick@wgcf${i}" >/dev/null 2>&1
+  done
+
+  # Create Dante configs
+  blue "Setting up Dante SOCKS5 proxies..."
+  for i in $(seq 1 "$COUNT"); do
+    local port=$((1080 + i))
+    local ip="${BASE_IP}.$((i+1))"
+    local conf_file="${DANTED_DIR}/danted-warp${i}.conf"
+    cat >"$conf_file" <<EOF
+logoutput: stderr
+internal: 127.0.0.1 port = ${port}
+external: ${ip}
+user.privileged: root
+user.unprivileged: nobody
+clientmethod: none
+socksmethod: none
+
+client pass {
+  from: 0.0.0.0/0 to: 0.0.0.0/0
 }
 
-# Function 4: WebSocket Optimization
-optimize_websocket() {
-    if ! detect_xray; then
-        echo -e "${RED}Skipping WebSocket optimization...${NC}"
-        return 1
-    fi
-    
-    echo -e "${YELLOW}[4] Optimizing WebSocket...${NC}"
-    
-    TEMP_CONFIG="/tmp/xray_ws_$(date +%s).json"
-    
-    jq --argjson protected "$(printf '%s\n' "${PROTECTED_PORTS[@]}" | jq -R . | jq -s .)" '
-    (.inbounds[] | select(.streamSettings.network == "ws")) |= 
-    if (.port | tonumber) as $port | ($protected | index($port)) == null then
-        .streamSettings += {
-            "wsSettings": {
-                "maxEarlyData": 2048,
-                "acceptProxyProtocol": false,
-                "path": "/$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')",
-                "headers": {
-                    "Host": "$host"
-                }
-            },
-            "sockopt": {
-                "tcpFastOpen": true,
-                "tproxy": "off"
-            }
-        }
-    else
-        .
-    end' "$CONFIG_PATH" > "$TEMP_CONFIG"
-    
-    if "$XRAY_PATH" -test -c "$TEMP_CONFIG" 2>/dev/null; then
-        mv "$TEMP_CONFIG" "$CONFIG_PATH"
-        systemctl restart xray
-        echo -e "${GREEN}WebSocket optimized with random path!${NC}"
-    else
-        echo -e "${RED}Failed to optimize WebSocket!${NC}"
-        rm -f "$TEMP_CONFIG"
-    fi
+socks pass {
+  from: 0.0.0.0/0 to: 0.0.0.0/0
 }
-
-# Function 5: Install Media Services
-install_media() {
-    echo -e "${YELLOW}[5] Installing Media Services...${NC}"
-    
-    # Find available ports (excluding protected ports)
-    find_available_port() {
-        while true; do
-            local port=$(( (RANDOM % 60000) + 2000 ))
-            if [[ ! " ${PROTECTED_PORTS[@]} " =~ " ${port} " ]] && ! ss -tuln | grep -q ":${port} "; then
-                echo $port
-                return
-            fi
-        done
-    }
-    
-    # Instagram Music
-    INSTA_PORT=$(find_available_port)
-    docker run -d \
-        --name insta-music \
-        -p $INSTA_PORT:$INSTA_PORT \
-        -e "PORT=$INSTA_PORT" \
-        -e "BLOCKED_PORTS=${PROTECTED_PORTS[@]}" \
-        --restart unless-stopped \
-        ghcr.io/instagram-music/proxy:latest
-    
-    # Spotify
-    SPOTIFY_PORT=$(find_available_port)
-    docker run -d \
-        --name spotify \
-        -p $SPOTIFY_PORT:$SPOTIFY_PORT \
-        -e "SPOTIFY_USER=your_username" \
-        -e "SPOTIFY_PASSWORD=your_password" \
-        -e "PORT=$SPOTIFY_PORT" \
-        -e "BLOCKED_PORTS=${PROTECTED_PORTS[@]}" \
-        --restart unless-stopped \
-        spotify/spotify-connect
-    
-    echo -e "${GREEN}Media services installed on random safe ports!${NC}"
-    echo -e "Instagram Music: ${BLUE}http://your-server-ip:$INSTA_PORT${NC}"
-    echo -e "Spotify: ${BLUE}http://your-server-ip:$SPOTIFY_PORT${NC}"
-}
-
-# Function 6: Secure DNS
-secure_dns() {
-    echo -e "${YELLOW}[6] Securing DNS...${NC}"
-    
-    # Backup
-    cp /etc/resolv.conf "$BACKUP_DIR/resolv.conf.bak"
-    
-    # Apply settings (protect Sanaei panel ports)
-    for port in "${PROTECTED_PORTS[@]}"; do
-        iptables -I OUTPUT -p udp --sport $port --dport 53 -j ACCEPT
-        iptables -I OUTPUT -p tcp --sport $port --dport 53 -j ACCEPT
-    done
-    
-    iptables -A OUTPUT -p udp --dport 53 -j DROP
-    iptables -A OUTPUT -p tcp --dport 53 -j DROP
-    
-    echo "nameserver 1.1.1.1" > /etc/resolv.conf
-    echo "nameserver 1.0.0.1" >> /etc/resolv.conf
-    chattr +i /etc/resolv.conf
-    
-    echo -e "${GREEN}DNS secured (Protected ports excluded)!${NC}"
-}
-
-# Function 7: Install All
-install_all() {
-    echo -e "${YELLOW}[7] Installing ALL Optimizations...${NC}"
-    optimize_tcp
-    optimize_xray_core
-    optimize_vless_tcp
-    optimize_websocket
-    secure_dns
-    install_media
-    echo -e "${GREEN}All optimizations completed!${NC}"
-}
-
-# Function 8: Rollback
-rollback() {
-    echo -e "${RED}[8] Rolling Back ALL Changes...${NC}"
-    
-    # Restore sysctl
-    [ -f "$BACKUP_DIR/sysctl.conf.bak" ] && \
-        cp "$BACKUP_DIR/sysctl.conf.bak" /etc/sysctl.conf && \
-        sysctl -p > /dev/null
-    
-    # Restore Xray config
-    if detect_xray; then
-        local latest_backup=$(ls -t "$BACKUP_DIR"/xray_config_*.json 2>/dev/null | head -1)
-        [ -f "$latest_backup" ] && \
-            cp "$latest_backup" "$CONFIG_PATH" && \
-            systemctl restart xray
-    fi
-    
-    # Restore DNS
-    [ -f "$BACKUP_DIR/resolv.conf.bak" ] && \
-        chattr -i /etc/resolv.conf 2>/dev/null && \
-        cp "$BACKUP_DIR/resolv.conf.bak" /etc/resolv.conf
-    
-    # Remove media
-    docker rm -f spotify insta-music 2>/dev/null
-    
-    # Clean iptables
-    iptables -D OUTPUT -p udp --dport 53 -j DROP 2>/dev/null
-    iptables -D OUTPUT -p tcp --dport 53 -j DROP 2>/dev/null
-    
-    echo -e "${GREEN}Rollback completed!${NC}"
-}
-
-# Function 9: Reboot
-reboot_server() {
-    echo -e "${YELLOW}[9] Rebooting Server...${NC}"
-    read -p "Are you sure? (y/n) " -n 1 -r
-    echo
-    [[ $REPLY =~ ^[Yy]$ ]] && reboot
-}
-
-# Menu
-show_menu() {
-    clear
-    echo -e "${BLUE}"
-    cat << "EOF"
-   ___  _____ _   _ _____ _____ _   _ 
-  / _ \|_   _| \ | |  ___|  _  | \ | |
- / /_\ \ | | |  \| | |__ | | | |  \| |
- |  _  | | | | . ` |  __|| | | | . ` |
- | | | |_| |_| |\  | |___\ \_/ / |\  |
- \_| |_/\___/\_| \_\____/ \___/\_| \_/
 EOF
-    echo -e "${NC}"
-    echo "----------------------------------------"
-    echo -e "${YELLOW}Protected Ports: 8880, 443, 23902${NC}"
-    echo "----------------------------------------"
-    echo "1) Optimize TCP Stack"
-    echo "2) Optimize Xray Core"
-    echo "3) Optimize VLESS/TCP"
-    echo "4) Optimize WebSocket"
-    echo "5) Install Media Services"
-    echo "6) Secure DNS"
-    echo "7) Install ALL"
-    echo -e "${RED}8) Rollback ALL${NC}"
-    echo "9) Reboot Server"
-    echo "q) Quit"
-    echo "----------------------------------------"
+
+    local service_file="${SYSTEMD_DIR}/danted-warp${i}.service"
+    cat >"$service_file" <<EOF
+[Unit]
+Description=Dante SOCKS proxy warp${i}
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/danted -f ${conf_file}
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable "danted-warp${i}" >/dev/null 2>&1
+    systemctl restart "danted-warp${i}" >/dev/null 2>&1
+
+    green "SOCKS5 proxy warp${i}: 127.0.0.1:${port} (external IP via wgcf${i})."
+  done
+
+  blue "Checking public IPs behind each SOCKS5 proxy..."
+  for i in $(seq 1 "$COUNT"); do
+    local port=$((1080 + i))
+    local ip_raw
+    ip_raw=$(curl -s --socks5 "127.0.0.1:${port}" --max-time 12 https://api.ipify.org || echo "error")
+    echo "Proxy #${i} (127.0.0.1:${port}) → ${ip_raw}"
+  done
+
+  echo
+  green "Multi-IP WARP + SOCKS5 setup completed."
+  echo "You can use these SOCKS5 proxies in your tools or clients."
 }
 
-# Main
-while true; do
+multi_list_status() {
+  if [[ ! -d "$DANTED_DIR" ]]; then
+    yellow "No multi-IP Dante configuration directory found at $DANTED_DIR."
+    return
+  fi
+  echo "Existing multi-IP WARP SOCKS5 proxies:"
+  for conf in "$DANTED_DIR"/danted-warp*.conf; do
+    [[ -e "$conf" ]] || continue
+    base=$(basename "$conf")
+    idx=${base//[!0-9]/}
+    port=$((1080 + idx))
+    echo "  warp${idx}: SOCKS5 127.0.0.1:${port}, config=$conf"
+  done
+}
+
+# ---------------- Menu actions ----------------
+action_full_install_main() {
+  install_deps_base
+  install_deps_wgcf
+  install_wgcf
+  generate_wgcf_config
+  choose_cf_ip || { pause; return; }
+  backup_config
+  set_endpoint_and_routes_main
+  enable_warp_main
+  pause
+}
+
+action_change_endpoint_main() {
+  if [[ ! -f "$WGCF_CONF" ]]; then
+    red "Main WARP config not found at $WGCF_CONF. Run full installation first."
+    pause
+    return
+  fi
+  choose_cf_ip || { pause; return; }
+  backup_config
+  set_endpoint_and_routes_main
+  restart_wg_main
+  test_warp_route_main
+  pause
+}
+
+action_show_status_all() {
+  show_current_status
+  echo
+  blue "Multi-IP SOCKS5 status:"
+  multi_list_status
+  pause
+}
+
+action_enable_only_main() {
+  enable_warp_main
+  pause
+}
+
+action_disable_only_main() {
+  disable_warp_main
+  pause
+}
+
+action_uninstall_all() {
+  read -rp "This will uninstall main WARP and all multi-IP configs. Are you sure? (y/N): " ans
+  case "$ans" in
+    y|Y)
+      uninstall_warp_main
+      multi_cleanup_all
+      ;;
+    *)
+      yellow "Uninstall cancelled."
+      ;;
+  esac
+  pause
+}
+
+action_multi_generate() {
+  read -rp "This will create multiple WARP accounts and SOCKS5 proxies. Continue? (y/N): " ans
+  case "$ans" in
+    y|Y)
+      multi_generate
+      ;;
+    *)
+      yellow "Multi-IP generation cancelled."
+      ;;
+  esac
+  pause
+}
+
+action_multi_cleanup() {
+  read -rp "This will remove ALL multi-IP WARP configs and Dante proxies. Continue? (y/N): " ans
+  case "$ans" in
+    y|Y) multi_cleanup_all ;;
+    *) yellow "Cleanup cancelled." ;;
+  esac
+  pause
+}
+
+# ---------------- Main menu ----------------
+show_menu() {
+  clear
+  blue "==============================================="
+  blue "    Advanced WARP Multi Endpoint Manager       "
+  blue " (Ubuntu + wgcf + Cloudflare + Multi-IP mode)  "
+  blue "==============================================="
+  echo
+  white "1) Full install / reinstall main WARP (wgcf + WireGuard + Endpoint + routing)"
+  white "2) Change Cloudflare Endpoint for main WARP"
+  white "3) Show current status (public IP, wg, WARP trace, multi-IP proxies)"
+  white "4) Enable main WARP (set default IPv4 via WARP - good for Xray)"
+  white "5) Disable main WARP"
+  white "6) Generate multiple WARP accounts + SOCKS5 proxies (multi-IP, like Warp-Multi-IP)"
+  white "7) List / check multi-IP SOCKS5 proxies"
+  white "8) Remove all multi-IP WARP configs and proxies"
+  white "9) Uninstall everything (main WARP + multi-IP + wgcf)"
+  white "0) Exit"
+  echo
+  read -rp "Choose an option [0-9]: " menu_choice
+}
+
+main() {
+  check_root
+  check_os
+  install_deps_base
+
+  while true; do
     show_menu
-    read -p "Select option (1-9/q): " choice
-    
-    case $choice in
-        1) optimize_tcp ;;
-        2) optimize_xray_core ;;
-        3) optimize_vless_tcp ;;
-        4) optimize_websocket ;;
-        5) install_media ;;
-        6) secure_dns ;;
-        7) install_all ;;
-        8) rollback ;;
-        9) reboot_server ;;
-        q|Q) exit 0 ;;
-        *) echo -e "${RED}Invalid option!${NC}"; sleep 1 ;;
+    case "$menu_choice" in
+      1) action_full_install_main ;;
+      2) action_change_endpoint_main ;;
+      3) action_show_status_all ;;
+      4) action_enable_only_main ;;
+      5) action_disable_only_main ;;
+      6) action_multi_generate ;;
+      7) multi_list_status; pause ;;
+      8) action_multi_cleanup ;;
+      9) action_uninstall_all ;;
+      0) green "Goodbye!"; exit 0 ;;
+      *) red "Invalid option."; pause ;;
     esac
-    
-    read -p "Press [Enter] to continue..."
-done
+  done
+}
+
+main "$@"
