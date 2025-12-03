@@ -1,34 +1,35 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Cloudflare WARP Menu (Parham Edition)
 # Author: Parham Pahlevan
 #
 # GitHub usage example:
 #   bash <(curl -Ls https://raw.githubusercontent.com/USERNAME/REPO/BRANCH/warp-menu.sh)
 
-# ========== Auto-install on first run ==========
+set -e
+
+# ========== Elevate to root automatically ==========
+if [[ $EUID -ne 0 ]]; then
+  echo "[*] Re-running this script as root using sudo..."
+  exec sudo -E bash "$0" "$@"
+fi
+
+# ========== Auto-install path ==========
 SCRIPT_PATH="/usr/local/bin/warp-menu"
-if [[ "$0" != "$SCRIPT_PATH" ]]; then
-  echo -e "\033[0;33m[!] Installing warp-menu to /usr/local/bin ...\033[0m"
-  cp "$0" "$SCRIPT_PATH" 2>/dev/null || {
-    echo -e "\033[0;31m[!] Could not copy script from \$0. If you're running via curl/process substitution,\033[0m"
-    echo -e "\033[0;31m    please save this script to a file and run it locally once for auto-install.\033[0m"
-    exit 1
-  }
+
+# If this script is not already at /usr/local/bin/warp-menu, install it there
+CURRENT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+if [[ "$CURRENT_PATH" != "$SCRIPT_PATH" ]]; then
+  echo "[*] Installing warp-menu to ${SCRIPT_PATH} ..."
+  cp "$CURRENT_PATH" "$SCRIPT_PATH"
   chmod +x "$SCRIPT_PATH"
-  echo -e "\033[0;32m[✓] Installed! Now run with: sudo warp-menu\033[0m"
-  exit 0
+  echo "[✓] Installed warp-menu to ${SCRIPT_PATH}"
+  echo "[*] You can later run it with: warp-menu"
+  # Do NOT exit here: continue and show menu right now
 fi
 
 # ========== Colors & Version ==========
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
-VERSION="2.0-parham"
-
-# Require root
-if [[ $EUID -ne 0 ]]; then
-  echo -e "${RED}This script must be run as root.${NC}"
-  echo -e "Example: ${YELLOW}sudo warp-menu${NC}"
-  exit 1
-fi
+VERSION="2.1-parham"
 
 # ========== Global scan result file ==========
 SCAN_RESULT_FILE="/tmp/warp_cf_scan_last.csv"
@@ -95,7 +96,7 @@ parham_warp_install() {
     apt update
     apt install -y cloudflare-warp
 
-    parham_warp_connect()
+    parham_warp_connect
 }
 
 parham_warp_connect() {
@@ -114,7 +115,7 @@ parham_warp_disconnect() {
 }
 
 parham_warp_status() {
-    warp-cli status
+    warp-cli status || echo -e "${RED}warp-cli status failed (is it installed?).${NC}"
     echo
     echo -e "${CYAN}External IP via SOCKS5 proxy (if connected):${NC}"
     local ip
@@ -122,7 +123,7 @@ parham_warp_status() {
     if [[ -n "$ip" ]]; then
         echo -e "  ${GREEN}${ip}${NC}"
     else
-        echo -e "  ${RED}Could not retrieve IP (probably not connected).${NC}"
+        echo -e "  ${RED}Could not retrieve IP (probably not connected or proxy not working).${NC}"
     fi
 }
 
@@ -139,11 +140,11 @@ parham_warp_test_proxy() {
 
 parham_warp_remove() {
     echo -e "${RED}Removing WARP...${NC}"
-    apt remove --purge -y cloudflare-warp
+    apt remove --purge -y cloudflare-warp || true
     rm -f /etc/apt/sources.list.d/cloudflare-client.list
     rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-    apt autoremove -y
-    echo -e "${GREEN}WARP removed.${NC}"
+    apt autoremove -y || true
+    echo -e "${GREEN}WARP removed (or was not installed).${NC}"
 }
 
 # ========== Change IP (Quick) ==========
@@ -396,7 +397,7 @@ parham_warp_main_menu() {
             7) parham_warp_scan_cloudflare_ips ;;
             8) parham_warp_select_ip_from_scan ;;
             9) parham_warp_set_endpoint_manual ;;
-            0) echo -e "${GREEN}Exiting...${NC}"; exit ;;
+            0) echo -e "${GREEN}Exiting...${NC}"; exit 0 ;;
             *) echo -e "${RED}Invalid choice. Try again.${NC}" ;;
         esac
         echo -e "\nPress Enter to return to menu..."
