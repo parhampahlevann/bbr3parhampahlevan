@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
-# script.sh - launcher for Warp-Multi-IP (fixed for Ubuntu 22/24/25)
-# Usage:
-#   bash <(curl -Ls https://raw.githubusercontent.com/ParsaKSH/Warp-Multi-IP/main/script.sh)
+# warp-multi-socks.sh - Clean multi WARP + multi SOCKS5 (fixed)
+# Based on the logic of the script you pasted (Parsa / Warp-Multi-IP), but rewritten & fixed.
 
 set -euo pipefail
+
+NUM_PROFILES=8                 # how many WARP profiles / proxies
+BASE_NET="172.16.0"           # 172.16.0.x internal IPs
+
+WGCF_BIN="/usr/local/bin/wgcf"
+CONF_DIR="/etc/wireguard"
+WORK_DIR="/root/warp-confs"
+DANTED_DIR="/etc/danted-multi"
+SYSTEMD_DIR="/etc/systemd/system"
 
 # ---------- colors ----------
 red()   { echo -e "\033[31m\033[01m$1\033[0m"; }
@@ -11,78 +19,234 @@ green() { echo -e "\033[32m\033[01m$1\033[0m"; }
 yellow(){ echo -e "\033[33m\033[01m$1\033[0m"; }
 blue()  { echo -e "\033[36m\033[01m$1\033[0m"; }
 
+# ---------- root check ----------
+if [[ $EUID -ne 0 ]]; then
+  red "This script must be run as root."
+  exit 1
+fi
+
 clear || true
-echo "=========================================="
-echo " Warp-Multi-IP launcher (fixed version)   "
-echo "  Repo: github.com/ParsaKSH/Warp-Multi-IP "
-echo "=========================================="
+echo -e "\033[1;33m=========================================="
+echo -e "Multi WARP + Multi SOCKS5 (fixed version)"
+echo -e "Inspired by Parsa's Warp-Multi-IP"
+echo -e "==========================================\033[0m"
 
-# ---------- sudo helper ----------
-if [[ $EUID -ne 0 ]]; then
-  SUDO="sudo"
-else
-  SUDO=""
+# ---------- optional cleanup ----------
+read -rp "Do you want to remove ALL existing wgcfX + danted-warpX configs first? (y/n): " CLEAN
+CLEAN=${CLEAN,,}
+if [[ "$CLEAN" == "y" ]]; then
+  blue "Cleaning up old configs, services, and interfaces..."
+
+  # stop any danted-warp services
+  for svc in "$SYSTEMD_DIR"/danted-warp*.service; do
+    [[ -e "$svc" ]] || continue
+    name=$(basename "$svc")
+    systemctl stop "$name" 2>/dev/null || true
+    systemctl disable "$name" 2>/dev/null || true
+    rm -f "$svc"
+  done
+
+  rm -rf "$DANTED_DIR"
+
+  # stop wgcfX interfaces
+  for i in $(seq 1 32); do
+    wg-quick down "wgcf${i}" 2>/dev/null || true
+  done
+
+  # delete stray wg interfaces
+  for dev in $(ip -o link show | awk -F': ' '{print $2}' | grep '^wg' || true); do
+    ip link delete "$dev" 2>/dev/null || true
+  done
+
+  # remove wgcf configs
+  rm -f "$CONF_DIR"/wgcf*.conf
+
+  # remove working dir
+  rm -rf "$WORK_DIR"
+
+  systemctl daemon-reload
+  modprobe -r wireguard 2>/dev/null || true
+
+  green "Cleanup done."
 fi
 
-# ---------- basic deps ----------
-blue "Checking and installing required packages (python3, curl, wget)..."
+# ---------- deps ----------
+blue "Installing dependencies (wireguard, resolvconf, curl, jq, dante-server)..."
+apt update -y >/dev/null 2>&1
+apt install -y wireguard wireguard-tools resolvconf curl jq dante-server unzip >/dev/null 2>&1
+green "Base packages installed."
 
-if command -v apt-get >/dev/null 2>&1; then
-  $SUDO apt-get update -y >/dev/null 2>&1 || true
-  $SUDO apt-get install -y python3 python3-venv python3-pip curl wget >/dev/null 2>&1 || {
-    red "Failed to install required packages via apt-get."
-    exit 1
+# ---------- wgcf ----------
+if ! command -v wgcf >/dev/null 2>&1; then
+  blue "Installing wgcf..."
+  curl -fsSL git.io/wgcf.sh | bash
+  mv wgcf "$WGCF_BIN"
+  chmod +x "$WGCF_BIN"
+fi
+green "wgcf is available."
+
+mkdir -p "$CONF_DIR"
+mkdir -p "$WORK_DIR"
+cd "$WORK_DIR"
+
+# ---------- generate WARP profiles ----------
+blue "Generating ${NUM_PROFILES} WARP configs (if not present)..."
+
+for i in $(seq 1 "$NUM_PROFILES"); do
+  WG_CONF="${CONF_DIR}/wgcf${i}.conf"
+  PROFILE_DIR="${WORK_DIR}/warp${i}"
+
+  if [[ -f "$WG_CONF" ]]; then
+    yellow "  wgcf${i}.conf already exists, skipping generation."
+    continue
+  fi
+
+  mkdir -p "$PROFILE_DIR"
+  cd "$PROFILE_DIR"
+
+  rm -f wgcf-account.toml wgcf-profile.conf
+
+  blue "  [${i}/${NUM_PROFILES}] wgcf register..."
+  wgcf register --accept-tos >/dev/null 2>&1 || {
+    red "    wgcf register failed for profile ${i}, skipping."
+    cd "$WORK_DIR"
+    continue
   }
-else
-  yellow "apt-get not found. Please install python3, curl and wget manually."
-fi
 
-# ---------- prepare working directory ----------
-WORKDIR="/root/Warp-Multi-IP"
+  wgcf generate >/dev/null 2>&1 || {
+    red "    wgcf generate failed for profile ${i}, skipping."
+    cd "$WORK_DIR"
+    continue
+  }
 
-blue "Preparing working directory at ${WORKDIR} ..."
-$SUDO mkdir -p "$WORKDIR"
-$SUDO chown "$(id -u):$(id -g)" "$WORKDIR" 2>/dev/null || true
+  if [[ ! -f wgcf-profile.conf ]]; then
+    red "    wgcf-profile.conf missing for profile ${i}, skipping."
+    cd "$WORK_DIR"
+    continue
+  fi
 
-cd "$WORKDIR"
+  cp wgcf-profile.conf "$WG_CONF"
+  chmod 600 "$WG_CONF"
 
-# ---------- download latest warp.py ----------
-WARP_URL="https://raw.githubusercontent.com/ParsaKSH/Warp-Multi-IP/main/warp.py"
+  # set unique internal IP and routing table
+  ip_suffix=$((i + 1))
+  ip_addr="${BASE_NET}.${ip_suffix}"
+  table_id=$((51820 + i))
 
-blue "Downloading latest warp.py from GitHub..."
-$SUDO rm -f warp.py
+  # replace Address line (drop IPv6, keep only IPv4 /32)
+  sed -i -E "s|^Address *=.*|Address = ${ip_addr}/32|" "$WG_CONF"
 
-if command -v wget >/dev/null 2>&1; then
-  $SUDO wget -q -O warp.py "$WARP_URL"
-elif command -v curl >/dev/null 2>&1; then
-  $SUDO curl -fsSL -o warp.py "$WARP_URL"
-else
-  red "Neither wget nor curl is available. Please install one of them."
-  exit 1
-fi
+  # add table + policy rules
+  if ! grep -q "^Table *= *" "$WG_CONF"; then
+    sed -i "/^\[Interface\]/a Table = ${table_id}\nPostUp = ip rule add from ${ip_addr}/32 table ${table_id}\nPostDown = ip rule del from ${ip_addr}/32 table ${table_id}" "$WG_CONF"
+  fi
 
-if [[ ! -s warp.py ]]; then
-  red "Failed to download warp.py (file is missing or empty)."
-  exit 1
-fi
+  green "    Created ${WG_CONF} (IP ${ip_addr}, table ${table_id})."
 
-$SUDO chmod +x warp.py
+  cd "$WORK_DIR"
+done
 
-green "warp.py downloaded successfully."
+# ---------- bring up interfaces (no systemd) ----------
+blue "Reloading WireGuard kernel module..."
+modprobe -r wireguard 2>/dev/null || true
+modprobe wireguard 2>/dev/null || true
 
-# ---------- run warp.py ----------
-blue "Running warp.py (this may take a while)..."
+blue "Bringing up wgcfX interfaces using wg-quick..."
+for i in $(seq 1 "$NUM_PROFILES"); do
+  WG_CONF="${CONF_DIR}/wgcf${i}.conf"
+  if [[ -f "$WG_CONF" ]]; then
+    wg-quick down "wgcf${i}" 2>/dev/null || true
+    if wg-quick up "wgcf${i}" >/dev/null 2>&1; then
+      green "  wgcf${i} up."
+    else
+      red "  wgcf${i} failed to start. Check: wg-quick up wgcf${i}"
+    fi
+  fi
+done
 
-if [[ $EUID -ne 0 ]]; then
-  $SUDO python3 warp.py
-else
-  python3 warp.py
-fi
+# ---------- Dante SOCKS proxies ----------
+blue "Setting up Dante SOCKS5 proxies..."
+mkdir -p "$DANTED_DIR"
 
-EXIT_CODE=$?
+for i in $(seq 1 "$NUM_PROFILES"); do
+  WG_CONF="${CONF_DIR}/wgcf${i}.conf"
+  if [[ ! -f "$WG_CONF" ]]; then
+    yellow "  No wgcf${i}.conf, skip danted-warp${i}."
+    continue
+  fi
 
-if [[ $EXIT_CODE -eq 0 ]]; then
-  green "Warp-Multi-IP finished successfully."
-else
-  red "warp.py exited with code ${EXIT_CODE}."
-fi
+  port=$((1080 + i))
+  ip_suffix=$((i + 1))
+  internal_ip="${BASE_NET}.${ip_suffix}"
+
+  D_CONF="${DANTED_DIR}/danted-warp${i}.conf"
+  SVC="${SYSTEMD_DIR}/danted-warp${i}.service"
+
+  cat >"$D_CONF" <<EOF
+logoutput: stderr
+internal: 127.0.0.1 port = ${port}
+external: ${internal_ip}
+user.privileged: root
+user.unprivileged: nobody
+clientmethod: none
+socksmethod: none
+
+client pass {
+  from: 0.0.0.0/0 to: 0.0.0.0/0
+}
+
+socks pass {
+  from: 0.0.0.0/0 to: 0.0.0.0/0
+}
+EOF
+
+  cat >"$SVC" <<EOF
+[Unit]
+Description=Dante SOCKS proxy warp${i}
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/danted -f ${D_CONF}
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable "danted-warp${i}" >/dev/null 2>&1 || true
+  systemctl restart "danted-warp${i}" >/dev/null 2>&1 || true
+
+  green "  danted-warp${i}: SOCKS5 127.0.0.1:${port} (external via ${internal_ip})"
+done
+
+# ---------- check proxy IPs ----------
+blue "Checking public IPs via each SOCKS5 proxy..."
+declare -A ip_map
+declare -A proxy_ips
+
+for i in $(seq 1 "$NUM_PROFILES"); do
+  port=$((1080 + i))
+
+  # quick restart to be safe
+  systemctl restart "danted-warp${i}" 2>/dev/null || true
+  wg-quick up "wgcf${i}" 2>/dev/null || true
+
+  sleep 5
+  ip_raw=$(curl -s --max-time 15 --socks5 127.0.0.1:${port} https://api.ipify.org || echo "error")
+  echo "  wgcf${i} (SOCKS 127.0.0.1:${port}) → ${ip_raw}"
+  proxy_ips[$i]="$ip_raw"
+  ip_map[$ip_raw]=1
+done
+
+echo
+green "Setup finished!"
+echo "SOCKS5 proxies available:"
+for i in $(seq 1 "$NUM_PROFILES"); do
+  port=$((1080 + i))
+  echo "  wgcf${i} → 127.0.0.1:${port}"
+done
+
+echo "If some IPs show 'error', run:"
+echo "  systemctl status danted-warp1  (or wg-quick up wgcf1) to see logs."
