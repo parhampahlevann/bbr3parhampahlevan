@@ -34,8 +34,13 @@ if [[ "$CURRENT_PATH" != "$SCRIPT_PATH" ]]; then
 fi
 
 # ========== Colors & Version ==========
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
-VERSION="2.3-parham-multiloc"
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+VERSION="2.4-parham-multiloc-eu"
 
 # ========== Global files ==========
 SCAN_RESULT_FILE="/tmp/warp_cf_scan_last.csv"
@@ -47,6 +52,24 @@ CURRENT_ENDPOINT_FILE="${CONFIG_DIR}/current_endpoint"
 mkdir -p "$CONFIG_DIR"
 touch "$ENDPOINTS_FILE" 2>/dev/null || true
 
+# ========== Preload EU Cloudflare endpoints ==========
+parham_warp_preload_endpoints() {
+    if [[ ! -s "$ENDPOINTS_FILE" ]]; then
+        echo "[*] Preloading European Cloudflare endpoints..."
+        cat << EOF > "$ENDPOINTS_FILE"
+Romania-1|188.114.96.10:2408
+Romania-2|188.114.97.10:2408
+Germany-1|188.114.98.10:2408
+Germany-2|188.114.99.10:2408
+Netherlands-1|162.159.192.10:2408
+Netherlands-2|162.159.193.10:2408
+France-1|162.159.195.10:2408
+UK-1|162.159.204.10:2408
+EOF
+        echo "[✓] Loaded European Cloudflare endpoints."
+    fi
+}
+
 # ========== Core Checks ==========
 parham_warp_is_installed() {
     command -v warp-cli &>/dev/null
@@ -57,6 +80,12 @@ parham_warp_is_connected() {
 }
 
 # ========== Helpers ==========
+parham_warp_ensure_proxy_mode() {
+    # Ensure WARP is in proxy mode on port 10808
+    warp-cli set-mode proxy 2>/dev/null || warp-cli mode proxy
+    warp-cli set-proxy-port 10808 2>/dev/null || warp-cli proxy port 10808
+}
+
 parham_warp_get_out_ip() {
     # Real outgoing IP (force IPv4) behind WARP proxy
     local proxy_ip="127.0.0.1"
@@ -142,8 +171,7 @@ parham_warp_install() {
 parham_warp_connect() {
     echo -e "${BLUE}Connecting to WARP Proxy...${NC}"
     yes | warp-cli registration new 2>/dev/null || warp-cli register
-    warp-cli set-mode proxy 2>/dev/null || warp-cli mode proxy
-    warp-cli set-proxy-port 10808 2>/dev/null || warp-cli proxy port 10808
+    parham_warp_ensure_proxy_mode
     warp-cli connect
     sleep 2
 }
@@ -211,6 +239,7 @@ parham_warp_quick_change_ip() {
     for attempt in {1..5}; do
         echo -e "Attempt ${attempt}/5: reconnecting..."
         parham_warp_disconnect
+        parham_warp_ensure_proxy_mode
         warp-cli connect
         sleep 2
         new_ip=$(parham_warp_get_out_ip)
@@ -244,8 +273,7 @@ parham_warp_new_identity() {
 
     sleep 1
     yes | warp-cli registration new 2>/dev/null || warp-cli register
-    warp-cli set-mode proxy 2>/dev/null || warp-cli mode proxy
-    warp-cli set-proxy-port 10808 2>/dev/null || warp-cli proxy port 10808
+    parham_warp_ensure_proxy_mode
     warp-cli connect
     sleep 2
 
@@ -356,6 +384,7 @@ parham_warp_select_ip_from_scan() {
 
     local endpoint="${ip}:${port}"
     parham_warp_disconnect
+    parham_warp_ensure_proxy_mode
     parham_warp_set_custom_endpoint "$endpoint"
     warp-cli connect
     sleep 2
@@ -381,6 +410,7 @@ parham_warp_set_endpoint_manual() {
     fi
 
     parham_warp_disconnect
+    parham_warp_ensure_proxy_mode
     parham_warp_set_custom_endpoint "$endpoint"
     warp-cli connect
     sleep 2
@@ -451,6 +481,7 @@ parham_warp_apply_saved_endpoint() {
         if [[ "$i" -eq "$idx" ]]; then
             echo -e "${CYAN}Applying endpoint:${NC} ${name} -> ${endpoint}"
             parham_warp_disconnect
+            parham_warp_ensure_proxy_mode
             parham_warp_set_custom_endpoint "$endpoint"
             echo "$name|$endpoint" > "$CURRENT_ENDPOINT_FILE"
             warp-cli connect
@@ -549,6 +580,7 @@ parham_warp_rotate_endpoint() {
         if [[ "$i" -eq "$next_index" ]]; then
             echo -e "${CYAN}Rotating to endpoint:${NC} ${name} -> ${endpoint}"
             parham_warp_disconnect
+            parham_warp_ensure_proxy_mode
             parham_warp_set_custom_endpoint "$endpoint"
             echo "$name|$endpoint" > "$CURRENT_ENDPOINT_FILE"
             warp-cli connect
@@ -636,6 +668,9 @@ EOF
 }
 
 parham_warp_main_menu() {
+    # Preload EU endpoints if list is empty
+    parham_warp_preload_endpoints
+
     while true; do
         parham_warp_draw_menu
         read -r choice
