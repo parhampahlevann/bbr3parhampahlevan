@@ -16,20 +16,26 @@ fi
 # ========== Auto-install path ==========
 SCRIPT_PATH="/usr/local/bin/warp-menu"
 
-# If this script is not already at /usr/local/bin/warp-menu, install it there
+# Try to resolve current script path (may be a regular file or a pipe/dev/fd)
 CURRENT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+
+# Detect if CURRENT_PATH is a regular file (not a pipe/dev/fd)
 if [[ "$CURRENT_PATH" != "$SCRIPT_PATH" ]]; then
-  echo "[*] Installing warp-menu to ${SCRIPT_PATH} ..."
-  cp "$CURRENT_PATH" "$SCRIPT_PATH"
-  chmod +x "$SCRIPT_PATH"
-  echo "[✓] Installed warp-menu to ${SCRIPT_PATH}"
-  echo "[*] You can later run it with: warp-menu"
-  # Do NOT exit here: continue and show menu right now
+  if [[ -f "$CURRENT_PATH" ]]; then
+    echo "[*] Installing warp-menu to ${SCRIPT_PATH} ..."
+    cp "$CURRENT_PATH" "$SCRIPT_PATH"
+    chmod +x "$SCRIPT_PATH"
+    echo "[✓] Installed warp-menu to ${SCRIPT_PATH}"
+    echo "[*] You can later run it with: warp-menu"
+  else
+    echo "[*] Running from a pipe/FD (e.g. bash <(curl ...)), skipping auto-install."
+    echo "[*] If you want persistent install, save this script to a file and run it from there."
+  fi
 fi
 
 # ========== Colors & Version ==========
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
-VERSION="2.1-parham"
+VERSION="2.2-parham"
 
 # ========== Global scan result file ==========
 SCAN_RESULT_FILE="/tmp/warp_cf_scan_last.csv"
@@ -82,7 +88,7 @@ parham_warp_install() {
     echo -e "${CYAN}Installing WARP-CLI...${NC}"
     local codename
     codename=$(lsb_release -cs 2>/dev/null || echo "")
-    # For Ubuntu 24/25 and newer, fall back to jammy (Cloudflare repo supports it well)
+    # For Ubuntu 24/25+ fallback to jammy which is supported by Cloudflare repo
     if [[ -z "$codename" || "$codename" == "oracular" || "$codename" == "plucky" ]]; then
         codename="jammy"
     fi
