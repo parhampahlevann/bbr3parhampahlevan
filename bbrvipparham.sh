@@ -55,6 +55,20 @@ mkdir -p "$CONFIG_DIR"
 touch "$ENDPOINTS_FILE" 2>/dev/null || true
 touch "$CONNECTION_LOG" 2>/dev/null || true
 
+# ========== Predefined Locations ==========
+declare -A WARP_LOCATIONS=(
+    ["Germany"]="188.114.98.10:2408"
+    ["Netherlands"]="162.159.192.10:2408"
+    ["France"]="162.159.195.10:2408"
+    ["UK"]="162.159.204.10:2408"
+    ["USA"]="162.159.208.10:2408"
+    ["Singapore"]="104.16.186.10:2408"
+    ["Japan"]="104.16.187.10:2408"
+    ["Canada"]="104.16.188.10:2408"
+    ["Switzerland"]="188.114.100.10:2408"
+    ["Italy"]="188.114.102.10:2408"
+)
+
 # ========== Logging function ==========
 log_message() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$CONNECTION_LOG"
@@ -64,27 +78,10 @@ log_message() {
 parham_warp_preload_endpoints() {
     if [[ ! -s "$ENDPOINTS_FILE" ]]; then
         echo "[*] Preloading Cloudflare endpoints..."
-        cat << EOF > "$ENDPOINTS_FILE"
-Romania-1|188.114.96.10:2408
-Romania-2|188.114.97.10:2408
-Germany-1|188.114.98.10:2408
-Germany-2|188.114.99.10:2408
-Netherlands-1|162.159.192.10:2408
-Netherlands-2|162.159.193.10:2408
-France-1|162.159.195.10:2408
-UK-1|162.159.204.10:2408
-USA-1|162.159.208.10:2408
-USA-2|162.159.209.10:2408
-Switzerland-1|188.114.100.10:2408
-Switzerland-2|188.114.101.10:2408
-Italy-1|188.114.102.10:2408
-Italy-2|188.114.103.10:2408
-Spain-1|188.114.104.10:2408
-Spain-2|188.114.105.10:2408
-Poland-1|188.114.106.10:2408
-Poland-2|188.114.107.10:2408
-EOF
-        echo "[✓] Loaded 18 Cloudflare endpoints from 9 countries."
+        for loc in "${!WARP_LOCATIONS[@]}"; do
+            echo "$loc|${WARP_LOCATIONS[$loc]}" >> "$ENDPOINTS_FILE"
+        done
+        echo "[✓] Loaded ${#WARP_LOCATIONS[@]} predefined locations."
     fi
 }
 
@@ -753,6 +750,73 @@ parham_warp_rotate_endpoint() {
     fi
 }
 
+parham_warp_select_location() {
+    echo -e "${CYAN}Available locations:${NC}"
+    local i=1
+    for loc in "${!WARP_LOCATIONS[@]}"; do
+        echo " $i) $loc"
+        i=$((i+1))
+    done
+    
+    read -p "Select location: " choice
+    i=1
+    for loc in "${!WARP_LOCATIONS[@]}"; do
+        if [[ $i -eq $choice ]]; then
+            local endpoint="${WARP_LOCATIONS[$loc]}"
+            echo -e "${GREEN}Selected: $loc ($endpoint)${NC}"
+            parham_warp_disconnect
+            parham_warp_set_custom_endpoint "$endpoint"
+            echo "$loc|$endpoint" > "$CURRENT_ENDPOINT_FILE"
+            warp-cli connect
+            sleep 5
+            parham_warp_status
+            return
+        fi
+        i=$((i+1))
+    done
+    echo -e "${RED}Invalid selection${NC}"
+}
+
+parham_warp_rotate_location() {
+    local locations=("${!WARP_LOCATIONS[@]}")
+    local current=""
+    
+    if [[ -f "$CURRENT_ENDPOINT_FILE" ]]; then
+        current=$(cat "$CURRENT_ENDPOINT_FILE" | cut -d'|' -f1)
+    fi
+    
+    local next_loc=""
+    for loc in "${locations[@]}"; do
+        if [[ -z "$current" ]]; then
+            next_loc="$loc"
+            break
+        elif [[ "$current" == "$loc" ]]; then
+            next_loc="${locations[((RANDOM % ${#locations[@]}))]}"
+            break
+        fi
+    done
+    
+    if [[ -z "$next_loc" ]]; then
+        next_loc="${locations[0]}"
+    fi
+    
+    local endpoint="${WARP_LOCATIONS[$next_loc]}"
+    echo -e "${CYAN}Rotating to: $next_loc ($endpoint)${NC}"
+    
+    parham_warp_disconnect
+    parham_warp_set_custom_endpoint "$endpoint"
+    echo "$next_loc|$endpoint" > "$CURRENT_ENDPOINT_FILE"
+    warp-cli connect
+    sleep 5
+    
+    if parham_warp_is_connected; then
+        echo -e "${GREEN}✓ Successfully rotated to $next_loc${NC}"
+        parham_warp_status
+    else
+        echo -e "${RED}Rotation failed${NC}"
+    fi
+}
+
 parham_warp_multilocation_menu() {
     while true; do
         clear
@@ -765,9 +829,12 @@ parham_warp_multilocation_menu() {
         echo -e "${GREEN}Options:${NC}"
         echo " 1) Add new endpoint"
         echo " 2) Apply endpoint"
-        echo " 3) Delete endpoint"
-        echo " 4) Rotate to next endpoint"
-        echo " 5) Test current endpoint speed"
+        echo " 3) Test proxy"
+        echo " 4) Delete endpoint"
+        echo " 5) Rotate to next endpoint"
+        echo " 6) Test current endpoint speed"
+        echo " 7) Select predefined location"
+        echo " 8) Rotate to random location"
         echo " 0) Back to main menu"
         echo
         
@@ -776,13 +843,16 @@ parham_warp_multilocation_menu() {
         case $choice in
             1) parham_warp_add_saved_endpoint ;;
             2) parham_warp_apply_saved_endpoint ;;
-            3) 
+            3) parham_warp_test_proxy ;;
+            4) 
                 echo -e "${YELLOW}Deleting endpoints is not implemented yet.${NC}"
                 echo -e "You can manually edit: $ENDPOINTS_FILE"
                 sleep 2
                 ;;
-            4) parham_warp_rotate_endpoint ;;
-            5) parham_warp_test_endpoint_speed ;;
+            5) parham_warp_rotate_endpoint ;;
+            6) parham_warp_test_endpoint_speed ;;
+            7) parham_warp_select_location ;;
+            8) parham_warp_rotate_location ;;
             0) break ;;
             *) echo -e "${RED}Invalid option${NC}" ;;
         esac
@@ -828,18 +898,18 @@ parham_warp_draw_menu() {
     fi
     
     cat << EOF
-${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}
-${CYAN}║         ${BOLD}WARP Manager v${VERSION} - Enhanced Edition${NC}           ${CYAN}║${NC}
-${CYAN}║                    ${BOLD}by Parham Pahlevan${NC}                       ${CYAN}║${NC}
-${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}
+ ${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}
+ ${CYAN}║         ${BOLD}WARP Manager v${VERSION} - Enhanced Edition${NC}           ${CYAN}║${NC}
+ ${CYAN}║                    ${BOLD}by Parham Pahlevan${NC}                       ${CYAN}║${NC}
+ ${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}
 
-${GREEN}Status:${NC} ${status_color}${status_text}${NC}
-${GREEN}Current IP:${NC} ${YELLOW}${current_ip}${NC}
-${GREEN}Location:${NC} ${CYAN}${location:-Unknown}${NC}
-${GREEN}Endpoint:${NC} ${PURPLE}${endpoint_info}${NC}
-${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}
+ ${GREEN}Status:${NC} ${status_color}${status_text}${NC}
+ ${GREEN}Current IP:${NC} ${YELLOW}${current_ip}${NC}
+ ${GREEN}Location:${NC} ${CYAN}${location:-Unknown}${NC}
+ ${GREEN}Endpoint:${NC} ${PURPLE}${endpoint_info}${NC}
+ ${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}
 
-${BOLD}Main Options:${NC}
+ ${BOLD}Main Options:${NC}
  ${GREEN}1${NC}) 📦 Install WARP
  ${GREEN}2${NC}) 📊 Status & Info
  ${GREEN}3${NC}) 🔧 Test Proxy
@@ -847,15 +917,15 @@ ${BOLD}Main Options:${NC}
  ${GREEN}5${NC}) 🔄 Quick IP Change
  ${GREEN}6${NC}) 🆔 New Identity
 
-${BOLD}Advanced Options:${NC}
+ ${BOLD}Advanced Options:${NC}
  ${GREEN}7${NC}) 🔍 Scan Cloudflare IPs
  ${GREEN}8${NC}) 📍 Apply Scanned IP
  ${GREEN}9${NC}) ✏️  Manual Endpoint
  ${GREEN}10${NC}) 🌍 Multi-location Manager
 
-${RED}0${NC}) Exit
+ ${RED}0${NC}) Exit
 
-${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}
+ ${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}
 EOF
 }
 
