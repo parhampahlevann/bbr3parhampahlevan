@@ -2,9 +2,6 @@
 # Cloudflare WARP Menu (Parham Enhanced Edition)
 # Author: Parham Pahlevan
 # Enhanced with multi-location and bug fixes
-#
-# GitHub usage example:
-#   bash <(curl -Ls https://raw.githubusercontent.com/USERNAME/REPO/BRANCH/warp-menu.sh)
 
 set -e
 
@@ -63,7 +60,7 @@ log_message() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$CONNECTION_LOG"
 }
 
-# ========== Preload EU Cloudflare endpoints ==========
+# ========== Preload Cloudflare endpoints ==========
 parham_warp_preload_endpoints() {
     if [[ ! -s "$ENDPOINTS_FILE" ]]; then
         echo "[*] Preloading Cloudflare endpoints..."
@@ -120,20 +117,17 @@ parham_warp_check_connection() {
 
 # ========== Helpers ==========
 parham_warp_ensure_proxy_mode() {
-    # Ensure WARP is in proxy mode on port 10808
     warp-cli set-mode proxy 2>/dev/null || warp-cli mode proxy
     warp-cli set-proxy-port 10808 2>/dev/null || warp-cli proxy port 10808
     sleep 1
 }
 
 parham_warp_get_out_ip() {
-    # Real outgoing IP (force IPv4) behind WARP proxy
     local proxy_ip="127.0.0.1"
     local proxy_port="10808"
     local ip=""
     local timeout=5
 
-    # Try multiple services with timeout
     local services=(
         "https://ipv4.icanhazip.com"
         "https://api.ipify.org"
@@ -155,25 +149,16 @@ parham_warp_get_out_ip() {
 }
 
 parham_warp_get_out_geo() {
-    # Get country / country-code via WARP
     local proxy_ip="127.0.0.1"
     local proxy_port="10808"
     local geo country country_code isp asn
 
-    # Try ip-api.com first
     geo=$(timeout 10 curl -4 -s --socks5 "${proxy_ip}:${proxy_port}" \
         "http://ip-api.com/line/?fields=country,countryCode,isp,as" 2>/dev/null || true)
     
     if [[ -z "$geo" ]]; then
-        # Fallback to ipinfo.io
         geo=$(timeout 10 curl -4 -s --socks5 "${proxy_ip}:${proxy_port}" \
-            "https://ipinfo.io/json" 2>/dev/null || true)
-        if [[ -n "$geo" ]]; then
-            country=$(echo "$geo" | grep '"country"' | cut -d'"' -f4)
-            country_code=$(echo "$geo" | grep '"country"' | cut -d'"' -f4)
-            isp=$(echo "$geo" | grep '"org"' | cut -d'"' -f4)
-            asn=$(echo "$isp" | grep -o 'AS[0-9]\+' || echo "")
-        fi
+            "https://ipinfo.io/json" 2>/dev/null | jq -r '[.country, .country, .org, .org] | join("|")' 2>/dev/null || true)
     else
         country=$(echo "$geo" | sed -n '1p')
         country_code=$(echo "$geo" | sed -n '2p')
@@ -201,7 +186,7 @@ parham_warp_set_custom_endpoint() {
 }
 
 parham_warp_clear_custom_endpoint() {
-    echo -e "${CYAN}Clearing custom endpoint (back to automatic selection)...${NC}"
+    echo -e "${CYAN}Clearing custom endpoint...${NC}"
     warp-cli clear-custom-endpoint 2>/dev/null || true
     sleep 2
 }
@@ -224,7 +209,6 @@ parham_warp_install() {
     local codename
     codename=$(lsb_release -cs 2>/dev/null || echo "")
     
-    # Handle Ubuntu 24.04+ and other distros
     if [[ -z "$codename" ]]; then
         codename="jammy"
     elif [[ "$codename" == "oracular" || "$codename" == "plucky" || "$codename" == "noble" ]]; then
@@ -234,7 +218,6 @@ parham_warp_install() {
     apt update
     apt install -y curl gpg lsb-release apt-transport-https ca-certificates sudo jq
     
-    # Add Cloudflare repository
     curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
         | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
     
@@ -244,7 +227,6 @@ parham_warp_install() {
     apt update
     apt install -y cloudflare-warp
 
-    # Initialize WARP
     echo -e "${CYAN}Initializing WARP...${NC}"
     warp-cli registration new 2>/dev/null || warp-cli register
     parham_warp_ensure_proxy_mode
@@ -260,7 +242,6 @@ parham_warp_connect() {
     warp-cli connect
     sleep 3
     
-    # Wait for connection
     local attempts=0
     while [[ $attempts -lt 10 ]] && ! parham_warp_is_connected; do
         sleep 1
@@ -288,13 +269,11 @@ parham_warp_status() {
     if parham_warp_is_connected; then
         echo -e "${CYAN}=== Connection Details ===${NC}"
         
-        # Get IP
         local ip
         ip=$(parham_warp_get_out_ip)
         if [[ -n "$ip" ]]; then
             echo -e "  ${GREEN}IPv4:${NC} $ip"
             
-            # Get Geo info
             local geo
             geo=$(parham_warp_get_out_geo 2>/dev/null || true)
             if [[ -n "$geo" ]]; then
@@ -309,7 +288,6 @@ parham_warp_status() {
                 fi
             fi
             
-            # Get current endpoint if custom
             local endpoint_info
             endpoint_info=$(warp-cli settings 2>/dev/null | grep -i "endpoint" || true)
             if [[ -n "$endpoint_info" ]]; then
@@ -319,7 +297,6 @@ parham_warp_status() {
             echo -e "  ${RED}Could not retrieve IP address${NC}"
         fi
         
-        # Test proxy connectivity
         echo -e "\n${CYAN}=== Proxy Test ===${NC}"
         if timeout 5 curl -4 -s --socks5 127.0.0.1:10808 https://www.cloudflare.com > /dev/null; then
             echo -e "  ${GREEN}✓ Proxy is working${NC}"
@@ -357,7 +334,6 @@ parham_warp_test_proxy() {
         fi
     done
     
-    # Show current IP
     local ip
     ip=$(parham_warp_get_out_ip)
     if [[ -n "$ip" ]]; then
@@ -424,15 +400,12 @@ parham_warp_new_identity() {
     
     parham_warp_disconnect
     
-    # Clean all registration data
     warp-cli registration delete 2>/dev/null || true
     warp-cli clear-custom-endpoint 2>/dev/null || true
     sleep 2
     
-    # Restart service for clean state
     parham_warp_restart_warp_service
     
-    # New registration
     warp-cli registration new 2>/dev/null || warp-cli register
     parham_warp_ensure_proxy_mode
     warp-cli connect
@@ -451,7 +424,7 @@ parham_warp_new_identity() {
     fi
 }
 
-# ========== Enhanced Scanning Functions ==========
+# ========== Scanning Functions ==========
 parham_warp_scan_cloudflare_ips() {
     echo -e "${CYAN}Scanning Cloudflare IPs...${NC}"
     echo -e "${YELLOW}Note: This may take a few minutes${NC}\n"
@@ -507,7 +480,6 @@ parham_warp_scan_cloudflare_ips() {
         echo -e "\n${GREEN}Top 10 fastest IPs:${NC}"
         sort -t',' -k2 -n "$SCAN_RESULT_FILE" | head -10 | column -t -s ','
         
-        # Save best endpoints
         echo -e "\n${CYAN}Saving best endpoints...${NC}"
         : > "$BEST_ENDPOINTS_FILE"
         sort -t',' -k2 -n "$SCAN_RESULT_FILE" | head -5 | while IFS=',' read ip rtt; do
@@ -588,7 +560,6 @@ parham_warp_test_endpoint_speed() {
     
     echo -e "\n${CYAN}Running speed test via proxy...${NC}"
     
-    # Download test
     echo -ne "  Download speed: "
     local start_time download_time speed_mbps
     
@@ -605,7 +576,6 @@ parham_warp_test_endpoint_speed() {
         echo -e "${RED}Failed${NC}"
     fi
     
-    # Latency test
     echo -ne "  Latency to Cloudflare: "
     local latency
     latency=$(curl -4 -s --socks5 127.0.0.1:10808 -w "%{time_connect}\n" -o /dev/null https://www.cloudflare.com 2>/dev/null || echo "0")
@@ -617,7 +587,7 @@ parham_warp_test_endpoint_speed() {
     fi
 }
 
-# ========== Enhanced Multi-location Functions ==========
+# ========== Multi-location Functions ==========
 parham_warp_list_saved_endpoints() {
     if [[ ! -s "$ENDPOINTS_FILE" ]]; then
         echo -e "${YELLOW}No saved endpoints.${NC}"
@@ -627,7 +597,7 @@ parham_warp_list_saved_endpoints() {
     local current_endpoint=""
     [[ -f "$CURRENT_ENDPOINT_FILE" ]] && current_endpoint=$(cat "$CURRENT_ENDPOINT_FILE" 2>/dev/null || true)
     
-    echo -e "${CYAN}Saved endpoints (${#saved_endpoints[@]}):${NC}"
+    echo -e "${CYAN}Saved endpoints:${NC}"
     echo "----------------------------------------"
     
     local i=1
@@ -640,7 +610,6 @@ parham_warp_list_saved_endpoints() {
         fi
         
         printf " %2d. %-20s %s\n" "$i" "$name" "$endpoint"
-        echo -e "     ${mark}"
         i=$((i + 1))
     done < "$ENDPOINTS_FILE"
     
@@ -663,11 +632,10 @@ parham_warp_add_saved_endpoint() {
         return 1
     }
     
-    # Validate endpoint format
     if ! [[ "$endpoint" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$ ]]; then
         echo -e "${RED}Invalid endpoint format. Use IP:PORT${NC}"
         return 1
-    }
+    fi
     
     echo "${name}|${endpoint}" >> "$ENDPOINTS_FILE"
     echo -e "${GREEN}✓ Endpoint added: ${name} -> ${endpoint}${NC}"
@@ -703,28 +671,22 @@ parham_warp_apply_saved_endpoint() {
         
         log_message "Applying endpoint: $name -> $endpoint"
         
-        # Disconnect and apply
         parham_warp_disconnect
         parham_warp_set_custom_endpoint "$endpoint"
         
-        # Save current endpoint
         echo "$name|$endpoint" > "$CURRENT_ENDPOINT_FILE"
         
-        # Connect and verify
         warp-cli connect
         sleep 5
         
-        # Verify connection
         if parham_warp_is_connected; then
             echo -e "${GREEN}✓ Successfully applied endpoint!${NC}"
             
-            # Show new IP
             local new_ip
             new_ip=$(parham_warp_get_out_ip)
             if [[ -n "$new_ip" ]]; then
                 echo -e "${GREEN}New IP: ${new_ip}${NC}"
                 
-                # Show location
                 local geo
                 geo=$(parham_warp_get_out_geo 2>/dev/null || true)
                 if [[ -n "$geo" ]]; then
@@ -746,13 +708,11 @@ parham_warp_rotate_endpoint() {
         return 1
     fi
     
-    # Get current endpoint
     local current=""
     if [[ -f "$CURRENT_ENDPOINT_FILE" ]]; then
         current=$(cat "$CURRENT_ENDPOINT_FILE" 2>/dev/null || true)
     fi
     
-    # Find current index
     local current_idx=0 idx=1
     while IFS='|' read -r name endpoint; do
         [[ -z "$name" ]] && continue
@@ -763,14 +723,11 @@ parham_warp_rotate_endpoint() {
         idx=$((idx + 1))
     done < "$ENDPOINTS_FILE"
     
-    # Get total count
     local total
     total=$(grep -c '|' "$ENDPOINTS_FILE")
     
-    # Calculate next endpoint
     local next_idx=$((current_idx % total + 1))
     
-    # Get next endpoint
     local next_endpoint
     next_endpoint=$(sed -n "${next_idx}p" "$ENDPOINTS_FILE")
     local next_name="${next_endpoint%%|*}"
@@ -780,14 +737,12 @@ parham_warp_rotate_endpoint() {
     echo -e "Current: ${YELLOW}$(echo "$current" | cut -d'|' -f1)${NC}"
     echo -e "Next: ${GREEN}${next_name}${NC}"
     
-    # Apply next endpoint
     parham_warp_disconnect
     parham_warp_set_custom_endpoint "$next_addr"
     echo "$next_name|$next_addr" > "$CURRENT_ENDPOINT_FILE"
     warp-cli connect
     sleep 5
     
-    # Show result
     if parham_warp_is_connected; then
         echo -e "${GREEN}✓ Rotated to: ${next_name}${NC}"
         local new_ip
@@ -813,7 +768,6 @@ parham_warp_multilocation_menu() {
         echo " 3) Delete endpoint"
         echo " 4) Rotate to next endpoint"
         echo " 5) Test current endpoint speed"
-        echo " 6) Import endpoints from file"
         echo " 0) Back to main menu"
         echo
         
@@ -823,15 +777,12 @@ parham_warp_multilocation_menu() {
             1) parham_warp_add_saved_endpoint ;;
             2) parham_warp_apply_saved_endpoint ;;
             3) 
-                echo -e "${YELLOW}Feature under construction...${NC}"
+                echo -e "${YELLOW}Deleting endpoints is not implemented yet.${NC}"
+                echo -e "You can manually edit: $ENDPOINTS_FILE"
                 sleep 2
                 ;;
             4) parham_warp_rotate_endpoint ;;
             5) parham_warp_test_endpoint_speed ;;
-            6)
-                echo -e "${YELLOW}Feature under construction...${NC}"
-                sleep 2
-                ;;
             0) break ;;
             *) echo -e "${RED}Invalid option${NC}" ;;
         esac
@@ -845,17 +796,14 @@ parham_warp_multilocation_menu() {
 parham_warp_draw_menu() {
     clear
     
-    # Get connection status
     local status_color status_text
     if parham_warp_is_connected; then
         status_color="$GREEN"
         status_text="CONNECTED"
         
-        # Get current IP
         local current_ip
         current_ip=$(parham_warp_get_out_ip 2>/dev/null || echo "N/A")
         
-        # Get location if available
         local location=""
         local geo
         geo=$(parham_warp_get_out_geo 2>/dev/null || true)
@@ -870,7 +818,6 @@ parham_warp_draw_menu() {
         location=""
     fi
     
-    # Get current endpoint if any
     local endpoint_info="Auto"
     if [[ -f "$CURRENT_ENDPOINT_FILE" ]]; then
         local current
@@ -913,7 +860,6 @@ EOF
 }
 
 parham_warp_main_menu() {
-    # Preload endpoints if needed
     parham_warp_preload_endpoints
     
     while true; do
@@ -962,7 +908,6 @@ parham_warp_main_menu() {
 if [[ $# -eq 0 ]]; then
     parham_warp_main_menu
 else
-    # Handle command line arguments
     case $1 in
         install) parham_warp_install ;;
         status) parham_warp_status ;;
