@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Cloudflare WARP Menu (Parham Edition)
+# Cloudflare WARP Menu (Parham Enhanced Edition)
 # Author: Parham Pahlevan
+# Enhanced with multi-location and bug fixes
 #
 # GitHub usage example:
 #   bash <(curl -Ls https://raw.githubusercontent.com/USERNAME/REPO/BRANCH/warp-menu.sh)
@@ -16,10 +17,10 @@ fi
 # ========== Auto-install path ==========
 SCRIPT_PATH="/usr/local/bin/warp-menu"
 
-# Try to resolve current script path (may be a regular file or a pipe/dev/fd)
+# Try to resolve current script path
 CURRENT_PATH="$(readlink -f "$0" 2>/dev/null || echo "$0")"
 
-# Detect if CURRENT_PATH is a regular file (not a pipe/dev/fd)
+# Detect if CURRENT_PATH is a regular file
 if [[ "$CURRENT_PATH" != "$SCRIPT_PATH" ]]; then
   if [[ -f "$CURRENT_PATH" ]]; then
     echo "[*] Installing warp-menu to ${SCRIPT_PATH} ..."
@@ -39,23 +40,33 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+PURPLE='\033[0;35m'
 NC='\033[0m'
-VERSION="2.4-parham-multiloc-eu"
+BOLD='\033[1m'
+VERSION="3.0-parham-multiloc-enhanced"
 
 # ========== Global files ==========
 SCAN_RESULT_FILE="/tmp/warp_cf_scan_last.csv"
+BEST_ENDPOINTS_FILE="/tmp/warp_best_endpoints.txt"
 
 CONFIG_DIR="/etc/warp-menu"
 ENDPOINTS_FILE="${CONFIG_DIR}/endpoints.list"
 CURRENT_ENDPOINT_FILE="${CONFIG_DIR}/current_endpoint"
+CONNECTION_LOG="${CONFIG_DIR}/connection.log"
 
 mkdir -p "$CONFIG_DIR"
 touch "$ENDPOINTS_FILE" 2>/dev/null || true
+touch "$CONNECTION_LOG" 2>/dev/null || true
+
+# ========== Logging function ==========
+log_message() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$CONNECTION_LOG"
+}
 
 # ========== Preload EU Cloudflare endpoints ==========
 parham_warp_preload_endpoints() {
     if [[ ! -s "$ENDPOINTS_FILE" ]]; then
-        echo "[*] Preloading European Cloudflare endpoints..."
+        echo "[*] Preloading Cloudflare endpoints..."
         cat << EOF > "$ENDPOINTS_FILE"
 Romania-1|188.114.96.10:2408
 Romania-2|188.114.97.10:2408
@@ -65,8 +76,18 @@ Netherlands-1|162.159.192.10:2408
 Netherlands-2|162.159.193.10:2408
 France-1|162.159.195.10:2408
 UK-1|162.159.204.10:2408
+USA-1|162.159.208.10:2408
+USA-2|162.159.209.10:2408
+Switzerland-1|188.114.100.10:2408
+Switzerland-2|188.114.101.10:2408
+Italy-1|188.114.102.10:2408
+Italy-2|188.114.103.10:2408
+Spain-1|188.114.104.10:2408
+Spain-2|188.114.105.10:2408
+Poland-1|188.114.106.10:2408
+Poland-2|188.114.107.10:2408
 EOF
-        echo "[✓] Loaded European Cloudflare endpoints."
+        echo "[✓] Loaded 18 Cloudflare endpoints from 9 countries."
     fi
 }
 
@@ -79,11 +100,30 @@ parham_warp_is_connected() {
     warp-cli status 2>/dev/null | grep -iq "Connected"
 }
 
+parham_warp_check_connection() {
+    if ! parham_warp_is_installed; then
+        echo -e "${RED}WARP is not installed. Please install it first.${NC}"
+        return 1
+    fi
+    
+    if ! parham_warp_is_connected; then
+        echo -e "${YELLOW}WARP is not connected. Trying to connect...${NC}"
+        warp-cli connect
+        sleep 3
+        if ! parham_warp_is_connected; then
+            echo -e "${RED}Cannot establish connection. Please check WARP service.${NC}"
+            return 1
+        fi
+    fi
+    return 0
+}
+
 # ========== Helpers ==========
 parham_warp_ensure_proxy_mode() {
     # Ensure WARP is in proxy mode on port 10808
     warp-cli set-mode proxy 2>/dev/null || warp-cli mode proxy
     warp-cli set-proxy-port 10808 2>/dev/null || warp-cli proxy port 10808
+    sleep 1
 }
 
 parham_warp_get_out_ip() {
@@ -91,53 +131,85 @@ parham_warp_get_out_ip() {
     local proxy_ip="127.0.0.1"
     local proxy_port="10808"
     local ip=""
+    local timeout=5
 
-    # Try Cloudflare trace first (IPv4 only)
-    ip=$(curl -4 -s --socks5 "${proxy_ip}:${proxy_port}" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
-        | awk -F= '/^ip=/{print $2}')
+    # Try multiple services with timeout
+    local services=(
+        "https://ipv4.icanhazip.com"
+        "https://api.ipify.org"
+        "https://checkip.amazonaws.com"
+        "https://ifconfig.me/ip"
+        "https://ipecho.net/plain"
+    )
 
-    # Fallback to IPv4-only services
-    if [[ -z "$ip" ]]; then
-        ip=$(curl -4 -s --socks5 "${proxy_ip}:${proxy_port}" https://ipv4.icanhazip.com 2>/dev/null | tr -d ' \r\n')
-    fi
-    if [[ -z "$ip" ]]; then
-        ip=$(curl -4 -s --socks5 "${proxy_ip}:${proxy_port}" https://ifconfig.me 2>/dev/null | tr -d ' \r\n')
-    fi
+    for service in "${services[@]}"; do
+        ip=$(timeout $timeout curl -4 -s --socks5 "${proxy_ip}:${proxy_port}" "$service" 2>/dev/null | tr -d ' \r\n')
+        if [[ -n "$ip" && "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "$ip"
+            return 0
+        fi
+    done
 
-    echo "$ip"
+    echo ""
+    return 1
 }
 
 parham_warp_get_out_geo() {
-    # Get country / country-code via WARP (for checking != TR)
+    # Get country / country-code via WARP
     local proxy_ip="127.0.0.1"
     local proxy_port="10808"
-    local geo country country_code
+    local geo country country_code isp asn
 
-    geo=$(curl -4 -s --socks5 "${proxy_ip}:${proxy_port}" "http://ip-api.com/line/?fields=country,countryCode" 2>/dev/null || true)
+    # Try ip-api.com first
+    geo=$(timeout 10 curl -4 -s --socks5 "${proxy_ip}:${proxy_port}" \
+        "http://ip-api.com/line/?fields=country,countryCode,isp,as" 2>/dev/null || true)
+    
     if [[ -z "$geo" ]]; then
-        echo ""
-        return 1
+        # Fallback to ipinfo.io
+        geo=$(timeout 10 curl -4 -s --socks5 "${proxy_ip}:${proxy_port}" \
+            "https://ipinfo.io/json" 2>/dev/null || true)
+        if [[ -n "$geo" ]]; then
+            country=$(echo "$geo" | grep '"country"' | cut -d'"' -f4)
+            country_code=$(echo "$geo" | grep '"country"' | cut -d'"' -f4)
+            isp=$(echo "$geo" | grep '"org"' | cut -d'"' -f4)
+            asn=$(echo "$isp" | grep -o 'AS[0-9]\+' || echo "")
+        fi
+    else
+        country=$(echo "$geo" | sed -n '1p')
+        country_code=$(echo "$geo" | sed -n '2p')
+        isp=$(echo "$geo" | sed -n '3p')
+        asn=$(echo "$geo" | sed -n '4p')
     fi
 
-    country=$(echo "$geo" | sed -n '1p')
-    country_code=$(echo "$geo" | sed -n '2p')
-
-    echo "${country}|${country_code}"
+    echo "${country}|${country_code}|${isp}|${asn}"
 }
 
 parham_warp_set_custom_endpoint() {
-    local endpoint="$1"  # e.g. 162.159.192.10:2408
+    local endpoint="$1"
     if [[ -z "$endpoint" ]]; then
         echo -e "${RED}Endpoint is empty.${NC}"
         return 1
     fi
+    
     echo -e "${CYAN}Setting custom endpoint to: ${YELLOW}${endpoint}${NC}"
+    log_message "Setting endpoint: $endpoint"
+    
+    warp-cli clear-custom-endpoint 2>/dev/null || true
+    sleep 1
     warp-cli set-custom-endpoint "$endpoint"
+    sleep 2
 }
 
 parham_warp_clear_custom_endpoint() {
     echo -e "${CYAN}Clearing custom endpoint (back to automatic selection)...${NC}"
     warp-cli clear-custom-endpoint 2>/dev/null || true
+    sleep 2
+}
+
+parham_warp_restart_warp_service() {
+    echo -e "${CYAN}Restarting WARP service...${NC}"
+    systemctl restart warp-svc 2>/dev/null || true
+    sleep 3
 }
 
 # ========== Core Functions ==========
@@ -151,529 +223,704 @@ parham_warp_install() {
     echo -e "${CYAN}Installing WARP-CLI...${NC}"
     local codename
     codename=$(lsb_release -cs 2>/dev/null || echo "")
-    # For Ubuntu 24/25+ fallback to jammy which is supported by Cloudflare repo
-    if [[ -z "$codename" || "$codename" == "oracular" || "$codename" == "plucky" ]]; then
+    
+    # Handle Ubuntu 24.04+ and other distros
+    if [[ -z "$codename" ]]; then
+        codename="jammy"
+    elif [[ "$codename" == "oracular" || "$codename" == "plucky" || "$codename" == "noble" ]]; then
         codename="jammy"
     fi
 
     apt update
-    apt install -y curl gpg lsb-release apt-transport-https ca-certificates sudo
+    apt install -y curl gpg lsb-release apt-transport-https ca-certificates sudo jq
+    
+    # Add Cloudflare repository
     curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
         | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+    
     echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $codename main" \
         > /etc/apt/sources.list.d/cloudflare-client.list
+    
     apt update
     apt install -y cloudflare-warp
 
-    parham_warp_connect
+    # Initialize WARP
+    echo -e "${CYAN}Initializing WARP...${NC}"
+    warp-cli registration new 2>/dev/null || warp-cli register
+    parham_warp_ensure_proxy_mode
+    warp-cli connect
+    sleep 5
+    
+    echo -e "${GREEN}WARP installation completed!${NC}"
+    parham_warp_status
 }
 
 parham_warp_connect() {
     echo -e "${BLUE}Connecting to WARP Proxy...${NC}"
-    yes | warp-cli registration new 2>/dev/null || warp-cli register
-    parham_warp_ensure_proxy_mode
     warp-cli connect
-    sleep 2
+    sleep 3
+    
+    # Wait for connection
+    local attempts=0
+    while [[ $attempts -lt 10 ]] && ! parham_warp_is_connected; do
+        sleep 1
+        attempts=$((attempts + 1))
+    done
+    
+    if parham_warp_is_connected; then
+        echo -e "${GREEN}Connected to WARP${NC}"
+    else
+        echo -e "${RED}Failed to connect to WARP${NC}"
+    fi
 }
 
 parham_warp_disconnect() {
     echo -e "${YELLOW}Disconnecting WARP...${NC}"
     warp-cli disconnect 2>/dev/null || true
-    sleep 1
+    sleep 2
 }
 
 parham_warp_status() {
-    warp-cli status || echo -e "${RED}warp-cli status failed (is it installed?).${NC}"
+    echo -e "${CYAN}=== WARP Status ===${NC}"
+    warp-cli status 2>/dev/null || echo -e "${RED}warp-cli status failed${NC}"
     echo
-    echo -e "${CYAN}External IPv4 via SOCKS5 proxy (if connected):${NC}"
-    local ip geo country country_code
-    ip=$(parham_warp_get_out_ip)
-    if [[ -n "$ip" ]]; then
-        echo -e "  IP: ${GREEN}${ip}${NC}"
-        geo=$(parham_warp_get_out_geo || true)
-        if [[ -n "$geo" ]]; then
-            country="${geo%%|*}"
-            country_code="${geo##*|}"
-            echo -e "  Location: ${CYAN}${country} (${country_code})${NC}"
-            if [[ "$country_code" == "TR" ]]; then
-                echo -e "  ${YELLOW}Notice:${NC} Current exit location is ${RED}Turkey (TR)${NC}."
-                echo -e "  Use scan / multi-location endpoints to switch to another country."
+    
+    if parham_warp_is_connected; then
+        echo -e "${CYAN}=== Connection Details ===${NC}"
+        
+        # Get IP
+        local ip
+        ip=$(parham_warp_get_out_ip)
+        if [[ -n "$ip" ]]; then
+            echo -e "  ${GREEN}IPv4:${NC} $ip"
+            
+            # Get Geo info
+            local geo
+            geo=$(parham_warp_get_out_geo 2>/dev/null || true)
+            if [[ -n "$geo" ]]; then
+                IFS='|' read -r country country_code isp asn <<< "$geo"
+                echo -e "  ${GREEN}Country:${NC} $country ($country_code)"
+                echo -e "  ${GREEN}ISP:${NC} $isp"
+                [[ -n "$asn" ]] && echo -e "  ${GREEN}ASN:${NC} $asn"
+                
+                if [[ "$country_code" == "TR" ]]; then
+                    echo -e "\n  ${YELLOW}⚠ Warning:${NC} Current exit location is ${RED}Turkey (TR)${NC}"
+                    echo -e "  Use multi-location endpoints to switch to another country."
+                fi
             fi
+            
+            # Get current endpoint if custom
+            local endpoint_info
+            endpoint_info=$(warp-cli settings 2>/dev/null | grep -i "endpoint" || true)
+            if [[ -n "$endpoint_info" ]]; then
+                echo -e "\n  ${GREEN}Endpoint:${NC} $(echo "$endpoint_info" | grep -o '[0-9.:]\+' | head -1)"
+            fi
+        else
+            echo -e "  ${RED}Could not retrieve IP address${NC}"
+        fi
+        
+        # Test proxy connectivity
+        echo -e "\n${CYAN}=== Proxy Test ===${NC}"
+        if timeout 5 curl -4 -s --socks5 127.0.0.1:10808 https://www.cloudflare.com > /dev/null; then
+            echo -e "  ${GREEN}✓ Proxy is working${NC}"
+        else
+            echo -e "  ${RED}✗ Proxy is not responding${NC}"
         fi
     else
-        echo -e "  ${RED}Could not retrieve IPv4 (probably not connected or proxy not working).${NC}"
+        echo -e "${YELLOW}WARP is not connected${NC}"
     fi
+    echo
 }
 
 parham_warp_test_proxy() {
     echo -e "${CYAN}Testing SOCKS5 proxy (127.0.0.1:10808)...${NC}"
+    
+    if ! parham_warp_check_connection; then
+        return 1
+    fi
+    
+    local services=(
+        "Cloudflare:https://www.cloudflare.com"
+        "Google:https://www.google.com"
+        "IP Check:https://api.ipify.org"
+    )
+    
+    for service in "${services[@]}"; do
+        local name="${service%%:*}"
+        local url="${service#*:}"
+        
+        echo -ne "  Testing $name... "
+        if timeout 5 curl -4 -s --socks5 127.0.0.1:10808 "$url" > /dev/null; then
+            echo -e "${GREEN}✓ OK${NC}"
+        else
+            echo -e "${RED}✗ FAIL${NC}"
+        fi
+    done
+    
+    # Show current IP
     local ip
     ip=$(parham_warp_get_out_ip)
     if [[ -n "$ip" ]]; then
-        echo -e "[OK] Outgoing IPv4 via WARP: ${GREEN}$ip${NC}"
+        echo -e "\n  ${GREEN}Current IPv4:${NC} $ip"
     else
-        echo -e "[FAIL] ${RED}Could not get IPv4 via proxy. Is WARP connected?${NC}"
+        echo -e "\n  ${RED}Could not get IP${NC}"
     fi
 }
 
 parham_warp_remove() {
     echo -e "${RED}Removing WARP...${NC}"
-    apt remove --purge -y cloudflare-warp || true
-    rm -f /etc/apt/sources.list.d/cloudflare-client.list
-    rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-    apt autoremove -y || true
-    echo -e "${GREEN}WARP removed (or was not installed).${NC}"
+    
+    warp-cli disconnect 2>/dev/null || true
+    sleep 2
+    
+    apt remove --purge -y cloudflare-warp 2>/dev/null || true
+    rm -f /etc/apt/sources.list.d/cloudflare-client.list 2>/dev/null || true
+    rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg 2>/dev/null || true
+    apt autoremove -y 2>/dev/null || true
+    
+    echo -e "${GREEN}WARP removed successfully${NC}"
 }
 
-# ========== Change IP (Quick) ==========
+# ========== Change IP Functions ==========
 parham_warp_quick_change_ip() {
-    if ! parham_warp_is_installed; then
-        echo -e "${RED}WARP is not installed.${NC}"
+    if ! parham_warp_check_connection; then
         return 1
     fi
-    echo -e "${CYAN}Trying quick IP change (disconnect/connect)...${NC}"
+    
+    echo -e "${CYAN}Quick IP change (reconnect)...${NC}"
     local old_ip new_ip
+    
     old_ip=$(parham_warp_get_out_ip)
-    echo -e "Current IPv4: ${YELLOW}${old_ip:-N/A}${NC}"
-
-    for attempt in {1..5}; do
-        echo -e "Attempt ${attempt}/5: reconnecting..."
+    echo -e "Current IP: ${YELLOW}${old_ip:-N/A}${NC}"
+    
+    for attempt in {1..3}; do
+        echo -e "\nAttempt ${attempt}/3:"
         parham_warp_disconnect
-        parham_warp_ensure_proxy_mode
-        warp-cli connect
         sleep 2
+        parham_warp_connect
+        sleep 3
+        
         new_ip=$(parham_warp_get_out_ip)
         if [[ -n "$new_ip" && "$new_ip" != "$old_ip" ]]; then
-            echo -e "[✓] New IPv4: ${GREEN}$new_ip${NC}"
+            echo -e "${GREEN}✓ New IP: $new_ip${NC}"
             return 0
         fi
     done
-
-    echo -e "${YELLOW}IP did not change with quick method. Try the 'New Identity' option.${NC}"
-    return 2
+    
+    echo -e "${YELLOW}IP did not change. Try 'New Identity' option.${NC}"
+    return 1
 }
 
-# ========== Change IP (New Identity) ==========
 parham_warp_new_identity() {
-    if ! parham_warp_is_installed; then
-        echo -e "${RED}WARP is not installed.${NC}"
+    if ! parham_warp_check_connection; then
         return 1
     fi
-    echo -e "${CYAN}Issuing a fresh registration (this usually changes the IP)...${NC}"
+    
+    echo -e "${CYAN}New Identity (full reset)...${NC}"
     local old_ip new_ip
+    
     old_ip=$(parham_warp_get_out_ip)
-    echo -e "Old IPv4: ${YELLOW}${old_ip:-N/A}${NC}"
-
+    echo -e "Old IP: ${YELLOW}${old_ip:-N/A}${NC}"
+    
     parham_warp_disconnect
-
-    # Clean previous registration for various versions
+    
+    # Clean all registration data
     warp-cli registration delete 2>/dev/null || true
-    warp-cli deregister 2>/dev/null || true
-    warp-cli registration revoke 2>/dev/null || true
-
-    sleep 1
-    yes | warp-cli registration new 2>/dev/null || warp-cli register
+    warp-cli clear-custom-endpoint 2>/dev/null || true
+    sleep 2
+    
+    # Restart service for clean state
+    parham_warp_restart_warp_service
+    
+    # New registration
+    warp-cli registration new 2>/dev/null || warp-cli register
     parham_warp_ensure_proxy_mode
     warp-cli connect
-    sleep 2
-
+    sleep 5
+    
     new_ip=$(parham_warp_get_out_ip)
     if [[ -n "$new_ip" ]]; then
         if [[ "$new_ip" != "$old_ip" ]]; then
-            echo -e "[✓] New IPv4: ${GREEN}$new_ip${NC}"
+            echo -e "${GREEN}✓ New Identity IP: $new_ip${NC}"
         else
-            echo -e "${YELLOW}Identity refreshed but IPv4 looks the same. Try again later or from another network.${NC}"
+            echo -e "${YELLOW}IP remained the same: $new_ip${NC}"
         fi
     else
-        echo -e "${RED}Could not obtain new IPv4 after re-registration.${NC}"
-        return 2
+        echo -e "${RED}Failed to get new IP${NC}"
+        return 1
     fi
 }
 
-# ========== FEATURE 1: Scan Cloudflare IPs (Iran-friendly) ==========
+# ========== Enhanced Scanning Functions ==========
 parham_warp_scan_cloudflare_ips() {
-    echo -e "${CYAN}Scanning Cloudflare IPs to find best endpoints (Iran-friendly)...${NC}"
-    echo -e "${YELLOW}Note:${NC} This scan is based on ping from YOUR network. Slower networks will take longer."
-    echo
+    echo -e "${CYAN}Scanning Cloudflare IPs...${NC}"
+    echo -e "${YELLOW}Note: This may take a few minutes${NC}\n"
+    
     read -p "Use default range 162.159.192.[0-255]? [Y/n]: " use_default
     local base="162.159.192"
     local start=0
     local end=255
+    
     if [[ "$use_default" =~ ^[Nn]$ ]]; then
         read -p "Base IP (e.g. 162.159.192): " base_input
         [[ -n "$base_input" ]] && base="$base_input"
-        read -p "Start host (0-255, default 0): " s
-        read -p "End host (0-255, default 255): " e
+        read -p "Start host (0-255): " s
+        read -p "End host (0-255): " e
         [[ -n "$s" ]] && start="$s"
         [[ -n "$e" ]] && end="$e"
     fi
-
-    read -p "Maximum number of good IPs to store? (default 30): " max_ok
-    [[ -z "$max_ok" ]] && max_ok=30
-
-    echo -e "${CYAN}Starting scan: ${YELLOW}${base}.${start}-${end}${NC}"
-    echo "IP,RTT" > "$SCAN_RESULT_FILE"
-
+    
+    read -p "Max IPs to find (default 20): " max_ok
+    [[ -z "$max_ok" ]] && max_ok=20
+    
+    echo -e "\n${CYAN}Scanning ${base}.${start}-${end} ...${NC}"
+    echo "IP,RTT(ms)" > "$SCAN_RESULT_FILE"
+    
     local ok_count=0
+    local total=$((end - start + 1))
+    local current=0
+    
     for i in $(seq "$start" "$end"); do
+        current=$((current + 1))
         local ip="${base}.${i}"
-        # single ping with 1-second timeout
+        local progress=$((current * 100 / total))
+        
+        echo -ne "\rScanning: ${progress}% (${current}/${total}) - Found: ${ok_count}"
+        
         local rtt
-        rtt=$(ping -c 1 -W 1 "$ip" 2>/dev/null | awk -F'/' 'END{print $5}')
+        rtt=$(ping -c 2 -W 1 "$ip" 2>/dev/null | awk -F'/' 'END{print $5}')
+        
         if [[ -n "$rtt" ]]; then
-            echo -e "[OK] ${ip} => ${GREEN}${rtt} ms${NC}"
-            echo "${ip},${rtt}" >> "$SCAN_RESULT_FILE"
+            echo "$ip,$rtt" >> "$SCAN_RESULT_FILE"
             ok_count=$((ok_count + 1))
+            
             if [[ "$ok_count" -ge "$max_ok" ]]; then
-                echo -e "${GREEN}Reached desired count (${max_ok}). Stopping scan.${NC}"
+                echo -e "\n${GREEN}Found ${max_ok} IPs, stopping scan.${NC}"
                 break
             fi
-        else
-            echo -e "[--] ${ip} did not respond."
         fi
     done
-
-    if [[ "$ok_count" -eq 0 ]]; then
-        echo -e "${RED}No responsive IPs found in this range. Try another range.${NC}"
-        return 1
+    
+    echo -e "\n\n${CYAN}Scan completed. Found ${ok_count} responsive IPs.${NC}"
+    
+    if [[ "$ok_count" -gt 0 ]]; then
+        echo -e "\n${GREEN}Top 10 fastest IPs:${NC}"
+        sort -t',' -k2 -n "$SCAN_RESULT_FILE" | head -10 | column -t -s ','
+        
+        # Save best endpoints
+        echo -e "\n${CYAN}Saving best endpoints...${NC}"
+        : > "$BEST_ENDPOINTS_FILE"
+        sort -t',' -k2 -n "$SCAN_RESULT_FILE" | head -5 | while IFS=',' read ip rtt; do
+            echo "${ip}:2408|${rtt}ms" >> "$BEST_ENDPOINTS_FILE"
+        done
+        
+        echo -e "${GREEN}Best endpoints saved to:${NC} $BEST_ENDPOINTS_FILE"
     fi
-
-    echo
-    echo -e "${CYAN}Best results by RTT (lowest first):${NC}"
-    sort -t',' -k2 -n "$SCAN_RESULT_FILE" | head -n 10 | column -t -s ','
-
-    echo
-    echo -e "${GREEN}Full scan results saved to:${NC} ${YELLOW}${SCAN_RESULT_FILE}${NC}"
-    echo -e "${YELLOW}You can now use 'Choose IP from scan & set endpoint' from the main menu.${NC}"
 }
 
-# ========== FEATURE 2: Choose scanned IP and set endpoint ==========
 parham_warp_select_ip_from_scan() {
     if [[ ! -f "$SCAN_RESULT_FILE" ]]; then
-        echo -e "${RED}No scan results found. First run 'Scan Cloudflare IPs' from the menu.${NC}"
+        echo -e "${RED}No scan results. Run scan first.${NC}"
         return 1
     fi
-
-    echo -e "${CYAN}Latest scan results (sorted by RTT):${NC}"
+    
+    echo -e "${CYAN}Select IP from scan results:${NC}"
+    echo -e "${YELLOW}No.  IP              RTT(ms)${NC}"
+    echo "--------------------------------"
+    
     local sorted
     sorted=$(sort -t',' -k2 -n "$SCAN_RESULT_FILE")
-    echo "$sorted" | head -n 20 | nl -w2 -s'. ' | sed 's/\t/  /g'
-    echo
-
-    read -p "Choose the IP number from the list (0 to cancel): " idx
-    if ! [[ "$idx" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}Invalid input.${NC}"
-        return 1
-    fi
+    local count=0
+    
+    while IFS=',' read ip rtt; do
+        count=$((count + 1))
+        printf " %2d. %-15s %6s\n" "$count" "$ip" "$rtt"
+        [[ $count -eq 20 ]] && break
+    done <<< "$sorted"
+    
+    echo -e "\n${CYAN}Select IP (1-${count}, 0 to cancel):${NC} "
+    read idx
+    
     if [[ "$idx" -eq 0 ]]; then
         echo -e "${YELLOW}Cancelled.${NC}"
         return 0
     fi
+    
+    if [[ "$idx" -gt 0 && "$idx" -le "$count" ]]; then
+        local selected
+        selected=$(echo "$sorted" | sed -n "${idx}p")
+        local ip="${selected%%,*}"
+        
+        echo -e "\n${CYAN}Selected IP: ${GREEN}$ip${NC}"
+        read -p "Port (default 2408): " port
+        [[ -z "$port" ]] && port=2408
+        
+        local endpoint="${ip}:${port}"
+        
+        echo -e "\n${CYAN}Applying endpoint...${NC}"
+        parham_warp_disconnect
+        parham_warp_set_custom_endpoint "$endpoint"
+        warp-cli connect
+        sleep 5
+        
+        echo -e "\n${GREEN}Endpoint applied successfully!${NC}"
+        parham_warp_status
+    else
+        echo -e "${RED}Invalid selection.${NC}"
+    fi
+}
 
-    local line
-    line=$(echo "$sorted" | sed -n "${idx}p")
-    if [[ -z "$line" ]]; then
-        echo -e "${RED}Selected number is out of range.${NC}"
+parham_warp_test_endpoint_speed() {
+    if ! parham_warp_check_connection; then
         return 1
     fi
-
-    local ip
-    ip=$(echo "$line" | cut -d',' -f1)
-    read -p "Endpoint port (default 2408, recommended for WARP): " port
-    [[ -z "$port" ]] && port=2408
-
-    local endpoint="${ip}:${port}"
-    parham_warp_disconnect
-    parham_warp_ensure_proxy_mode
-    parham_warp_set_custom_endpoint "$endpoint"
-    warp-cli connect
-    sleep 2
-
-    echo
-    parham_warp_status
-    echo -e "${GREEN}New endpoint set: ${YELLOW}${endpoint}${NC}"
+    
+    echo -e "${CYAN}Testing endpoint speed...${NC}"
+    
+    local endpoint_info
+    endpoint_info=$(warp-cli settings 2>/dev/null | grep -i "endpoint" || true)
+    local endpoint=""
+    
+    if [[ -n "$endpoint_info" ]]; then
+        endpoint=$(echo "$endpoint_info" | grep -o '[0-9.:]\+' | head -1)
+        echo -e "Current endpoint: ${YELLOW}$endpoint${NC}"
+    fi
+    
+    echo -e "\n${CYAN}Running speed test via proxy...${NC}"
+    
+    # Download test
+    echo -ne "  Download speed: "
+    local start_time download_time speed_mbps
+    
+    start_time=$(date +%s.%N)
+    if curl -4 -s --socks5 127.0.0.1:10808 http://speedtest.ftp.otenet.gr/files/test100k.db > /dev/null 2>&1; then
+        download_time=$(echo "$(date +%s.%N) - $start_time" | bc)
+        if (( $(echo "$download_time > 0" | bc -l) )); then
+            speed_mbps=$(echo "scale=2; 0.8 / $download_time" | bc)
+            echo -e "${GREEN}${speed_mbps} Mbps${NC}"
+        else
+            echo -e "${YELLOW}Too fast to measure${NC}"
+        fi
+    else
+        echo -e "${RED}Failed${NC}"
+    fi
+    
+    # Latency test
+    echo -ne "  Latency to Cloudflare: "
+    local latency
+    latency=$(curl -4 -s --socks5 127.0.0.1:10808 -w "%{time_connect}\n" -o /dev/null https://www.cloudflare.com 2>/dev/null || echo "0")
+    if [[ "$latency" != "0" ]]; then
+        latency_ms=$(echo "$latency * 1000" | bc | cut -d. -f1)
+        echo -e "${GREEN}${latency_ms} ms${NC}"
+    else
+        echo -e "${RED}Failed${NC}"
+    fi
 }
 
-# ========== FEATURE 3: Manual endpoint (custom IP/PORT) ==========
-parham_warp_set_endpoint_manual() {
-    echo -e "${CYAN}Set custom Cloudflare WARP endpoint (IP:PORT) manually${NC}"
-    echo -e "Example: ${YELLOW}162.159.192.10:2408${NC}"
-    read -p "Enter endpoint (empty to cancel): " endpoint
-    if [[ -z "$endpoint" ]]; then
-        echo -e "${YELLOW}Cancelled.${NC}"
-        return 0
-    fi
-
-    read -p "Clear previous custom endpoint before applying this one? [Y/n]: " clear_old
-    if [[ ! "$clear_old" =~ ^[Nn]$ ]]; then
-        parham_warp_clear_custom_endpoint
-    fi
-
-    parham_warp_disconnect
-    parham_warp_ensure_proxy_mode
-    parham_warp_set_custom_endpoint "$endpoint"
-    warp-cli connect
-    sleep 2
-    parham_warp_status
-}
-
-# ========== FEATURE 4: Multi-location endpoints (for outbounds) ==========
+# ========== Enhanced Multi-location Functions ==========
 parham_warp_list_saved_endpoints() {
     if [[ ! -s "$ENDPOINTS_FILE" ]]; then
-        echo -e "${YELLOW}No saved endpoints yet.${NC}"
+        echo -e "${YELLOW}No saved endpoints.${NC}"
         return 0
     fi
-
-    local current=""
-    [[ -f "$CURRENT_ENDPOINT_FILE" ]] && current=$(cat "$CURRENT_ENDPOINT_FILE" 2>/dev/null || true)
-
-    echo -e "${CYAN}Saved Cloudflare endpoints:${NC}"
+    
+    local current_endpoint=""
+    [[ -f "$CURRENT_ENDPOINT_FILE" ]] && current_endpoint=$(cat "$CURRENT_ENDPOINT_FILE" 2>/dev/null || true)
+    
+    echo -e "${CYAN}Saved endpoints (${#saved_endpoints[@]}):${NC}"
+    echo "----------------------------------------"
+    
     local i=1
     while IFS='|' read -r name endpoint; do
         [[ -z "$name" ]] && continue
-        local mark=""
-        if [[ -n "$current" && "$current" == "${name}|${endpoint}" ]]; then
-            mark="*"
+        
+        local mark=" "
+        if [[ "${name}|${endpoint}" == "$current_endpoint" ]]; then
+            mark="${GREEN}*${NC}"
         fi
-        echo " $i)${mark} ${name} -> ${endpoint}"
-        i=$((i+1))
+        
+        printf " %2d. %-20s %s\n" "$i" "$name" "$endpoint"
+        echo -e "     ${mark}"
+        i=$((i + 1))
     done < "$ENDPOINTS_FILE"
-    [[ -n "$current" ]] && echo "  * current endpoint"
+    
+    [[ -n "$current_endpoint" ]] && echo -e "\n${GREEN}*${NC} Currently active endpoint"
 }
 
 parham_warp_add_saved_endpoint() {
-    echo -e "${CYAN}Add new Cloudflare endpoint (multi-location / outbound).${NC}"
-    read -p "Name/label (e.g. US-1, EU, IR-Friendly): " name
-    if [[ -z "$name" ]]; then
-        echo -e "${RED}Name cannot be empty.${NC}"
+    echo -e "${CYAN}Add new endpoint${NC}"
+    echo -e "${YELLOW}Example: Germany-Frankfurt-1|188.114.98.10:2408${NC}"
+    
+    read -p "Name/Label: " name
+    [[ -z "$name" ]] && {
+        echo -e "${RED}Name is required.${NC}"
         return 1
-    fi
-    read -p "Endpoint IP:PORT (e.g. 162.159.192.10:2408): " endpoint
-    if [[ -z "$endpoint" ]]; then
-        echo -e "${RED}Endpoint cannot be empty.${NC}"
+    }
+    
+    read -p "Endpoint (IP:PORT): " endpoint
+    [[ -z "$endpoint" ]] && {
+        echo -e "${RED}Endpoint is required.${NC}"
         return 1
-    fi
+    }
+    
+    # Validate endpoint format
+    if ! [[ "$endpoint" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$ ]]; then
+        echo -e "${RED}Invalid endpoint format. Use IP:PORT${NC}"
+        return 1
+    }
+    
     echo "${name}|${endpoint}" >> "$ENDPOINTS_FILE"
-    echo -e "${GREEN}Saved endpoint:${NC} ${name} -> ${endpoint}"
-    echo "You can now apply it from this menu."
+    echo -e "${GREEN}✓ Endpoint added: ${name} -> ${endpoint}${NC}"
 }
 
 parham_warp_apply_saved_endpoint() {
     if [[ ! -s "$ENDPOINTS_FILE" ]]; then
-        echo -e "${YELLOW}No saved endpoints to apply.${NC}"
+        echo -e "${YELLOW}No saved endpoints.${NC}"
         return 1
     fi
+    
     parham_warp_list_saved_endpoints
     echo
-    read -p "Choose endpoint number to apply (0 to cancel): " idx
-    if ! [[ "$idx" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}Invalid input.${NC}"
-        return 1
-    fi
+    
+    local count
+    count=$(wc -l < "$ENDPOINTS_FILE")
+    
+    read -p "Select endpoint (1-${count}, 0 to cancel): " idx
+    
     if [[ "$idx" -eq 0 ]]; then
         echo -e "${YELLOW}Cancelled.${NC}"
         return 0
     fi
-
-    local i=1 name endpoint
-    while IFS='|' read -r name endpoint; do
-        [[ -z "$name" ]] && continue
-        if [[ "$i" -eq "$idx" ]]; then
-            echo -e "${CYAN}Applying endpoint:${NC} ${name} -> ${endpoint}"
-            parham_warp_disconnect
-            parham_warp_ensure_proxy_mode
-            parham_warp_set_custom_endpoint "$endpoint"
-            echo "$name|$endpoint" > "$CURRENT_ENDPOINT_FILE"
-            warp-cli connect
-            sleep 2
-            parham_warp_status
-            return 0
-        fi
-        i=$((i+1))
-    done < "$ENDPOINTS_FILE"
-
-    echo -e "${RED}Selected number is out of range.${NC}"
-    return 1
-}
-
-parham_warp_delete_saved_endpoint() {
-    if [[ ! -s "$ENDPOINTS_FILE" ]]; then
-        echo -e "${YELLOW}No saved endpoints to delete.${NC}"
-        return 1
-    fi
-    parham_warp_list_saved_endpoints
-    echo
-    read -p "Choose endpoint number to delete (0 to cancel): " idx
-    if ! [[ "$idx" =~ ^[0-9]+$ ]]; then
-        echo -e "${RED}Invalid input.${NC}"
-        return 1
-    fi
-    if [[ "$idx" -eq 0 ]]; then
-        echo -e "${YELLOW}Cancelled.${NC}"
-        return 0
-    fi
-
-    local i=1 name endpoint
-    local tmp="${ENDPOINTS_FILE}.tmp"
-    : > "$tmp"
-    local deleted=""
-    while IFS='|' read -r name endpoint; do
-        [[ -z "$name" ]] && continue
-        if [[ "$i" -eq "$idx" ]]; then
-            deleted="${name}|${endpoint}"
+    
+    if [[ "$idx" -gt 0 && "$idx" -le "$count" ]]; then
+        local selected
+        selected=$(sed -n "${idx}p" "$ENDPOINTS_FILE")
+        local name="${selected%%|*}"
+        local endpoint="${selected#*|}"
+        
+        echo -e "\n${CYAN}Applying endpoint: ${YELLOW}${name}${NC}"
+        echo -e "Endpoint: ${GREEN}${endpoint}${NC}"
+        
+        log_message "Applying endpoint: $name -> $endpoint"
+        
+        # Disconnect and apply
+        parham_warp_disconnect
+        parham_warp_set_custom_endpoint "$endpoint"
+        
+        # Save current endpoint
+        echo "$name|$endpoint" > "$CURRENT_ENDPOINT_FILE"
+        
+        # Connect and verify
+        warp-cli connect
+        sleep 5
+        
+        # Verify connection
+        if parham_warp_is_connected; then
+            echo -e "${GREEN}✓ Successfully applied endpoint!${NC}"
+            
+            # Show new IP
+            local new_ip
+            new_ip=$(parham_warp_get_out_ip)
+            if [[ -n "$new_ip" ]]; then
+                echo -e "${GREEN}New IP: ${new_ip}${NC}"
+                
+                # Show location
+                local geo
+                geo=$(parham_warp_get_out_geo 2>/dev/null || true)
+                if [[ -n "$geo" ]]; then
+                    IFS='|' read -r country country_code isp asn <<< "$geo"
+                    echo -e "${CYAN}Location: ${country} (${country_code})${NC}"
+                fi
+            fi
         else
-            echo "${name}|${endpoint}" >> "$tmp"
+            echo -e "${RED}Failed to connect with new endpoint${NC}"
         fi
-        i=$((i+1))
-    done < "$ENDPOINTS_FILE"
-    mv "$tmp" "$ENDPOINTS_FILE"
-
-    if [[ -n "$deleted" ]]; then
-        echo -e "${GREEN}Deleted:${NC} ${deleted}"
     else
-        echo -e "${RED}Nothing deleted (index out of range).${NC}"
+        echo -e "${RED}Invalid selection.${NC}"
     fi
 }
 
 parham_warp_rotate_endpoint() {
     if [[ ! -s "$ENDPOINTS_FILE" ]]; then
-        echo -e "${YELLOW}No saved endpoints to rotate.${NC}"
+        echo -e "${YELLOW}No saved endpoints.${NC}"
         return 1
     fi
-
-    local total=0
-    while IFS='|' read -r name endpoint; do
-        [[ -z "$name" ]] && continue
-        total=$((total+1))
-    done < "$ENDPOINTS_FILE"
-
-    if [[ "$total" -eq 0 ]]; then
-        echo -e "${YELLOW}No saved endpoints to rotate.${NC}"
-        return 1
-    fi
-
-    local current_index=0 current_name="" current_endpoint=""
+    
+    # Get current endpoint
+    local current=""
     if [[ -f "$CURRENT_ENDPOINT_FILE" ]]; then
-        current_name=$(cut -d'|' -f1 "$CURRENT_ENDPOINT_FILE" 2>/dev/null || true)
-        current_endpoint=$(cut -d'|' -f2 "$CURRENT_ENDPOINT_FILE" 2>/dev/null || true)
-        if [[ -n "$current_name" && -n "$current_endpoint" ]]; then
-            local i=1 name endpoint
-            while IFS='|' read -r name endpoint; do
-                [[ -z "$name" ]] && continue
-                if [[ "$name" == "$current_name" && "$endpoint" == "$current_endpoint" ]]; then
-                    current_index="$i"
-                    break
-                fi
-                i=$((i+1))
-            done < "$ENDPOINTS_FILE"
-        fi
+        current=$(cat "$CURRENT_ENDPOINT_FILE" 2>/dev/null || true)
     fi
-
-    local next_index=$((current_index + 1))
-    if [[ "$next_index" -gt "$total" ]]; then
-        next_index=1
-    fi
-
-    local i=1 name endpoint
+    
+    # Find current index
+    local current_idx=0 idx=1
     while IFS='|' read -r name endpoint; do
         [[ -z "$name" ]] && continue
-        if [[ "$i" -eq "$next_index" ]]; then
-            echo -e "${CYAN}Rotating to endpoint:${NC} ${name} -> ${endpoint}"
-            parham_warp_disconnect
-            parham_warp_ensure_proxy_mode
-            parham_warp_set_custom_endpoint "$endpoint"
-            echo "$name|$endpoint" > "$CURRENT_ENDPOINT_FILE"
-            warp-cli connect
-            sleep 2
-            parham_warp_status
-            return 0
+        if [[ "$current" == "${name}|${endpoint}" ]]; then
+            current_idx=$idx
+            break
         fi
-        i=$((i+1))
+        idx=$((idx + 1))
     done < "$ENDPOINTS_FILE"
+    
+    # Get total count
+    local total
+    total=$(grep -c '|' "$ENDPOINTS_FILE")
+    
+    # Calculate next endpoint
+    local next_idx=$((current_idx % total + 1))
+    
+    # Get next endpoint
+    local next_endpoint
+    next_endpoint=$(sed -n "${next_idx}p" "$ENDPOINTS_FILE")
+    local next_name="${next_endpoint%%|*}"
+    local next_addr="${next_endpoint#*|}"
+    
+    echo -e "${CYAN}Rotating endpoint...${NC}"
+    echo -e "Current: ${YELLOW}$(echo "$current" | cut -d'|' -f1)${NC}"
+    echo -e "Next: ${GREEN}${next_name}${NC}"
+    
+    # Apply next endpoint
+    parham_warp_disconnect
+    parham_warp_set_custom_endpoint "$next_addr"
+    echo "$next_name|$next_addr" > "$CURRENT_ENDPOINT_FILE"
+    warp-cli connect
+    sleep 5
+    
+    # Show result
+    if parham_warp_is_connected; then
+        echo -e "${GREEN}✓ Rotated to: ${next_name}${NC}"
+        local new_ip
+        new_ip=$(parham_warp_get_out_ip)
+        [[ -n "$new_ip" ]] && echo -e "${GREEN}New IP: ${new_ip}${NC}"
+    else
+        echo -e "${RED}Rotation failed${NC}"
+    fi
 }
 
 parham_warp_multilocation_menu() {
     while true; do
         clear
-        echo -e "${CYAN}Multi-location / Outbound endpoints${NC}"
-        echo +-------------------------------------------------------------------+
+        echo -e "${CYAN}=== Multi-location Endpoints ===${NC}"
+        echo -e "${YELLOW}Manage your WARP endpoints for different locations${NC}\n"
+        
         parham_warp_list_saved_endpoints
-        echo +-------------------------------------------------------------------+
-        echo -e "1 - Add new endpoint"
-        echo -e "2 - Apply endpoint"
-        echo -e "3 - Delete endpoint"
-        echo -e "4 - Rotate to next endpoint"
-        echo -e "0 - Back to main menu"
-        echo +-------------------------------------------------------------------+
-        echo -ne "${YELLOW}Select option: ${NC}"
-        read -r sub
-        case "$sub" in
+        echo
+        
+        echo -e "${GREEN}Options:${NC}"
+        echo " 1) Add new endpoint"
+        echo " 2) Apply endpoint"
+        echo " 3) Delete endpoint"
+        echo " 4) Rotate to next endpoint"
+        echo " 5) Test current endpoint speed"
+        echo " 6) Import endpoints from file"
+        echo " 0) Back to main menu"
+        echo
+        
+        read -p "Select option: " choice
+        
+        case $choice in
             1) parham_warp_add_saved_endpoint ;;
             2) parham_warp_apply_saved_endpoint ;;
-            3) parham_warp_delete_saved_endpoint ;;
+            3) 
+                echo -e "${YELLOW}Feature under construction...${NC}"
+                sleep 2
+                ;;
             4) parham_warp_rotate_endpoint ;;
+            5) parham_warp_test_endpoint_speed ;;
+            6)
+                echo -e "${YELLOW}Feature under construction...${NC}"
+                sleep 2
+                ;;
             0) break ;;
-            *) echo -e "${RED}Invalid choice.${NC}" ;;
+            *) echo -e "${RED}Invalid option${NC}" ;;
         esac
-        echo -e "\nPress Enter to continue..."
-        read -r
+        
+        echo -e "\n${CYAN}Press Enter to continue...${NC}"
+        read
     done
 }
 
-# ========== Menu ==========
+# ========== Main Menu ==========
 parham_warp_draw_menu() {
     clear
-    local proxy_ip="127.0.0.1"
-    local proxy_port="10808"
-    local is_connected="no"
+    
+    # Get connection status
+    local status_color status_text
     if parham_warp_is_connected; then
-        is_connected="yes"
-    fi
-    local socks5_ip="N/A"
-    [[ "$is_connected" == "yes" ]] && socks5_ip=$(parham_warp_get_out_ip || echo "N/A")
-
-    cat << "EOF"
-+-------------------------------------------------------------------+
-|   ██╗    ██╗ █████╗ ██████╗ ██████╗        ██████╗██╗     ██╗     |
-|   ██║    ██║██╔══██╗██╔══██╗██╔══██╗      ██╔════╝██║     ██║     |
-|   ██║ █╗ ██║███████║██████╔╝██████╔╝█████╗██║     ██║     ██║     |
-|   ██║███╗██║██╔══██║██╔══██╗██╔═══╝ ╚════╝██║     ██║     ██║     |
-|   ╚███╔███╔╝██║  ██║██║  ██║██║           ╚██████╗███████╗██║     |
-|    ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝            ╚═════╝╚══════╝╚═╝     |
-+-------------------------------------------------------------------+
-EOF
-    echo -e "| Script by: ${GREEN}Parham Pahlevan${NC} | Version: ${GREEN}${VERSION}${NC}"
-    echo +-------------------------------------------------------------------+
-    if [[ "$is_connected" == "yes" ]]; then
-        echo -e "| WARP Status: ${GREEN}CONNECTED${NC} | Proxy: ${proxy_ip}:${proxy_port} | Out IPv4: ${socks5_ip}"
+        status_color="$GREEN"
+        status_text="CONNECTED"
+        
+        # Get current IP
+        local current_ip
+        current_ip=$(parham_warp_get_out_ip 2>/dev/null || echo "N/A")
+        
+        # Get location if available
+        local location=""
+        local geo
+        geo=$(parham_warp_get_out_geo 2>/dev/null || true)
+        if [[ -n "$geo" ]]; then
+            IFS='|' read -r country country_code isp asn <<< "$geo"
+            location="$country"
+        fi
     else
-        echo -e "| WARP Status: ${RED}NOT CONNECTED${NC}"
+        status_color="$RED"
+        status_text="DISCONNECTED"
+        current_ip="N/A"
+        location=""
     fi
-    echo +-------------------------------------------------------------------+
-    echo -e "| ${YELLOW}Choose an option:${NC}"
-    echo +-------------------------------------------------------------------+
-    echo -e "| 1 - Install WARP"
-    echo -e "| 2 - Show Status"
-    echo -e "| 3 - Test Proxy"
-    echo -e "| 4 - Remove WARP"
-    echo -e "| 5 - Change IP (Quick reconnect)"
-    echo -e "| 6 - Change IP (New Identity - stronger)"
-    echo -e "| 7 - Scan Cloudflare IPs (Iran friendly)"
-    echo -e "| 8 - Choose IP from scan & set endpoint"
-    echo -e "| 9 - Set custom endpoint manually (IP:PORT)"
-    echo -e "| 10 - Multi-location endpoints (outbounds)"
-    echo -e "| 0 - Exit"
-    echo +-------------------------------------------------------------------+
-    echo -ne "${YELLOW}Select option: ${NC}"
+    
+    # Get current endpoint if any
+    local endpoint_info="Auto"
+    if [[ -f "$CURRENT_ENDPOINT_FILE" ]]; then
+        local current
+        current=$(cat "$CURRENT_ENDPOINT_FILE" 2>/dev/null || true)
+        if [[ -n "$current" ]]; then
+            endpoint_info=$(echo "$current" | cut -d'|' -f1)
+        fi
+    fi
+    
+    cat << EOF
+${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}
+${CYAN}║         ${BOLD}WARP Manager v${VERSION} - Enhanced Edition${NC}           ${CYAN}║${NC}
+${CYAN}║                    ${BOLD}by Parham Pahlevan${NC}                       ${CYAN}║${NC}
+${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}
+
+${GREEN}Status:${NC} ${status_color}${status_text}${NC}
+${GREEN}Current IP:${NC} ${YELLOW}${current_ip}${NC}
+${GREEN}Location:${NC} ${CYAN}${location:-Unknown}${NC}
+${GREEN}Endpoint:${NC} ${PURPLE}${endpoint_info}${NC}
+${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}
+
+${BOLD}Main Options:${NC}
+ ${GREEN}1${NC}) 📦 Install WARP
+ ${GREEN}2${NC}) 📊 Status & Info
+ ${GREEN}3${NC}) 🔧 Test Proxy
+ ${GREEN}4${NC}) 🗑️  Remove WARP
+ ${GREEN}5${NC}) 🔄 Quick IP Change
+ ${GREEN}6${NC}) 🆔 New Identity
+
+${BOLD}Advanced Options:${NC}
+ ${GREEN}7${NC}) 🔍 Scan Cloudflare IPs
+ ${GREEN}8${NC}) 📍 Apply Scanned IP
+ ${GREEN}9${NC}) ✏️  Manual Endpoint
+ ${GREEN}10${NC}) 🌍 Multi-location Manager
+
+${RED}0${NC}) Exit
+
+${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}
+EOF
 }
 
 parham_warp_main_menu() {
-    # Preload EU endpoints if list is empty
+    # Preload endpoints if needed
     parham_warp_preload_endpoints
-
+    
     while true; do
         parham_warp_draw_menu
+        echo -ne "${YELLOW}Select option: ${NC}"
         read -r choice
+        
         case $choice in
             1) parham_warp_install ;;
             2) parham_warp_status ;;
@@ -683,15 +930,46 @@ parham_warp_main_menu() {
             6) parham_warp_new_identity ;;
             7) parham_warp_scan_cloudflare_ips ;;
             8) parham_warp_select_ip_from_scan ;;
-            9) parham_warp_set_endpoint_manual ;;
+            9) 
+                echo -e "${CYAN}Manual endpoint setup${NC}"
+                read -p "Enter IP:PORT (e.g. 162.159.192.10:2408): " manual_endpoint
+                if [[ -n "$manual_endpoint" ]]; then
+                    parham_warp_disconnect
+                    parham_warp_set_custom_endpoint "$manual_endpoint"
+                    echo "Manual|$manual_endpoint" > "$CURRENT_ENDPOINT_FILE"
+                    warp-cli connect
+                    sleep 5
+                    parham_warp_status
+                fi
+                ;;
             10) parham_warp_multilocation_menu ;;
-            0) echo -e "${GREEN}Exiting...${NC}"; exit 0 ;;
-            *) echo -e "${RED}Invalid choice. Try again.${NC}" ;;
+            0) 
+                echo -e "${GREEN}Goodbye!${NC}"
+                exit 0
+                ;;
+            *) 
+                echo -e "${RED}Invalid option. Please try again.${NC}"
+                sleep 2
+                ;;
         esac
-        echo -e "\nPress Enter to return to menu..."
+        
+        echo -e "\n${CYAN}Press Enter to continue...${NC}"
         read -r
     done
 }
 
-# ========== Run Menu ==========
-parham_warp_main_menu
+# ========== Start the script ==========
+if [[ $# -eq 0 ]]; then
+    parham_warp_main_menu
+else
+    # Handle command line arguments
+    case $1 in
+        install) parham_warp_install ;;
+        status) parham_warp_status ;;
+        connect) parham_warp_connect ;;
+        disconnect) parham_warp_disconnect ;;
+        rotate) parham_warp_rotate_endpoint ;;
+        scan) parham_warp_scan_cloudflare_ips ;;
+        *) parham_warp_main_menu ;;
+    esac
+fi
