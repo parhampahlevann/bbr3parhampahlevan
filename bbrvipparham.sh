@@ -2,48 +2,19 @@
 
 ###############################################################################
 # Cloudflare WARP Proxy Manager
-# - Auto-installs itself to /usr/local/bin/warp-menu
-# - Installs Cloudflare WARP (cloudflare-warp)
 # - Uses warp-cli in proxy mode (SOCKS5 127.0.0.1:10808)
-# - Provides menu to install, connect, change IP, remove, etc.
+# - Installs Cloudflare WARP (cloudflare-warp) on Debian/Ubuntu systems
+# - Provides menu to:
+#     * Install / Reinstall WARP
+#     * Connect / Disconnect
+#     * Show Status
+#     * Test Proxy
+#     * Change IP (Quick reconnect)
+#     * Change IP (New identity / new registration)
+#     * Remove WARP
 ###############################################################################
 
-SCRIPT_NAME="warp-menu"
-INSTALL_PATH="/usr/local/bin/$SCRIPT_NAME"
-
-# Resolve script source (works even if called via symlink or from PATH)
-SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
-SCRIPT_REALPATH="$(readlink -f "$SCRIPT_SOURCE" 2>/dev/null || realpath "$SCRIPT_SOURCE" 2>/dev/null || echo "$SCRIPT_SOURCE")"
-
-# ===================== Auto-install to /usr/local/bin ========================
-
-# 1) If /usr/local/bin/warp-menu does not exist or is not executable, install it
-if [[ ! -x "$INSTALL_PATH" ]]; then
-    echo -e "\033[0;33m[!] Installing $SCRIPT_NAME to $INSTALL_PATH ...\033[0m"
-    if ! command -v sudo &>/dev/null && [[ $EUID -ne 0 ]]; then
-        echo -e "\033[0;31m[ERROR] 'sudo' not found and you are not root.\033[0m"
-        echo "Please run as root."
-        exit 1
-    fi
-
-    if [[ $EUID -ne 0 ]]; then
-        sudo cp "$SCRIPT_REALPATH" "$INSTALL_PATH"
-        sudo chmod +x "$INSTALL_PATH"
-    else
-        cp "$SCRIPT_REALPATH" "$INSTALL_PATH"
-        chmod +x "$INSTALL_PATH"
-    fi
-    echo -e "\033[0;32m[✓] Installed successfully.\033[0m"
-fi
-
-# 2) If we are not running from the installed path, re-exec from there
-INSTALLED_REALPATH="$(readlink -f "$INSTALL_PATH" 2>/dev/null || echo "$INSTALL_PATH")"
-if [[ "$SCRIPT_REALPATH" != "$INSTALLED_REALPATH" ]]; then
-    echo -e "\033[0;36m[>] Re-launching from $INSTALL_PATH ...\033[0m"
-    exec sudo "$INSTALL_PATH" "$@"
-fi
-
-# ===================== Colors & Version =====================================
+# ===================== Colors & Version ======================================
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -51,13 +22,13 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
-VERSION="3.0"
+VERSION="3.1"
 
 # ===================== Root Check ===========================================
 
 if [[ $EUID -ne 0 ]]; then
     echo -e "${RED}[ERROR] This script must be run as root.${NC}"
-    echo -e "${YELLOW}Usage: sudo $SCRIPT_NAME${NC}"
+    echo -e "${YELLOW}Usage: sudo warp-menu${NC}"
     exit 1
 fi
 
@@ -87,7 +58,7 @@ ensure_warp_service() {
 get_warp_ip() {
     local proxy_ip="127.0.0.1"
     local proxy_port="10808"
-    local ip
+    local ip=""
 
     # Try Cloudflare trace first
     if command -v timeout &>/dev/null; then
@@ -127,7 +98,7 @@ warp_install() {
     local codename
     codename=$(lsb_release -cs 2>/dev/null || echo "jammy")
 
-    # Force supported codename for newer Ubuntu versions
+    # Force a supported codename for newer Ubuntu versions
     case "$codename" in
         oracular|mantic|noble|jammy|focal)
             codename="jammy"
@@ -207,7 +178,7 @@ warp_status() {
     if warp_is_connected; then
         local ip
         ip=$(get_warp_ip)
-        [[ -n "$ip" ]] && echo -e "${GREEN}Proxy IP (via Cloudflare): $ip${NC}"
+        [[ -n "$ip" ]] && echo -e "${GREEN}Proxy IP (via WARP): $ip${NC}"
     fi
 }
 
@@ -367,8 +338,8 @@ draw_menu() {
         fi
     fi
 
-    echo -e "Status      : ${status_color}$status${NC}"
-    echo -e "Proxy       : 127.0.0.1:10808 (SOCKS5)"
+    echo -e "Status       : ${status_color}$status${NC}"
+    echo -e "Proxy        : 127.0.0.1:10808 (SOCKS5)"
     echo -e "IP (via WARP): ${GREEN}$ip${NC}"
     echo "------------------------------------------------------------------"
     echo -e "${YELLOW}OPTIONS:${NC}"
