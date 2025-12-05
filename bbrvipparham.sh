@@ -3,7 +3,7 @@
 # ==============================
 # VXLAN Multi-IP Failover Script
 # Compatible with: Ubuntu / Debian
-# Author: Parham (Modified by ChatGPT)
+# Author: Parham (modified)
 # ==============================
 
 VXLAN_IF="vxlan100"
@@ -14,9 +14,6 @@ VXLAN_IPV4_KHAREJ="10.123.1.2/30"
 VXLAN_IPV4_IRAN="10.123.1.1/30"
 VXLAN_IPV6_KHAREJ="fd11:1ceb:1d11::2/64"
 VXLAN_IPV6_IRAN="fd11:1ceb:1d11::1/64"
-
-# Used for tunnel health checks
-VXLAN_REMOTE_TUN_IP_IRAN="10.123.1.1"
 
 get_iface() {
     ip route | awk '/default/ {print $5; exit}'
@@ -32,8 +29,10 @@ setup_iran() {
     IFACE=$(get_iface)
     echo "Detected default interface: $IFACE"
 
+    # Clean previous VXLAN if exists
     ip link del $VXLAN_IF >/dev/null 2>&1 || true
 
+    # Configure VXLAN
     ip link add $VXLAN_IF type vxlan id $VXLAN_ID dev $IFACE remote $REMOTE_IP dstport 4789
     ip addr add $VXLAN_IPV4_IRAN dev $VXLAN_IF
     ip -6 addr add $VXLAN_IPV6_IRAN dev $VXLAN_IF
@@ -59,11 +58,11 @@ EOF
     systemctl start rc-local >/dev/null 2>&1 || systemctl start rc-local.service >/dev/null 2>&1
 
     echo "IRAN VXLAN setup complete."
-    echo "Local IP: $VXLAN_IPV4_IRAN"
+    echo "Local VXLAN IP: $VXLAN_IPV4_IRAN"
 }
 
 # ------------------------------
-# KHAREJ SERVER (MULTI-IP FAILOVER)
+# KHAREJ SERVER (MULTI-IP FAILOVER WITH PRIMARY PREFERENCE)
 # ------------------------------
 setup_kharej() {
     echo "=== KHAREJ SERVER MULTI-IRAN FAILOVER SETUP ==="
@@ -76,13 +75,14 @@ setup_kharej() {
 
     IRAN_IPS=()
     for ((i=1; i<=COUNT; i++)); do
-        read -p "Enter IRAN server IP #$i: " IP
+        read -p "Enter PUBLIC IP of IRAN server #$i (priority #$i): " IP
         IRAN_IPS+=("$IP")
     done
 
     IFACE=$(get_iface)
     echo "Detected default interface: $IFACE"
 
+    # Clean previous VXLAN
     ip link del $VXLAN_IF >/dev/null 2>&1 || true
 
     IRAN_IPS_STR="${IRAN_IPS[*]}"
@@ -90,52 +90,80 @@ setup_kharej() {
 # Create failover script
 cat <<EOF > /usr/local/bin/vxlan-failover.sh
 #!/bin/bash
+
 IFACE="$IFACE"
 VXLAN_IF="$VXLAN_IF"
 VXLAN_ID="$VXLAN_ID"
 IRAN_IPS=($IRAN_IPS_STR)
 COUNT=\${#IRAN_IPS[@]}
-CURRENT=0
+CURRENT=-1   # -1 = none active yet
 
 VXLAN_IPV4_KHAREJ="$VXLAN_IPV4_KHAREJ"
 VXLAN_IPV6_KHAREJ="$VXLAN_IPV6_KHAREJ"
-VXLAN_REMOTE_TUN_IP_IRAN="$VXLAN_REMOTE_TUN_IP_IRAN"
+
+# Health-check parameters
+PING_COUNT=2          # 2 pings
+PING_TIMEOUT=5        # each ping up to 5 seconds -> ~10 seconds total per server
 
 create_vxlan() {
-    local REMOTE_IP="\${IRAN_IPS[\$CURRENT]}"
-    echo "Switching VXLAN to IRAN server: \$REMOTE_IP"
+    local INDEX="\$1"
+    local REMOTE_IP="\${IRAN_IPS[\$INDEX]}"
 
-    ip link del \$VXLAN_IF >/dev/null 2>&1 || true
+    echo ">>> Switching VXLAN remote to IRAN server [index=\$INDEX, ip=\$REMOTE_IP]"
 
-    ip link add \$VXLAN_IF type vxlan id \$VXLAN_ID dev \$IFACE remote \$REMOTE_IP dstport 4789
+    ip link del "\$VXLAN_IF" >/dev/null 2>&1 || true
 
-    ip addr flush dev \$VXLAN_IF
-    ip addr add \$VXLAN_IPV4_KHAREJ dev \$VXLAN_IF
-    ip -6 addr add \$VXLAN_IPV6_KHAREJ dev \$VXLAN_IF
-    ip link set \$VXLAN_IF up
+    ip link add "\$VXLAN_IF" type vxlan id "\$VXLAN_ID" dev "\$IFACE" remote "\$REMOTE_IP" dstport 4789
+
+    ip addr flush dev "\$VXLAN_IF"
+    ip addr add "\$VXLAN_IPV4_KHAREJ" dev "\$VXLAN_IF"
+    ip -6 addr add "\$VXLAN_IPV6_KHAREJ" dev "\$VXLAN_IF"
+    ip link set "\$VXLAN_IF" up
+}
+
+check_server() {
+    local IP="\$1"
+    ping -c "\$PING_COUNT" -W "\$PING_TIMEOUT" "\$IP" >/dev/null 2>&1
 }
 
 monitor_loop() {
     while true; do
-        if ping -I \$VXLAN_IF -c 3 -W 3 \$VXLAN_REMOTE_TUN_IP_IRAN >/dev/null 2>&1; then
-            sleep 5
+        local preferred_index=-1
+
+        # Always prefer the first reachable server in the list
+        local i
+        for ((i=0; i<COUNT; i++)); do
+            local ip="\${IRAN_IPS[\$i]}"
+            if check_server "\$ip"; then
+                preferred_index=\$i
+                break
+            fi
+        done
+
+        if [[ "\$preferred_index" -eq -1 ]]; then
+            echo "!!! No IRAN servers are reachable. Keeping current VXLAN (if any)."
         else
-            echo "Tunnel DOWN on IRAN #\$((CURRENT+1)), switching..."
-            CURRENT=\$(( (CURRENT + 1) % COUNT ))
-            create_vxlan
-            sleep 5
+            # If the best available server is not the current, switch
+            if [[ "\$preferred_index" -ne "\$CURRENT" ]]; then
+                echo "Health-check: best available IRAN server is index=\$preferred_index (IP=\${IRAN_IPS[\$preferred_index]})."
+                CURRENT=\$preferred_index
+                create_vxlan "\$CURRENT"
+            fi
         fi
+
+        sleep 2
     done
 }
 
-create_vxlan
 monitor_loop
 EOF
 
     chmod +x /usr/local/bin/vxlan-failover.sh
+
+    # Start now
     /usr/local/bin/vxlan-failover.sh &
 
-# rc.local auto-run
+# rc.local auto-run on boot
 cat <<EOF > /etc/rc.local
 #!/bin/bash
 /usr/local/bin/vxlan-failover.sh &
@@ -147,7 +175,7 @@ EOF
     systemctl start rc-local >/dev/null 2>&1 || systemctl start rc-local.service >/dev/null 2>&1
 
     echo "KHAREJ VXLAN failover setup complete."
-    echo "IRAN servers configured: ${IRAN_IPS_STR}"
+    echo "IRAN servers configured (priority order): ${IRAN_IPS_STR}"
 }
 
 # ------------------------------
@@ -164,7 +192,7 @@ main_menu() {
 
     read -p "Choose option (1-3): " CHOICE
 
-    case "$CHOICE" in
+    case "\$CHOICE" in
         1) setup_iran ;;
         2) setup_kharej ;;
         3) exit 0 ;;
