@@ -1,31 +1,40 @@
-#!/usr/bin/env bash
-# Cloudflare WARP Menu (Parham Enhanced Edition) - Clean Version
-# Author: Parham Pahlevan
-# Version: 4.0-clean
+#!/bin/bash
 
-# ========== Elevate to root automatically ==========
-if [[ $EUID -ne 0 ]]; then
-    echo "[*] Re-running this script as root using sudo..."
-    exec sudo -E bash "$0" "$@"
+# ========== Auto-install on first run ==========
+SCRIPT_NAME="warp-menu"
+SCRIPT_PATH="/usr/local/bin/$SCRIPT_NAME"
+
+# Check if script is running from /usr/local/bin
+if [[ "$0" != "$SCRIPT_PATH" ]]; then
+    echo -e "\033[0;33m[!] Installing $SCRIPT_NAME to /usr/local/bin ...\033[0m"
+    
+    # Copy script to /usr/local/bin
+    sudo cp "$0" "$SCRIPT_PATH"
+    sudo chmod +x "$SCRIPT_PATH"
+    
+    echo -e "\033[0;32m[✓] Installed successfully!\033[0m"
+    echo -e "\033[0;36m[!] Running WARP Manager...\033[0m"
+    
+    # Auto-run the installed script
+    sudo "$SCRIPT_PATH"
+    exit 0
 fi
 
-# ========== Colors ==========
+# ========== Colors & Version ==========
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-PURPLE='\033[0;35m'
 NC='\033[0m'
-BOLD='\033[1m'
+VERSION="2.0"
 
-# ========== Config ==========
-CONFIG_DIR="/etc/warp-menu"
-ENDPOINTS_FILE="${CONFIG_DIR}/endpoints.list"
-VERSION="4.0"
-
-# Create directory
-mkdir -p "$CONFIG_DIR"
+# ========== Root Check ==========
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}This script must be run as root.${NC}"
+    echo -e "${YELLOW}Please run with: sudo $0${NC}"
+    exit 1
+fi
 
 # ========== Core Checks ==========
 warp_is_installed() {
@@ -33,391 +42,279 @@ warp_is_installed() {
 }
 
 warp_is_connected() {
-    warp-cli --accept-tos status 2>/dev/null | grep -iq "Connected"
+    warp-cli status 2>/dev/null | grep -iq "Connected"
 }
 
-# ========== Helper Functions ==========
-get_out_ip() {
-    curl -4 -s --socks5 127.0.0.1:10808 https://api.ipify.org 2>/dev/null || echo "N/A"
+# ========== Helpers ==========
+get_warp_ip() {
+    local proxy_ip="127.0.0.1"
+    local proxy_port="10808"
+    local ip
+    
+    # Try Cloudflare trace first
+    ip=$(timeout 5 curl -s --socks5 "${proxy_ip}:${proxy_port}" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | awk -F= '/^ip=/{print $2}')
+    
+    if [[ -z "$ip" ]]; then
+        # Fallback to ifconfig.me
+        ip=$(timeout 5 curl -s --socks5 "${proxy_ip}:${proxy_port}" https://ifconfig.me 2>/dev/null)
+    fi
+    
+    echo "$ip"
 }
 
-get_out_ipv6() {
-    curl -6 -s --socks5 127.0.0.1:10808 https://api64.ipify.org 2>/dev/null || echo "N/A"
+# ========== Core Functions ==========
+warp_install() {
+    if warp_is_installed && warp_is_connected; then
+        echo -e "${GREEN}WARP is already installed and connected.${NC}"
+        read -p "Do you want to reinstall it? [y/N]: " confirm
+        [[ ! "$confirm" =~ ^[Yy]$ ]] && return
+    fi
+
+    echo -e "${CYAN}Installing WARP-CLI...${NC}"
+    
+    # Get distribution codename
+    local codename=$(lsb_release -cs 2>/dev/null || echo "jammy")
+    
+    # Handle Ubuntu codenames
+    case "$codename" in
+        "oracular"|"mantic"|"noble"|"jammy"|"focal")
+            codename="jammy"  # Use jammy repo for newer Ubuntu versions
+            ;;
+    esac
+    
+    # Update system
+    apt-get update
+    apt-get install -y curl gpg lsb-release apt-transport-https ca-certificates
+    
+    # Add Cloudflare WARP repository
+    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | \
+        gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+    
+    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $codename main" | \
+        tee /etc/apt/sources.list.d/cloudflare-client.list
+    
+    # Install WARP
+    apt-get update
+    apt-get install -y cloudflare-warp
+    
+    echo -e "${GREEN}WARP installed successfully!${NC}"
+    warp_connect
 }
 
-ensure_proxy_mode() {
-    warp-cli --accept-tos set-mode proxy >/dev/null 2>&1
-    warp-cli --accept-tos set-proxy-port 10808 >/dev/null 2>&1
-    sleep 1
-}
-
-# ========== Main Functions ==========
-install_warp() {
-    clear
-    echo -e "${CYAN}============================================${NC}"
-    echo -e "${BOLD}${CYAN}          INSTALL WARP               ${NC}"
-    echo -e "${CYAN}============================================${NC}\n"
+warp_connect() {
+    echo -e "${BLUE}Connecting to WARP...${NC}"
     
-    if warp_is_installed; then
-        echo -e "${GREEN}WARP is already installed.${NC}"
-        return 0
+    # Check if already registered
+    if ! warp-cli account 2>/dev/null | grep -q "Account type"; then
+        echo -e "${YELLOW}Registering new WARP account...${NC}"
+        warp-cli registration new
     fi
     
-    echo -e "${YELLOW}Installing Cloudflare WARP...${NC}\n"
+    # Configure proxy mode
+    warp-cli mode proxy
+    warp-cli proxy port 10808
     
-    # Update and install dependencies
-    apt update
-    apt install -y curl gpg
-    
-    # Add repository
-    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-    
-    # Detect OS version
-    if grep -q "jammy\|focal\|bionic" /etc/os-release; then
-        codename="jammy"
-    else
-        codename="jammy"
-    fi
-    
-    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $codename main" | tee /etc/apt/sources.list.d/cloudflare-client.list
-    
-    # Install
-    apt update
-    apt install -y cloudflare-warp
-    
-    # Start service
-    systemctl start warp-svc
-    sleep 5
-    
-    # Register and connect
-    warp-cli --accept-tos registration new
-    ensure_proxy_mode
-    warp-cli --accept-tos connect
-    sleep 5
-    
-    if warp_is_connected; then
-        echo -e "\n${GREEN}✓ WARP installed successfully!${NC}"
-        local ip=$(get_out_ip)
-        echo -e "${GREEN}Your WARP IP: $ip${NC}"
-    else
-        echo -e "\n${RED}✗ Installation failed${NC}"
-    fi
-    
-    echo -e "\n${CYAN}Press Enter to continue...${NC}"
-    read -r
-}
-
-status_warp() {
-    clear
-    echo -e "${CYAN}============================================${NC}"
-    echo -e "${BOLD}${CYAN}          WARP STATUS                ${NC}"
-    echo -e "${CYAN}============================================${NC}\n"
-    
-    if warp_is_installed; then
-        echo -e "${GREEN}WARP Status:${NC}"
-        warp-cli --accept-tos status
-    else
-        echo -e "${RED}WARP is not installed${NC}"
-    fi
-    
-    echo -e "\n${GREEN}Connection Details:${NC}"
-    
-    if warp_is_connected; then
-        local ip4=$(get_out_ip)
-        local ip6=$(get_out_ipv6)
-        
-        echo -e "  IPv4: ${YELLOW}$ip4${NC}"
-        echo -e "  IPv6: ${YELLOW}$ip6${NC}"
-        
-        # Test proxy
-        echo -ne "\n${CYAN}Testing proxy...${NC} "
-        if curl -4 -s --socks5 127.0.0.1:10808 https://cloudflare.com >/dev/null 2>&1; then
-            echo -e "${GREEN}✓ Working${NC}"
-        else
-            echo -e "${RED}✗ Failed${NC}"
-        fi
-    else
-        echo -e "${RED}Not connected${NC}"
-    fi
-    
-    echo -e "\n${CYAN}Press Enter to continue...${NC}"
-    read -r
-}
-
-test_proxy() {
-    clear
-    echo -e "${CYAN}============================================${NC}"
-    echo -e "${BOLD}${CYAN}          PROXY TEST                 ${NC}"
-    echo -e "${CYAN}============================================${NC}\n"
-    
-    if ! warp_is_connected; then
-        echo -e "${RED}WARP is not connected${NC}"
-        echo -e "\n${CYAN}Press Enter to continue...${NC}"
-        read -r
-        return 1
-    fi
-    
-    echo -e "${GREEN}Testing SOCKS5 proxy (127.0.0.1:10808)...${NC}\n"
-    
-    echo -ne "${CYAN}• IPv4 test...${NC} "
-    local ip4=$(get_out_ip)
-    if [[ "$ip4" != "N/A" ]]; then
-        echo -e "${GREEN}✓ $ip4${NC}"
-    else
-        echo -e "${RED}✗ Failed${NC}"
-    fi
-    
-    echo -ne "${CYAN}• IPv6 test...${NC} "
-    local ip6=$(get_out_ipv6)
-    if [[ "$ip6" != "N/A" ]]; then
-        echo -e "${GREEN}✓ $ip6${NC}"
-    else
-        echo -e "${YELLOW}⚠ Not available${NC}"
-    fi
-    
-    echo -e "\n${CYAN}• Website tests:${NC}"
-    local sites=("cloudflare.com" "google.com" "github.com")
-    
-    for site in "${sites[@]}"; do
-        echo -ne "  $site... "
-        if curl -4 -s --socks5 127.0.0.1:10808 "https://$site" >/dev/null 2>&1; then
-            echo -e "${GREEN}✓${NC}"
-        else
-            echo -e "${RED}✗${NC}"
-        fi
-    done
-    
-    echo -e "\n${CYAN}Press Enter to continue...${NC}"
-    read -r
-}
-
-connect_warp() {
-    echo -e "\n${CYAN}Connecting to WARP...${NC}"
-    warp-cli --accept-tos connect
+    # Connect
+    warp-cli connect
     sleep 3
     
     if warp_is_connected; then
-        echo -e "${GREEN}✓ Connected${NC}"
+        echo -e "${GREEN}Connected to WARP successfully!${NC}"
     else
-        echo -e "${RED}✗ Connection failed${NC}"
+        echo -e "${RED}Failed to connect to WARP.${NC}"
     fi
-    sleep 2
 }
 
-disconnect_warp() {
-    echo -e "\n${CYAN}Disconnecting from WARP...${NC}"
-    warp-cli --accept-tos disconnect
-    sleep 2
-    echo -e "${GREEN}✓ Disconnected${NC}"
+warp_disconnect() {
+    echo -e "${YELLOW}Disconnecting WARP...${NC}"
+    warp-cli disconnect 2>/dev/null
     sleep 1
 }
 
-change_ip() {
-    clear
-    echo -e "${CYAN}============================================${NC}"
-    echo -e "${BOLD}${CYAN}          CHANGE IP                  ${NC}"
-    echo -e "${CYAN}============================================${NC}\n"
-    
-    if ! warp_is_connected; then
-        echo -e "${RED}WARP is not connected${NC}"
-        echo -e "\n${CYAN}Press Enter to continue...${NC}"
-        read -r
-        return
-    fi
-    
-    local old_ip=$(get_out_ip)
-    echo -e "Current IP: ${YELLOW}$old_ip${NC}"
-    
-    echo -e "\n${CYAN}Changing IP...${NC}"
-    disconnect_warp
-    connect_warp
-    
-    local new_ip=$(get_out_ip)
-    echo -e "\nNew IP: ${YELLOW}$new_ip${NC}"
-    
-    echo -e "\n${CYAN}Press Enter to continue...${NC}"
-    read -r
-}
-
-new_identity() {
-    clear
-    echo -e "${CYAN}============================================${NC}"
-    echo -e "${BOLD}${CYAN}          NEW IDENTITY              ${NC}"
-    echo -e "${CYAN}============================================${NC}\n"
-    
-    echo -e "${YELLOW}This will reset your WARP connection...${NC}\n"
-    read -r -p "Continue? [y/N]: " confirm
-    
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        return
-    fi
-    
-    echo -e "\n${CYAN}Resetting WARP...${NC}"
-    
-    warp-cli --accept-tos disconnect
-    warp-cli --accept-tos registration delete
-    sleep 2
-    
-    systemctl restart warp-svc
-    sleep 5
-    
-    warp-cli --accept-tos registration new
-    ensure_proxy_mode
-    warp-cli --accept-tos connect
-    sleep 5
+warp_status() {
+    echo -e "${CYAN}WARP Status:${NC}"
+    warp-cli status
     
     if warp_is_connected; then
-        local new_ip=$(get_out_ip)
-        echo -e "${GREEN}✓ New identity created${NC}"
-        echo -e "${GREEN}New IP: $new_ip${NC}"
-    else
-        echo -e "${RED}✗ Failed to create new identity${NC}"
-    fi
-    
-    echo -e "\n${CYAN}Press Enter to continue...${NC}"
-    read -r
-}
-
-test_ipv6() {
-    clear
-    echo -e "${CYAN}============================================${NC}"
-    echo -e "${BOLD}${CYAN}          IPv6 TEST                 ${NC}"
-    echo -e "${CYAN}============================================${NC}\n"
-    
-    echo -e "${GREEN}Testing IPv6 connectivity...${NC}\n"
-    
-    echo -ne "${CYAN}• Native IPv6...${NC} "
-    if curl -6 -s https://ipv6.google.com >/dev/null 2>&1; then
-        echo -e "${GREEN}✓ Available${NC}"
-    else
-        echo -e "${YELLOW}⚠ Not available${NC}"
-    fi
-    
-    if warp_is_connected; then
-        echo -ne "${CYAN}• IPv6 through WARP...${NC} "
-        local ipv6=$(get_out_ipv6)
-        if [[ "$ipv6" != "N/A" ]]; then
-            echo -e "${GREEN}✓ $ipv6${NC}"
-        else
-            echo -e "${YELLOW}⚠ Not available${NC}"
+        local ip=$(get_warp_ip)
+        if [[ -n "$ip" ]]; then
+            echo -e "${GREEN}Proxy IP: $ip${NC}"
         fi
     fi
-    
-    echo -e "\n${CYAN}Press Enter to continue...${NC}"
-    read -r
 }
 
-remove_warp() {
-    clear
-    echo -e "${RED}============================================${NC}"
-    echo -e "${BOLD}${RED}          REMOVE WARP               ${NC}"
-    echo -e "${RED}============================================${NC}\n"
+warp_test_proxy() {
+    echo -e "${CYAN}Testing SOCKS5 proxy (127.0.0.1:10808)...${NC}"
     
-    echo -e "${YELLOW}⚠ This will remove WARP completely!${NC}\n"
-    read -r -p "Are you sure? [y/N]: " confirm
-    
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo -e "${GREEN}Cancelled${NC}"
-        sleep 2
-        return
+    if ! warp_is_connected; then
+        echo -e "${RED}WARP is not connected!${NC}"
+        return 1
     fi
     
-    echo -e "\n${CYAN}Removing WARP...${NC}"
-    
-    warp-cli --accept-tos disconnect 2>/dev/null || true
-    systemctl stop warp-svc 2>/dev/null || true
-    
-    apt remove --purge -y cloudflare-warp 2>/dev/null || true
-    
-    rm -f /etc/apt/sources.list.d/cloudflare-client.list 2>/dev/null || true
-    rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg 2>/dev/null || true
-    
-    echo -e "\n${GREEN}✓ WARP removed successfully${NC}"
-    
-    echo -e "\n${CYAN}Press Enter to continue...${NC}"
-    read -r
+    local ip=$(get_warp_ip)
+    if [[ -n "$ip" ]]; then
+        echo -e "[✓] ${GREEN}Proxy is working!${NC}"
+        echo -e "[✓] ${GREEN}Outgoing IP: $ip${NC}"
+        
+        # Test connectivity
+        echo -e "${CYAN}Testing connectivity...${NC}"
+        if timeout 5 curl -s --socks5 127.0.0.1:10808 https://cloudflare.com &>/dev/null; then
+            echo -e "[✓] ${GREEN}Internet connectivity: OK${NC}"
+        else
+            echo -e "[!] ${YELLOW}Connectivity test failed${NC}"
+        fi
+    else
+        echo -e "[✗] ${RED}Proxy test failed${NC}"
+    fi
 }
 
-# ========== Draw Menu ==========
-show_menu() {
-    clear
+warp_remove() {
+    echo -e "${RED}Removing WARP...${NC}"
+    read -p "Are you sure you want to remove WARP? [y/N]: " confirm
+    [[ ! "$confirm" =~ ^[Yy]$ ]] && return
     
-    # Get status
-    local status_ip="N/A"
+    warp-cli disconnect 2>/dev/null
+    sleep 1
+    
+    apt-get remove --purge -y cloudflare-warp
+    rm -f /etc/apt/sources.list.d/cloudflare-client.list
+    rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+    apt-get autoremove -y
+    
+    echo -e "${GREEN}WARP removed successfully.${NC}"
+}
+
+warp_quick_change_ip() {
+    if ! warp_is_installed; then
+        echo -e "${RED}WARP is not installed.${NC}"
+        return 1
+    fi
+    
+    echo -e "${CYAN}Changing IP (quick reconnect)...${NC}"
+    local old_ip=$(get_warp_ip)
+    echo -e "Current IP: ${YELLOW}${old_ip:-N/A}${NC}"
+    
+    for attempt in {1..3}; do
+        echo -e "Attempt ${attempt}/3..."
+        warp_disconnect
+        warp-cli connect
+        sleep 3
+        
+        local new_ip=$(get_warp_ip)
+        if [[ -n "$new_ip" && "$new_ip" != "$old_ip" ]]; then
+            echo -e "[✓] ${GREEN}IP changed successfully!${NC}"
+            echo -e "[✓] ${GREEN}New IP: $new_ip${NC}"
+            return 0
+        fi
+        sleep 2
+    done
+    
+    echo -e "${YELLOW}IP did not change. Try 'New Identity' option.${NC}"
+    return 2
+}
+
+warp_new_identity() {
+    if ! warp_is_installed; then
+        echo -e "${RED}WARP is not installed.${NC}"
+        return 1
+    fi
+    
+    echo -e "${CYAN}Creating new identity...${NC}"
+    local old_ip=$(get_warp_ip)
+    echo -e "Old IP: ${YELLOW}${old_ip:-N/A}${NC}"
+    
+    warp_disconnect
+    
+    # Delete current registration
+    warp-cli registration delete 2>/dev/null || \
+    warp-cli clear-keys 2>/dev/null || \
+    echo -e "${YELLOW}Note: Could not delete old registration${NC}"
+    
+    sleep 2
+    
+    # Create new registration
+    warp-cli registration new
+    warp-cli mode proxy
+    warp-cli proxy port 10808
+    warp-cli connect
+    
+    sleep 4
+    
+    local new_ip=$(get_warp_ip)
+    if [[ -n "$new_ip" ]]; then
+        if [[ "$new_ip" != "$old_ip" ]]; then
+            echo -e "[✓] ${GREEN}New identity created!${NC}"
+            echo -e "[✓] ${GREEN}New IP: $new_ip${NC}"
+        else
+            echo -e "${YELLOW}IP address is the same. Try again later.${NC}"
+        fi
+    else
+        echo -e "${RED}Failed to get new IP address.${NC}"
+    fi
+}
+
+# ========== Menu Display ==========
+draw_menu() {
+    clear
+    echo "========================================================"
+    echo "           WARP Proxy Manager v$VERSION"
+    echo "                  by Parham Pahlevan"
+    echo "========================================================"
+    
+    local status="DISCONNECTED"
     local status_color=$RED
-    local status_text="DISCONNECTED"
+    local ip="N/A"
     
     if warp_is_connected; then
+        status="CONNECTED"
         status_color=$GREEN
-        status_text="CONNECTED"
-        status_ip=$(get_out_ip)
+        ip=$(get_warp_ip || echo "N/A")
     fi
     
-    # Draw clean menu
-    echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║    ${BOLD}CLOUDFLARE WARP MENU v$VERSION${NC}         ${CYAN}║${NC}"
-    echo -e "${CYAN}╚════════════════════════════════════════════╝${NC}\n"
-    
-    echo -e "${BOLD}Status:${NC} ${status_color}${status_text}${NC}"
-    echo -e "${BOLD}IP:${NC} ${YELLOW}$status_ip${NC}\n"
-    
-    echo -e "${BOLD}${GREEN}MAIN OPTIONS:${NC}"
-    echo -e " ${GREEN}1${NC}) Install WARP"
-    echo -e " ${GREEN}2${NC}) Status"
-    echo -e " ${GREEN}3${NC}) Test Proxy"
-    echo -e " ${GREEN}4${NC}) Remove WARP\n"
-    
-    echo -e "${BOLD}${CYAN}CONNECTION:${NC}"
-    echo -e " ${CYAN}5${NC}) Connect"
-    echo -e " ${CYAN}6${NC}) Disconnect"
-    echo -e " ${CYAN}7${NC}) Change IP"
-    echo -e " ${CYAN}8${NC}) New Identity\n"
-    
-    echo -e "${BOLD}${YELLOW}TOOLS:${NC}"
-    echo -e " ${YELLOW}9${NC}) Test IPv6\n"
-    
-    echo -e "${BOLD}${RED}0${NC}) Exit\n"
-    
-    echo -e "${CYAN}════════════════════════════════════════════${NC}"
+    echo -e "Status: ${status_color}$status${NC}"
+    echo -e "Proxy: 127.0.0.1:10808"
+    echo -e "IP Address: ${GREEN}$ip${NC}"
+    echo "--------------------------------------------------------"
+    echo -e "${YELLOW}OPTIONS:${NC}"
+    echo "  1) Install / Reinstall WARP"
+    echo "  2) Show Status"
+    echo "  3) Test Proxy Connection"
+    echo "  4) Remove WARP"
+    echo "  5) Change IP (Quick)"
+    echo "  6) Change IP (New Identity)"
+    echo "  0) Exit"
+    echo "========================================================"
+    echo -ne "${YELLOW}Select option [0-6]: ${NC}"
 }
 
-# ========== Main Loop ==========
-main() {
-    # Auto-install if needed
-    if [[ ! -f "/usr/local/bin/warp-menu" ]]; then
-        echo -e "${CYAN}Installing warp-menu to /usr/local/bin...${NC}"
-        cp "$0" /usr/local/bin/warp-menu
-        chmod +x /usr/local/bin/warp-menu
-        echo -e "${GREEN}✓ Installed. Run with: warp-menu${NC}\n"
-    fi
-    
+# ========== Main Menu ==========
+main_menu() {
     while true; do
-        show_menu
-        
-        echo -ne "${YELLOW}Select option [0-9]: ${NC}"
+        draw_menu
         read -r choice
         
         case $choice in
-            1) install_warp ;;
-            2) status_warp ;;
-            3) test_proxy ;;
-            4) remove_warp ;;
-            5) connect_warp ;;
-            6) disconnect_warp ;;
-            7) change_ip ;;
-            8) new_identity ;;
-            9) test_ipv6 ;;
-            0)
-                echo -e "\n${GREEN}Goodbye!${NC}"
+            1) warp_install ;;
+            2) warp_status ;;
+            3) warp_test_proxy ;;
+            4) warp_remove ;;
+            5) warp_quick_change_ip ;;
+            6) warp_new_identity ;;
+            0) 
+                echo -e "${GREEN}Goodbye!${NC}"
                 exit 0
                 ;;
             *)
-                echo -e "\n${RED}Invalid option!${NC}"
-                sleep 2
+                echo -e "${RED}Invalid option! Please choose 0-6.${NC}"
                 ;;
         esac
+        
+        if [[ $choice != "0" ]]; then
+            echo -e "\n${YELLOW}Press Enter to continue...${NC}"
+            read -r
+        fi
     done
 }
 
-# Run main function
-main
+# ========== Start Program ==========
+main_menu
