@@ -100,7 +100,7 @@ VXLAN_IPV4_KHAREJ="$VXLAN_IPV4_KHAREJ"
 VXLAN_IPV6_KHAREJ="$VXLAN_IPV6_KHAREJ"
 EOF
 
-    # Create failover script
+    # Create failover script (runs on KHAREJ)
 cat <<'EOF' > /usr/local/bin/vxlan-failover.sh
 #!/bin/bash
 
@@ -119,92 +119,85 @@ if [[ ! -f "$CONF_FILE" ]]; then
     exit 1
 fi
 
-# Load config
+# Load config from KHAREJ setup
 # shellcheck disable=SC1090
 source "$CONF_FILE"
 
-# ------------- HEALTH / SWITCH PARAMETERS (TUNE HERE) -------------
+# --------- HEALTH & FAILOVER PARAMETERS (TUNABLE) ---------
 
-PRIMARY_INDEX=0       # IRAN server #0 is considered primary
+PRIMARY_INDEX=0           # IRAN[0] is primary
 
-# EMA (approx 20-30 seconds smoothing)
-EMA_ALPHA_NUM=1       # alpha = 1 / 15  ≈ 0.067
-EMA_ALPHA_DEN=15
+PING_COUNT=3              # pings per check
+PING_TIMEOUT=1            # seconds per ping
 
-# Score = LOSS_WEIGHT * loss(%) + rtt(ms)
-LOSS_WEIGHT=100
-RTT_WEIGHT=1
+HARD_DOWN_LOSS=90         # >= this % loss => server considered DOWN
+DEGRADED_LOSS=40          # >= this % => degraded
+DEGRADED_RTT=250          # >= this ms => degraded
 
-# When is current server considered "bad"?
-CURR_BAD_LOSS=40         # if EMA loss% >= this
-CURR_BAD_RTT=220         # or EMA rtt >= this
-CURR_BAD_ROUNDS_MIN=5    # must be bad for at least this many loops
+BAD_STREAK_LIMIT=3        # number of consecutive degraded checks before switching
 
-# When is primary considered "good" enough to come back?
-PRIMARY_GOOD_LOSS=10        # EMA loss% <= this
-PRIMARY_GOOD_RTT=180        # EMA rtt <= this
-PRIMARY_GOOD_ROUNDS_MIN=20  # needs this many good loops (~20s)
+PRIMARY_OK_LOSS=15        # for return: primary must be this good or better
+PRIMARY_OK_RTT=200
+PRIMARY_STABLE_ROUNDS=10  # how many good loops before returning to primary
 
-# How much better should a candidate be to switch?
-SCORE_MARGIN=300         # candidate_score + margin < current_score
+# Score = loss*100 + rtt (lower is better)
+SCORE_MARGIN_SWITCH=300   # candidate must be this much better than current to switch
+SCORE_MARGIN_RETURN=150   # for return to primary
 
-SLEEP_INTERVAL=1         # seconds between checks
+SLEEP_INTERVAL=2          # seconds between health checks
 
-# -------------------------------------------------------------
+# ---------------------------------------------------------
 
-CURRENT=-1                   # current active index (-1: none)
-CURRENT_BAD_ROUNDS=0
-PRIMARY_GOOD_ROUNDS=0
+CURRENT=-1                # active IRAN index (-1 means none yet)
+CURRENT_BAD_STREAK=0
+PRIMARY_GOOD_STREAK=0
 
-declare -a EMA_LOSS
-declare -a EMA_RTT
+declare -a LOSS_ARR
+declare -a RTT_ARR
 
-quick_probe_server() {
+# ------------- PROBE + PARSE PING ------------------------
+
+probe_server() {
     local IP="$1"
-    local OUT
     local LOSS=100
-    local RTT=0
+    local RTT=1000
+    local OUT
 
-    OUT=$(ping -c1 -W1 "$IP" 2>/dev/null)
-    if [[ $? -ne 0 ]]; then
+    OUT=$(ping -c "$PING_COUNT" -W "$PING_TIMEOUT" "$IP" 2>/dev/null)
+    if [[ $? -eq 0 ]]; then
+        local loss_line
+        loss_line=$(echo "$OUT" | grep -m1 "packet loss")
+        if [[ -n "$loss_line" ]]; then
+            LOSS=$(echo "$loss_line" | awk -F',' '{print $3}' | sed 's/[^0-9]//g')
+            [[ -z "$LOSS" ]] && LOSS=0
+        else
+            LOSS=0
+        fi
+
+        local rtt_line
+        rtt_line=$(echo "$OUT" | grep -m1 "rtt" || true)
+        if [[ -n "$rtt_line" ]]; then
+            RTT=$(echo "$rtt_line" | awk -F'/' '{print $5}')
+            RTT=${RTT%.*}
+            [[ -z "$RTT" ]] && RTT=0
+        else
+            RTT=50
+        fi
+    else
         LOSS=100
         RTT=1000
-    else
-        LOSS=0
-        RTT=$(echo "$OUT" | awk -F'/' 'END{print $5}')
-        RTT=${RTT%.*}
-        [[ -z "$RTT" ]] && RTT=0
     fi
+
     echo "$LOSS $RTT"
 }
 
-update_ema() {
-    local idx="$1"
-    local loss_sample="$2"
-    local rtt_sample="$3"
-
-    local old_loss="${EMA_LOSS[$idx]}"
-    local old_rtt="${EMA_RTT[$idx]}"
-
-    if [[ -z "$old_loss" ]]; then
-        EMA_LOSS[$idx]=$loss_sample
-    else
-        EMA_LOSS[$idx]=$(( (EMA_ALPHA_NUM * loss_sample + (EMA_ALPHA_DEN - EMA_ALPHA_NUM) * old_loss) / EMA_ALPHA_DEN ))
-    fi
-
-    if [[ -z "$old_rtt" ]]; then
-        EMA_RTT[$idx]=$rtt_sample
-    else
-        EMA_RTT[$idx]=$(( (EMA_ALPHA_NUM * rtt_sample + (EMA_ALPHA_DEN - EMA_ALPHA_NUM) * old_rtt) / EMA_ALPHA_DEN ))
-    fi
-}
-
 compute_score() {
-    local idx="$1"
-    local loss="${EMA_LOSS[$idx]:-100}"
-    local rtt="${EMA_RTT[$idx]:-1000}"
-    echo $(( LOSS_WEIGHT * loss + RTT_WEIGHT * rtt ))
+    local loss="$1"
+    local rtt="$2"
+    echo $(( loss * 100 + rtt ))
 }
+
+# ------------- SWITCH VXLAN TO SELECTED IRAN -------------
 
 switch_to_index() {
     local INDEX="$1"
@@ -253,10 +246,12 @@ switch_to_index() {
     bridge fdb flush dev "$VXLAN_IF" 2>/dev/null || true
 
     CURRENT="$INDEX"
-    CURRENT_BAD_ROUNDS=0
+    CURRENT_BAD_STREAK=0
     log "VXLAN is now using IRAN[ip=$REMOTE_IP]"
     return 0
 }
+
+# ------------- MAIN MONITOR LOOP -------------------------
 
 monitor_loop() {
     log "Starting VXLAN failover monitor. IRAN IPs: ${IRAN_IPS[*]}"
@@ -266,75 +261,99 @@ monitor_loop() {
         local best_index=-1
         local best_score=999999999
 
+        # Probe all IRAN servers
         for ((i=0; i<COUNT; i++)); do
             local IP="${IRAN_IPS[$i]}"
             local loss rtt
-            read loss rtt < <(quick_probe_server "$IP")
-            update_ema "$i" "$loss" "$rtt"
+            read loss rtt < <(probe_server "$IP")
+            LOSS_ARR[$i]=$loss
+            RTT_ARR[$i]=$rtt
 
-            local ema_loss="${EMA_LOSS[$i]}"
-            local ema_rtt="${EMA_RTT[$i]}"
             local score
-            score=$(compute_score "$i")
+            score=$(compute_score "$loss" "$rtt")
 
-            log "Health index=$i ip=$IP sample_loss=${loss}% sample_rtt=${rtt}ms ema_loss=${ema_loss}% ema_rtt=${ema_rtt}ms score=$score"
+            log "Health index=$i ip=$IP loss=${loss}% rtt=${rtt}ms score=$score"
 
-            if (( score < best_score )); then
+            # Only consider servers that are not totally dead
+            if (( loss < HARD_DOWN_LOSS && score < best_score )); then
                 best_score=$score
                 best_index=$i
             fi
         done
 
-        local primary_loss="${EMA_LOSS[$PRIMARY_INDEX]:-100}"
-        local primary_rtt="${EMA_RTT[$PRIMARY_INDEX]:-1000}"
-        local current_loss=100
-        local current_rtt=1000
-        local current_score=999999999
+        local curr_loss=100
+        local curr_rtt=1000
+        local curr_score=999999999
 
         if (( CURRENT >= 0 )); then
-            current_loss="${EMA_LOSS[$CURRENT]:-100}"
-            current_rtt="${EMA_RTT[$CURRENT]:-1000}"
-            current_score=$(compute_score "$CURRENT")
+            curr_loss=${LOSS_ARR[$CURRENT]:-100}
+            curr_rtt=${RTT_ARR[$CURRENT]:-1000}
+            curr_score=$(compute_score "$curr_loss" "$curr_rtt")
         fi
 
-        if (( primary_loss <= PRIMARY_GOOD_LOSS && primary_rtt <= PRIMARY_GOOD_RTT )); then
-            PRIMARY_GOOD_ROUNDS=$((PRIMARY_GOOD_ROUNDS + 1))
+        local prim_loss=${LOSS_ARR[$PRIMARY_INDEX]:-100}
+        local prim_rtt=${RTT_ARR[$PRIMARY_INDEX]:-1000}
+        local prim_score
+        prim_score=$(compute_score "$prim_loss" "$prim_rtt")
+
+        # Track primary stability
+        if (( prim_loss <= PRIMARY_OK_LOSS && prim_rtt <= PRIMARY_OK_RTT )); then
+            PRIMARY_GOOD_STREAK=$((PRIMARY_GOOD_STREAK + 1))
         else
-            PRIMARY_GOOD_ROUNDS=0
+            PRIMARY_GOOD_STREAK=0
         fi
 
-        if (( current_loss >= CURR_BAD_LOSS || current_rtt >= CURR_BAD_RTT )); then
-            CURRENT_BAD_ROUNDS=$((CURRENT_BAD_ROUNDS + 1))
+        # Track current degradation
+        if (( curr_loss >= DEGRADED_LOSS || curr_rtt >= DEGRADED_RTT )); then
+            CURRENT_BAD_STREAK=$((CURRENT_BAD_STREAK + 1))
         else
-            CURRENT_BAD_ROUNDS=0
+            CURRENT_BAD_STREAK=0
         fi
 
-        log "Summary: current_index=$CURRENT current_loss=${current_loss}% current_rtt=${current_rtt}ms current_score=$current_score | best_index=$best_index best_score=$best_score | primary_good_rounds=$PRIMARY_GOOD_ROUNDS current_bad_rounds=$CURRENT_BAD_ROUNDS"
+        log "Summary: current_index=$CURRENT curr_loss=${curr_loss}% curr_rtt=${curr_rtt}ms curr_score=$curr_score | best_index=$best_index best_score=$best_score | primary_loss=${prim_loss}% primary_rtt=${prim_rtt}ms primary_good_streak=$PRIMARY_GOOD_STREAK bad_streak=$CURRENT_BAD_STREAK"
 
+        # Case 1: No active server yet → pick best reachable
         if (( CURRENT < 0 )); then
             if (( best_index >= 0 )); then
-                log "No active IRAN server, switching to best index=$best_index"
+                log "No active IRAN server. Switching to best index=$best_index"
                 switch_to_index "$best_index"
             fi
         else
-            if (( best_index == CURRENT )); then
-                :
+            # Case 2: Active server exists
+
+            # 2a) if current is effectively DOWN → immediate switch to best
+            if (( curr_loss >= HARD_DOWN_LOSS )); then
+                if (( best_index >= 0 && best_index != CURRENT )); then
+                    log "Current IRAN is effectively DOWN (loss=${curr_loss}%). Switching to best index=$best_index"
+                    switch_to_index "$best_index"
+                else
+                    log "Current IRAN is DOWN but no better candidate found."
+                fi
+
             else
-                if (( CURRENT_BAD_ROUNDS >= CURR_BAD_ROUNDS_MIN )); then
-                    if (( best_score + SCORE_MARGIN < current_score )); then
-                        if (( best_index == PRIMARY_INDEX )); then
-                            if (( PRIMARY_GOOD_ROUNDS >= PRIMARY_GOOD_ROUNDS_MIN )); then
-                                log "Primary has been stable long enough, switching back to primary index=$PRIMARY_INDEX"
-                                switch_to_index "$PRIMARY_INDEX"
-                            else
-                                log "Primary not yet stable enough to switch back (rounds=$PRIMARY_GOOD_ROUNDS/$PRIMARY_GOOD_ROUNDS_MIN)"
-                            fi
-                        else
-                            log "Found better backup index=$best_index (score=$best_score vs current=$current_score), switching."
+                # 2b) current is not fully down, but may be degraded
+                if (( CURRENT_BAD_STREAK >= BAD_STREAK_LIMIT )); then
+                    if (( best_index >= 0 && best_index != CURRENT )); then
+                        if (( best_score + SCORE_MARGIN_SWITCH < curr_score )); then
+                            log "Current IRAN degraded for $CURRENT_BAD_STREAK checks, better candidate index=$best_index found. Switching."
                             switch_to_index "$best_index"
+                        else
+                            log "Current IRAN degraded but candidate is not significantly better (score margin)."
                         fi
                     else
-                        log "Current server is bad but no significantly better candidate yet."
+                        log "Current IRAN degraded but no alternative reachable server."
+                    fi
+                fi
+
+                # 2c) If we are on backup, maybe return to primary
+                if (( CURRENT != PRIMARY_INDEX )); then
+                    if (( PRIMARY_GOOD_STREAK >= PRIMARY_STABLE_ROUNDS )); then
+                        if (( prim_score + SCORE_MARGIN_RETURN < curr_score )); then
+                            log "Primary has been stable long enough and is clearly better. Switching back to primary."
+                            switch_to_index "$PRIMARY_INDEX"
+                        else
+                            log "Primary is stable but not significantly better than current (no return yet)."
+                        fi
                     fi
                 fi
             fi
