@@ -123,27 +123,42 @@ fi
 # shellcheck disable=SC1090
 source "$CONF_FILE"
 
-PRIMARY_INDEX=0         # just for info / possible future preference
-CURRENT=-1              # current active index (-1 = none)
-CURRENT_BAD_STREAK=0    # how many consecutive bad checks on current
+# ------------- HEALTH / SWITCH PARAMETERS (TUNE HERE) -------------
 
-# Quick health thresholds
-QUICK_WARN_LOSS=30      # % packet loss to start worrying
-QUICK_WARN_RTT=200      # ms RTT to start worrying
-QUICK_HARD_LOSS=80      # % loss = effectively down
-BAD_STREAK_LIMIT=3      # how many bad quick checks before 30s test
+PRIMARY_INDEX=0       # IRAN server #0 is considered primary
 
-# Long test parameters
-LONG_TEST_DURATION=30   # seconds to run continuous pings when evaluating
-MAX_LOSS_FOR_CANDIDATE=95   # ignore servers with loss >= this in long test
+# EMA (approx 20-30 seconds smoothing)
+EMA_ALPHA_NUM=1       # alpha = 1 / 15  ≈ 0.067
+EMA_ALPHA_DEN=15
 
-SLEEP_INTERVAL=1        # seconds between quick checks
+# Score = LOSS_WEIGHT * loss(%) + rtt(ms)
+LOSS_WEIGHT=100
+RTT_WEIGHT=1
 
-# ------------------------------
-# Helpers: probing
-# ------------------------------
+# When is current server considered "bad"?
+CURR_BAD_LOSS=40         # if EMA loss% >= this
+CURR_BAD_RTT=220         # or EMA rtt >= this
+CURR_BAD_ROUNDS_MIN=5    # must be bad for at least this many loops
 
-# Quick probe: 1 ping, returns "LOSS RTT"
+# When is primary considered "good" enough to come back?
+PRIMARY_GOOD_LOSS=10        # EMA loss% <= this
+PRIMARY_GOOD_RTT=180        # EMA rtt <= this
+PRIMARY_GOOD_ROUNDS_MIN=20  # needs this many good loops (~20s)
+
+# How much better should a candidate be to switch?
+SCORE_MARGIN=300         # candidate_score + margin < current_score
+
+SLEEP_INTERVAL=1         # seconds between checks
+
+# -------------------------------------------------------------
+
+CURRENT=-1                   # current active index (-1: none)
+CURRENT_BAD_ROUNDS=0
+PRIMARY_GOOD_ROUNDS=0
+
+declare -a EMA_LOSS
+declare -a EMA_RTT
+
 quick_probe_server() {
     local IP="$1"
     local OUT
@@ -153,120 +168,64 @@ quick_probe_server() {
     OUT=$(ping -c1 -W1 "$IP" 2>/dev/null)
     if [[ $? -ne 0 ]]; then
         LOSS=100
-        RTT=0
+        RTT=1000
     else
         LOSS=0
         RTT=$(echo "$OUT" | awk -F'/' 'END{print $5}')
         RTT=${RTT%.*}
         [[ -z "$RTT" ]] && RTT=0
     fi
-
     echo "$LOSS $RTT"
 }
 
-# Long probe: ~30 seconds, 1 ping per second
-# returns: "LOSS RTT_AVG"
-long_probe_server() {
-    local IP="$1"
-    local DURATION="$LONG_TEST_DURATION"
+update_ema() {
+    local idx="$1"
+    local loss_sample="$2"
+    local rtt_sample="$3"
 
-    local start=$SECONDS
-    local sent=0
-    local recv=0
-    local rtt_sum=0
+    local old_loss="${EMA_LOSS[$idx]}"
+    local old_rtt="${EMA_RTT[$idx]}"
 
-    while (( SECONDS - start < DURATION )); do
-        local OUT
-        OUT=$(ping -c1 -W1 "$IP" 2>/dev/null)
-        ((sent++))
-
-        if [[ $? -eq 0 ]]; then
-            local rtt
-            rtt=$(echo "$OUT" | awk -F'/' 'END{print $5}')
-            rtt=${rtt%.*}
-            [[ -z "$rtt" ]] && rtt=0
-            rtt_sum=$((rtt_sum + rtt))
-            ((recv++))
-        fi
-
-        sleep 1
-    done
-
-    local loss=100
-    local avg_rtt=0
-
-    if (( sent > 0 )); then
-        loss=$(( (sent - recv) * 100 / sent ))
-    fi
-
-    if (( recv > 0 )); then
-        avg_rtt=$(( rtt_sum / recv ))
+    if [[ -z "$old_loss" ]]; then
+        EMA_LOSS[$idx]=$loss_sample
     else
-        avg_rtt=9999
+        EMA_LOSS[$idx]=$(( (EMA_ALPHA_NUM * loss_sample + (EMA_ALPHA_DEN - EMA_ALPHA_NUM) * old_loss) / EMA_ALPHA_DEN ))
     fi
 
-    echo "$loss $avg_rtt"
+    if [[ -z "$old_rtt" ]]; then
+        EMA_RTT[$idx]=$rtt_sample
+    else
+        EMA_RTT[$idx]=$(( (EMA_ALPHA_NUM * rtt_sample + (EMA_ALPHA_DEN - EMA_ALPHA_NUM) * old_rtt) / EMA_ALPHA_DEN ))
+    fi
 }
 
-# Choose the best server using 30s tests for ALL candidates
-choose_best_server_long() {
-    local i
-    local best_index=-1
-    local best_score=999999
-
-    log "Starting 30-second evaluation for all IRAN servers..."
-
-    for ((i=0; i<COUNT; i++)); do
-        local IP="${IRAN_IPS[$i]}"
-        local loss rtt
-
-        read loss rtt < <(long_probe_server "$IP")
-        local score=$(( loss * 100 + rtt ))
-
-        log "30s result: index=$i ip=$IP loss=${loss}% rtt=${rtt}ms score=$score"
-
-        # Ignore very bad candidates
-        if (( loss >= MAX_LOSS_FOR_CANDIDATE )); then
-            continue
-        fi
-
-        if (( score < best_score )); then
-            best_score=$score
-            best_index=$i
-        fi
-    done
-
-    log "30s evaluation best_index=$best_index best_score=$best_score"
-    echo "$best_index"
+compute_score() {
+    local idx="$1"
+    local loss="${EMA_LOSS[$idx]:-100}"
+    local rtt="${EMA_RTT[$idx]:-1000}"
+    echo $(( LOSS_WEIGHT * loss + RTT_WEIGHT * rtt ))
 }
 
-# ------------------------------
-# Switch VXLAN to given index
-# ------------------------------
 switch_to_index() {
     local INDEX="$1"
     local REMOTE_IP="${IRAN_IPS[$INDEX]}"
 
     log "Switching VXLAN to IRAN[index=$INDEX, ip=$REMOTE_IP]"
 
-    # Backup current routes on VXLAN interface (if any)
     local ROUTES=""
     if ip link show "$VXLAN_IF" >/dev/null 2>&1; then
         ROUTES=$(ip route show dev "$VXLAN_IF" 2>/dev/null || true)
     fi
 
-    # Remove old interface
     ip link set "$VXLAN_IF" down >/dev/null 2>&1 || true
     ip link del "$VXLAN_IF" >/dev/null 2>&1 || true
 
-    # Create new VXLAN interface pointing to new IRAN endpoint
     ip link add "$VXLAN_IF" type vxlan id "$VXLAN_ID" dev "$IFACE" remote "$REMOTE_IP" dstport 4789
     if [[ $? -ne 0 ]]; then
         log "ERROR: failed to create VXLAN interface to $REMOTE_IP"
         return 1
     fi
 
-    # Assign IP addresses
     ip addr flush dev "$VXLAN_IF" || true
 
     ip addr add "$VXLAN_IPV4_KHAREJ" dev "$VXLAN_IF" || {
@@ -281,7 +240,6 @@ switch_to_index() {
         return 1
     }
 
-    # Restore routes that were previously on this interface
     if [[ -n "$ROUTES" ]]; then
         log "Restoring routes on $VXLAN_IF:"
         while IFS= read -r R; do
@@ -291,78 +249,95 @@ switch_to_index() {
         done <<< "$ROUTES"
     fi
 
-    # Flush ARP and FDB to avoid stale MAC/neighbor entries
     ip neigh flush dev "$VXLAN_IF" 2>/dev/null || true
     bridge fdb flush dev "$VXLAN_IF" 2>/dev/null || true
 
     CURRENT="$INDEX"
-    CURRENT_BAD_STREAK=0
+    CURRENT_BAD_ROUNDS=0
     log "VXLAN is now using IRAN[ip=$REMOTE_IP]"
     return 0
 }
 
-# ------------------------------
-# Main monitor loop
-# ------------------------------
 monitor_loop() {
     log "Starting VXLAN failover monitor. IRAN IPs: ${IRAN_IPS[*]}"
 
     while true; do
-        # If we don't have an active server yet → run full 30s evaluation
-        if (( CURRENT == -1 )); then
-            log "No active IRAN server yet. Running 30s evaluation to choose the best."
-            local best
-            best=$(choose_best_server_long)
-            if (( best >= 0 )); then
-                switch_to_index "$best"
-            else
-                log "No suitable IRAN server found in 30s evaluation. Retrying later."
+        local i
+        local best_index=-1
+        local best_score=999999999
+
+        for ((i=0; i<COUNT; i++)); do
+            local IP="${IRAN_IPS[$i]}"
+            local loss rtt
+            read loss rtt < <(quick_probe_server "$IP")
+            update_ema "$i" "$loss" "$rtt"
+
+            local ema_loss="${EMA_LOSS[$i]}"
+            local ema_rtt="${EMA_RTT[$i]}"
+            local score
+            score=$(compute_score "$i")
+
+            log "Health index=$i ip=$IP sample_loss=${loss}% sample_rtt=${rtt}ms ema_loss=${ema_loss}% ema_rtt=${ema_rtt}ms score=$score"
+
+            if (( score < best_score )); then
+                best_score=$score
+                best_index=$i
             fi
-            sleep "$SLEEP_INTERVAL"
-            continue
+        done
+
+        local primary_loss="${EMA_LOSS[$PRIMARY_INDEX]:-100}"
+        local primary_rtt="${EMA_RTT[$PRIMARY_INDEX]:-1000}"
+        local current_loss=100
+        local current_rtt=1000
+        local current_score=999999999
+
+        if (( CURRENT >= 0 )); then
+            current_loss="${EMA_LOSS[$CURRENT]:-100}"
+            current_rtt="${EMA_RTT[$CURRENT]:-1000}"
+            current_score=$(compute_score "$CURRENT")
         fi
 
-        # We have a current server → quick check on it
-        local curr_ip="${IRAN_IPS[$CURRENT]}"
-        local loss rtt
-        read loss rtt < <(quick_probe_server "$curr_ip")
-
-        log "Quick health current_index=$CURRENT ip=$curr_ip loss=${loss}% rtt=${rtt}ms bad_streak=$CURRENT_BAD_STREAK"
-
-        # If effectively down → immediate 30s eval
-        if (( loss >= QUICK_HARD_LOSS )); then
-            log "Current IRAN looks DOWN or very bad (loss=${loss}%). Running 30s evaluation for all servers."
-            local best
-            best=$(choose_best_server_long)
-            if (( best >= 0 && best != CURRENT )); then
-                switch_to_index "$best"
-            else
-                log "30s evaluation did not find a better server than current. Keeping current."
-            fi
-            CURRENT_BAD_STREAK=0
-            sleep "$SLEEP_INTERVAL"
-            continue
+        if (( primary_loss <= PRIMARY_GOOD_LOSS && primary_rtt <= PRIMARY_GOOD_RTT )); then
+            PRIMARY_GOOD_ROUNDS=$((PRIMARY_GOOD_ROUNDS + 1))
+        else
+            PRIMARY_GOOD_ROUNDS=0
         fi
 
-        # Degraded but not fully down? count bad streak
-        if (( loss > QUICK_WARN_LOSS || rtt > QUICK_WARN_RTT )); then
-            CURRENT_BAD_STREAK=$((CURRENT_BAD_STREAK + 1))
-            log "Current IRAN degraded (loss=${loss}%, rtt=${rtt}ms). bad_streak=$CURRENT_BAD_STREAK"
+        if (( current_loss >= CURR_BAD_LOSS || current_rtt >= CURR_BAD_RTT )); then
+            CURRENT_BAD_ROUNDS=$((CURRENT_BAD_ROUNDS + 1))
+        else
+            CURRENT_BAD_ROUNDS=0
+        fi
 
-            if (( CURRENT_BAD_STREAK >= BAD_STREAK_LIMIT )); then
-                log "Current IRAN degraded for ${BAD_STREAK_LIMIT} consecutive checks. Running 30s evaluation for all servers."
-                local best
-                best=$(choose_best_server_long)
-                if (( best >= 0 && best != CURRENT )); then
-                    switch_to_index "$best"
-                else
-                    log "30s evaluation did not find a better server than current. Keeping current."
-                fi
-                CURRENT_BAD_STREAK=0
+        log "Summary: current_index=$CURRENT current_loss=${current_loss}% current_rtt=${current_rtt}ms current_score=$current_score | best_index=$best_index best_score=$best_score | primary_good_rounds=$PRIMARY_GOOD_ROUNDS current_bad_rounds=$CURRENT_BAD_ROUNDS"
+
+        if (( CURRENT < 0 )); then
+            if (( best_index >= 0 )); then
+                log "No active IRAN server, switching to best index=$best_index"
+                switch_to_index "$best_index"
             fi
         else
-            # Healthy again → reset streak
-            CURRENT_BAD_STREAK=0
+            if (( best_index == CURRENT )); then
+                :
+            else
+                if (( CURRENT_BAD_ROUNDS >= CURR_BAD_ROUNDS_MIN )); then
+                    if (( best_score + SCORE_MARGIN < current_score )); then
+                        if (( best_index == PRIMARY_INDEX )); then
+                            if (( PRIMARY_GOOD_ROUNDS >= PRIMARY_GOOD_ROUNDS_MIN )); then
+                                log "Primary has been stable long enough, switching back to primary index=$PRIMARY_INDEX"
+                                switch_to_index "$PRIMARY_INDEX"
+                            else
+                                log "Primary not yet stable enough to switch back (rounds=$PRIMARY_GOOD_ROUNDS/$PRIMARY_GOOD_ROUNDS_MIN)"
+                            fi
+                        else
+                            log "Found better backup index=$best_index (score=$best_score vs current=$current_score), switching."
+                            switch_to_index "$best_index"
+                        fi
+                    else
+                        log "Current server is bad but no significantly better candidate yet."
+                    fi
+                fi
+            fi
         fi
 
         sleep "$SLEEP_INTERVAL"
