@@ -124,17 +124,42 @@ fi
 source "$CONF_FILE"
 
 PRIMARY_INDEX=0
-
-# Health-check parameters
-PING_COUNT=1        # one ping
-PING_TIMEOUT=5      # seconds per ping (~5s failover)
-SLEEP_INTERVAL=1    # seconds between loops
-
 CURRENT=-1          # current active index (-1 = none)
+PRIMARY_STABLE_ROUNDS=0
 
-check_server() {
+# Health-check parameters (tunable thresholds)
+PING_COUNT=4                  # how many ping packets per check
+PING_TIMEOUT=2                # seconds per ping
+MAX_RTT_MS=150                # max acceptable RTT for "stable" primary
+MAX_LOSS_PERCENT=10           # max acceptable packet loss for "stable" primary
+HARD_DOWN_LOSS_PERCENT=80     # consider server "down" when loss >= this
+PRIMARY_RECOVER_OK_ROUNDS=5   # primary must be stable this many loops to switch back
+SWITCH_SCORE_MARGIN=50        # best server must beat current by this score
+SLEEP_INTERVAL=1              # seconds between health checks
+
+# Probe a server: prints "LOSS RTT"
+probe_server() {
     local IP="$1"
-    ping -c "$PING_COUNT" -W "$PING_TIMEOUT" "$IP" >/dev/null 2>&1
+    local OUT
+    local LOSS=100
+    local RTT=0
+
+    OUT=$(ping -c "$PING_COUNT" -W "$PING_TIMEOUT" "$IP" 2>/dev/null)
+    local RC=$?
+
+    if [[ $RC -ne 0 ]]; then
+        LOSS=100
+        RTT=0
+    else
+        LOSS=$(echo "$OUT" | awk -F',' '/packet loss/ {print $3}' | sed 's/[^0-9]//g')
+        [[ -z "$LOSS" ]] && LOSS=100
+
+        RTT=$(echo "$OUT" | awk -F'/' 'END{print $5}')
+        [[ -z "$RTT" ]] && RTT=0
+        RTT=${RTT%.*}
+    fi
+
+    echo "$LOSS $RTT"
 }
 
 switch_to_index() {
@@ -143,24 +168,24 @@ switch_to_index() {
 
     log "Switching VXLAN to IRAN[index=$INDEX, ip=$REMOTE_IP]"
 
-    # 1) Backup current routes on VXLAN interface (if any)
+    # Backup current routes on VXLAN interface (if any)
     local ROUTES=""
     if ip link show "$VXLAN_IF" >/dev/null 2>&1; then
         ROUTES=$(ip route show dev "$VXLAN_IF" 2>/dev/null || true)
     fi
 
-    # 2) Remove old interface
+    # Remove old interface
     ip link set "$VXLAN_IF" down >/dev/null 2>&1 || true
     ip link del "$VXLAN_IF" >/dev/null 2>&1 || true
 
-    # 3) Create new VXLAN interface pointing to new IRAN endpoint
+    # Create new VXLAN interface pointing to new IRAN endpoint
     ip link add "$VXLAN_IF" type vxlan id "$VXLAN_ID" dev "$IFACE" remote "$REMOTE_IP" dstport 4789
     if [[ $? -ne 0 ]]; then
         log "ERROR: failed to create VXLAN interface to $REMOTE_IP"
         return 1
     fi
 
-   # 4) Assign IP addresses
+    # Assign IP addresses
     ip addr flush dev "$VXLAN_IF" || true
 
     ip addr add "$VXLAN_IPV4_KHAREJ" dev "$VXLAN_IF" || {
@@ -175,7 +200,7 @@ switch_to_index() {
         return 1
     }
 
-    # 5) Restore routes that were previously on this interface
+    # Restore routes that were previously on this interface
     if [[ -n "$ROUTES" ]]; then
         log "Restoring routes on $VXLAN_IF:"
         while IFS= read -r R; do
@@ -185,7 +210,7 @@ switch_to_index() {
         done <<< "$ROUTES"
     fi
 
-    # 6) Flush ARP and FDB to avoid stale MAC/neighbor entries
+    # Flush ARP and FDB to avoid stale MAC/neighbor entries
     ip neigh flush dev "$VXLAN_IF" 2>/dev/null || true
     bridge fdb flush dev "$VXLAN_IF" 2>/dev/null || true
 
@@ -194,55 +219,103 @@ switch_to_index() {
     return 0
 }
 
-find_backup_index() {
-    local i
-    for ((i=0; i<COUNT; i++)); do
-        if [[ "$i" -eq "$PRIMARY_INDEX" ]]; then
-            continue
-        fi
-        if check_server "${IRAN_IPS[$i]}"; then
-            echo "$i"
-            return
-        fi
-    done
-    echo "-1"
-}
-
 monitor_loop() {
     log "Starting VXLAN failover monitor. IRAN IPs: ${IRAN_IPS[*]}"
 
     while true; do
-        # Prefer primary when it's reachable
-        if check_server "${IRAN_IPS[$PRIMARY_INDEX]}"; then
-            if [[ "$CURRENT" -ne "$PRIMARY_INDEX" ]]; then
-                log "Primary IRAN is reachable, switching back to primary."
-                switch_to_index "$PRIMARY_INDEX"
-            fi
-        else
-            # Primary is down
-            log "Primary IRAN (${IRAN_IPS[$PRIMARY_INDEX]}) is DOWN."
+        # Arrays to store current health
+        declare -a LOSS_ARR=()
+        declare -a RTT_ARR=()
+        declare -a SCORE_ARR=()
 
-            if [[ "$CURRENT" -ge 0 && "$CURRENT" -ne "$PRIMARY_INDEX" ]]; then
-                # We are on a backup; verify backup health
-                if ! check_server "${IRAN_IPS[$CURRENT]}"; then
-                    log "Current backup IRAN (${IRAN_IPS[$CURRENT]}) is also DOWN. Searching for another backup..."
-                    local B
-                    B=$(find_backup_index)
-                    if [[ "$B" -ge 0 ]]; then
-                        switch_to_index "$B"
-                    else
-                        log "No backup IRAN servers reachable."
-                    fi
+        local i
+        local best_index=-1
+        local best_score=999999
+
+        # Probe all IRAN servers
+        for ((i=0; i<COUNT; i++)); do
+            local IP="${IRAN_IPS[$i]}"
+            read loss rtt < <(probe_server "$IP")
+
+            LOSS_ARR[$i]=$loss
+            RTT_ARR[$i]=$rtt
+
+            # Simple health score: prioritize low loss + low latency
+            local score=$(( loss * 10 + rtt ))
+            SCORE_ARR[$i]=$score
+
+            if (( loss < HARD_DOWN_LOSS_PERCENT )); then
+                if (( score < best_score )); then
+                    best_score=$score
+                    best_index=$i
                 fi
+            fi
+
+            log "Health: index=$i ip=$IP loss=${loss}% rtt=${rtt}ms score=$score"
+        done
+
+        # Primary server health
+        local primary_loss=${LOSS_ARR[$PRIMARY_INDEX]:-100}
+        local primary_rtt=${RTT_ARR[$PRIMARY_INDEX]:-0}
+        local primary_score=${SCORE_ARR[$PRIMARY_INDEX]:-999999}
+
+        # Track primary stability
+        if (( primary_loss <= MAX_LOSS_PERCENT && primary_rtt <= MAX_RTT_MS )); then
+            PRIMARY_STABLE_ROUNDS=$((PRIMARY_STABLE_ROUNDS + 1))
+        else
+            PRIMARY_STABLE_ROUNDS=0
+        fi
+
+        # Current server health
+        local curr_loss=100
+        local curr_rtt=0
+        local curr_score=999999
+        if (( CURRENT >= 0 )); then
+            curr_loss=${LOSS_ARR[$CURRENT]:-100}
+            curr_rtt=${RTT_ARR[$CURRENT]:-0}
+            curr_score=${SCORE_ARR[$CURRENT]:-999999}
+        fi
+
+        log "Summary: current_index=$CURRENT curr_loss=${curr_loss}% curr_rtt=${curr_rtt}ms curr_score=$curr_score | primary_index=$PRIMARY_INDEX primary_loss=${primary_loss}% primary_rtt=${primary_rtt}ms primary_score=$primary_score stable_rounds=$PRIMARY_STABLE_ROUNDS"
+
+        # Decision logic
+
+        if (( best_index == -1 )); then
+            log "No usable IRAN servers (all have very high loss). Keeping current if any."
+        else
+            if (( CURRENT == -1 )); then
+                log "No active IRAN server. Switching to best index=$best_index."
+                switch_to_index "$best_index"
             else
-                # We were on primary or none; try to find backup
-                log "Trying to find a backup IRAN..."
-                local B
-                B=$(find_backup_index)
-                if [[ "$B" -ge 0 ]]; then
-                    switch_to_index "$B"
+                # If current is effectively down, switch immediately
+                if (( curr_loss >= HARD_DOWN_LOSS_PERCENT )); then
+                    log "Current IRAN (${IRAN_IPS[$CURRENT]}) is effectively DOWN (loss=${curr_loss}%). Switching to best index=$best_index."
+                    if (( best_index != CURRENT )); then
+                        switch_to_index "$best_index"
+                    fi
                 else
-                    log "No backup IRAN servers reachable."
+                    # Current is at least partially usable
+                    if (( best_index != CURRENT )); then
+                        if (( best_index == PRIMARY_INDEX )); then
+                            # Switch back to primary only if it's stable enough
+                            if (( PRIMARY_STABLE_ROUNDS >= PRIMARY_RECOVER_OK_ROUNDS )); then
+                                log "Primary is stable for $PRIMARY_STABLE_ROUNDS rounds, switching back to primary."
+                                switch_to_index "$PRIMARY_INDEX"
+                            else
+                                log "Primary not stable enough yet (stable_rounds=$PRIMARY_STABLE_ROUNDS/$PRIMARY_RECOVER_OK_ROUNDS), staying on current."
+                            fi
+                        else
+                            # Switch to a better backup if significantly healthier
+                            if (( best_score + SWITCH_SCORE_MARGIN < curr_score )); then
+                                log "Found much better backup IRAN index=$best_index (score=$best_score vs current=$curr_score). Switching."
+                                switch_to_index "$best_index"
+                            else
+                                log "Current IRAN is still acceptable (score=$curr_score, best=$best_score). No switch."
+                            fi
+                        fi
+                    else
+                        log "Current IRAN server is already the best choice (index=$CURRENT, score=$curr_score)."
+                    fi
                 fi
             fi
         fi
