@@ -123,45 +123,126 @@ fi
 # shellcheck disable=SC1090
 source "$CONF_FILE"
 
-PRIMARY_INDEX=0
-CURRENT=-1          # current active index (-1 = none)
-PRIMARY_STABLE_ROUNDS=0
+PRIMARY_INDEX=0         # just for info / possible future preference
+CURRENT=-1              # current active index (-1 = none)
+CURRENT_BAD_STREAK=0    # how many consecutive bad checks on current
 
-# Health-check parameters (tunable thresholds)
-PING_COUNT=4                  # how many ping packets per check
-PING_TIMEOUT=2                # seconds per ping
-MAX_RTT_MS=150                # max acceptable RTT for "stable" primary
-MAX_LOSS_PERCENT=10           # max acceptable packet loss for "stable" primary
-HARD_DOWN_LOSS_PERCENT=80     # consider server "down" when loss >= this
-PRIMARY_RECOVER_OK_ROUNDS=5   # primary must be stable this many loops to switch back
-SWITCH_SCORE_MARGIN=50        # best server must beat current by this score
-SLEEP_INTERVAL=1              # seconds between health checks
+# Quick health thresholds
+QUICK_WARN_LOSS=30      # % packet loss to start worrying
+QUICK_WARN_RTT=200      # ms RTT to start worrying
+QUICK_HARD_LOSS=80      # % loss = effectively down
+BAD_STREAK_LIMIT=3      # how many bad quick checks before 30s test
 
-# Probe a server: prints "LOSS RTT"
-probe_server() {
+# Long test parameters
+LONG_TEST_DURATION=30   # seconds to run continuous pings when evaluating
+MAX_LOSS_FOR_CANDIDATE=95   # ignore servers with loss >= this in long test
+
+SLEEP_INTERVAL=1        # seconds between quick checks
+
+# ------------------------------
+# Helpers: probing
+# ------------------------------
+
+# Quick probe: 1 ping, returns "LOSS RTT"
+quick_probe_server() {
     local IP="$1"
     local OUT
     local LOSS=100
     local RTT=0
 
-    OUT=$(ping -c "$PING_COUNT" -W "$PING_TIMEOUT" "$IP" 2>/dev/null)
-    local RC=$?
-
-    if [[ $RC -ne 0 ]]; then
+    OUT=$(ping -c1 -W1 "$IP" 2>/dev/null)
+    if [[ $? -ne 0 ]]; then
         LOSS=100
         RTT=0
     else
-        LOSS=$(echo "$OUT" | awk -F',' '/packet loss/ {print $3}' | sed 's/[^0-9]//g')
-        [[ -z "$LOSS" ]] && LOSS=100
-
+        LOSS=0
         RTT=$(echo "$OUT" | awk -F'/' 'END{print $5}')
-        [[ -z "$RTT" ]] && RTT=0
         RTT=${RTT%.*}
+        [[ -z "$RTT" ]] && RTT=0
     fi
 
     echo "$LOSS $RTT"
 }
 
+# Long probe: ~30 seconds, 1 ping per second
+# returns: "LOSS RTT_AVG"
+long_probe_server() {
+    local IP="$1"
+    local DURATION="$LONG_TEST_DURATION"
+
+    local start=$SECONDS
+    local sent=0
+    local recv=0
+    local rtt_sum=0
+
+    while (( SECONDS - start < DURATION )); do
+        local OUT
+        OUT=$(ping -c1 -W1 "$IP" 2>/dev/null)
+        ((sent++))
+
+        if [[ $? -eq 0 ]]; then
+            local rtt
+            rtt=$(echo "$OUT" | awk -F'/' 'END{print $5}')
+            rtt=${rtt%.*}
+            [[ -z "$rtt" ]] && rtt=0
+            rtt_sum=$((rtt_sum + rtt))
+            ((recv++))
+        fi
+
+        sleep 1
+    done
+
+    local loss=100
+    local avg_rtt=0
+
+    if (( sent > 0 )); then
+        loss=$(( (sent - recv) * 100 / sent ))
+    fi
+
+    if (( recv > 0 )); then
+        avg_rtt=$(( rtt_sum / recv ))
+    else
+        avg_rtt=9999
+    fi
+
+    echo "$loss $avg_rtt"
+}
+
+# Choose the best server using 30s tests for ALL candidates
+choose_best_server_long() {
+    local i
+    local best_index=-1
+    local best_score=999999
+
+    log "Starting 30-second evaluation for all IRAN servers..."
+
+    for ((i=0; i<COUNT; i++)); do
+        local IP="${IRAN_IPS[$i]}"
+        local loss rtt
+
+        read loss rtt < <(long_probe_server "$IP")
+        local score=$(( loss * 100 + rtt ))
+
+        log "30s result: index=$i ip=$IP loss=${loss}% rtt=${rtt}ms score=$score"
+
+        # Ignore very bad candidates
+        if (( loss >= MAX_LOSS_FOR_CANDIDATE )); then
+            continue
+        fi
+
+        if (( score < best_score )); then
+            best_score=$score
+            best_index=$i
+        fi
+    done
+
+    log "30s evaluation best_index=$best_index best_score=$best_score"
+    echo "$best_index"
+}
+
+# ------------------------------
+# Switch VXLAN to given index
+# ------------------------------
 switch_to_index() {
     local INDEX="$1"
     local REMOTE_IP="${IRAN_IPS[$INDEX]}"
@@ -215,109 +296,73 @@ switch_to_index() {
     bridge fdb flush dev "$VXLAN_IF" 2>/dev/null || true
 
     CURRENT="$INDEX"
+    CURRENT_BAD_STREAK=0
     log "VXLAN is now using IRAN[ip=$REMOTE_IP]"
     return 0
 }
 
+# ------------------------------
+# Main monitor loop
+# ------------------------------
 monitor_loop() {
     log "Starting VXLAN failover monitor. IRAN IPs: ${IRAN_IPS[*]}"
 
     while true; do
-        # Arrays to store current health
-        declare -a LOSS_ARR=()
-        declare -a RTT_ARR=()
-        declare -a SCORE_ARR=()
-
-        local i
-        local best_index=-1
-        local best_score=999999
-
-        # Probe all IRAN servers
-        for ((i=0; i<COUNT; i++)); do
-            local IP="${IRAN_IPS[$i]}"
-            read loss rtt < <(probe_server "$IP")
-
-            LOSS_ARR[$i]=$loss
-            RTT_ARR[$i]=$rtt
-
-            # Simple health score: prioritize low loss + low latency
-            local score=$(( loss * 10 + rtt ))
-            SCORE_ARR[$i]=$score
-
-            if (( loss < HARD_DOWN_LOSS_PERCENT )); then
-                if (( score < best_score )); then
-                    best_score=$score
-                    best_index=$i
-                fi
-            fi
-
-            log "Health: index=$i ip=$IP loss=${loss}% rtt=${rtt}ms score=$score"
-        done
-
-        # Primary server health
-        local primary_loss=${LOSS_ARR[$PRIMARY_INDEX]:-100}
-        local primary_rtt=${RTT_ARR[$PRIMARY_INDEX]:-0}
-        local primary_score=${SCORE_ARR[$PRIMARY_INDEX]:-999999}
-
-        # Track primary stability
-        if (( primary_loss <= MAX_LOSS_PERCENT && primary_rtt <= MAX_RTT_MS )); then
-            PRIMARY_STABLE_ROUNDS=$((PRIMARY_STABLE_ROUNDS + 1))
-        else
-            PRIMARY_STABLE_ROUNDS=0
-        fi
-
-        # Current server health
-        local curr_loss=100
-        local curr_rtt=0
-        local curr_score=999999
-        if (( CURRENT >= 0 )); then
-            curr_loss=${LOSS_ARR[$CURRENT]:-100}
-            curr_rtt=${RTT_ARR[$CURRENT]:-0}
-            curr_score=${SCORE_ARR[$CURRENT]:-999999}
-        fi
-
-        log "Summary: current_index=$CURRENT curr_loss=${curr_loss}% curr_rtt=${curr_rtt}ms curr_score=$curr_score | primary_index=$PRIMARY_INDEX primary_loss=${primary_loss}% primary_rtt=${primary_rtt}ms primary_score=$primary_score stable_rounds=$PRIMARY_STABLE_ROUNDS"
-
-        # Decision logic
-
-        if (( best_index == -1 )); then
-            log "No usable IRAN servers (all have very high loss). Keeping current if any."
-        else
-            if (( CURRENT == -1 )); then
-                log "No active IRAN server. Switching to best index=$best_index."
-                switch_to_index "$best_index"
+        # If we don't have an active server yet → run full 30s evaluation
+        if (( CURRENT == -1 )); then
+            log "No active IRAN server yet. Running 30s evaluation to choose the best."
+            local best
+            best=$(choose_best_server_long)
+            if (( best >= 0 )); then
+                switch_to_index "$best"
             else
-                # If current is effectively down, switch immediately
-                if (( curr_loss >= HARD_DOWN_LOSS_PERCENT )); then
-                    log "Current IRAN (${IRAN_IPS[$CURRENT]}) is effectively DOWN (loss=${curr_loss}%). Switching to best index=$best_index."
-                    if (( best_index != CURRENT )); then
-                        switch_to_index "$best_index"
-                    fi
-                else
-                    # Current is at least partially usable
-                    if (( best_index != CURRENT )); then
-                        if (( best_index == PRIMARY_INDEX )); then
-                            # Switch back to primary only if it's stable enough
-                            if (( PRIMARY_STABLE_ROUNDS >= PRIMARY_RECOVER_OK_ROUNDS )); then
-                                log "Primary is stable for $PRIMARY_STABLE_ROUNDS rounds, switching back to primary."
-                                switch_to_index "$PRIMARY_INDEX"
-                            else
-                                log "Primary not stable enough yet (stable_rounds=$PRIMARY_STABLE_ROUNDS/$PRIMARY_RECOVER_OK_ROUNDS), staying on current."
-                            fi
-                        else
-                            # Switch to a better backup if significantly healthier
-                            if (( best_score + SWITCH_SCORE_MARGIN < curr_score )); then
-                                log "Found much better backup IRAN index=$best_index (score=$best_score vs current=$curr_score). Switching."
-                                switch_to_index "$best_index"
-                            else
-                                log "Current IRAN is still acceptable (score=$curr_score, best=$best_score). No switch."
-                            fi
-                        fi
-                    else
-                        log "Current IRAN server is already the best choice (index=$CURRENT, score=$curr_score)."
-                    fi
-                fi
+                log "No suitable IRAN server found in 30s evaluation. Retrying later."
             fi
+            sleep "$SLEEP_INTERVAL"
+            continue
+        fi
+
+        # We have a current server → quick check on it
+        local curr_ip="${IRAN_IPS[$CURRENT]}"
+        local loss rtt
+        read loss rtt < <(quick_probe_server "$curr_ip")
+
+        log "Quick health current_index=$CURRENT ip=$curr_ip loss=${loss}% rtt=${rtt}ms bad_streak=$CURRENT_BAD_STREAK"
+
+        # If effectively down → immediate 30s eval
+        if (( loss >= QUICK_HARD_LOSS )); then
+            log "Current IRAN looks DOWN or very bad (loss=${loss}%). Running 30s evaluation for all servers."
+            local best
+            best=$(choose_best_server_long)
+            if (( best >= 0 && best != CURRENT )); then
+                switch_to_index "$best"
+            else
+                log "30s evaluation did not find a better server than current. Keeping current."
+            fi
+            CURRENT_BAD_STREAK=0
+            sleep "$SLEEP_INTERVAL"
+            continue
+        fi
+
+        # Degraded but not fully down? count bad streak
+        if (( loss > QUICK_WARN_LOSS || rtt > QUICK_WARN_RTT )); then
+            CURRENT_BAD_STREAK=$((CURRENT_BAD_STREAK + 1))
+            log "Current IRAN degraded (loss=${loss}%, rtt=${rtt}ms). bad_streak=$CURRENT_BAD_STREAK"
+
+            if (( CURRENT_BAD_STREAK >= BAD_STREAK_LIMIT )); then
+                log "Current IRAN degraded for ${BAD_STREAK_LIMIT} consecutive checks. Running 30s evaluation for all servers."
+                local best
+                best=$(choose_best_server_long)
+                if (( best >= 0 && best != CURRENT )); then
+                    switch_to_index "$best"
+                else
+                    log "30s evaluation did not find a better server than current. Keeping current."
+                fi
+                CURRENT_BAD_STREAK=0
+            fi
+        else
+            # Healthy again → reset streak
+            CURRENT_BAD_STREAK=0
         fi
 
         sleep "$SLEEP_INTERVAL"
