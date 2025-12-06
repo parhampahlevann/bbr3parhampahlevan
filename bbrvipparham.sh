@@ -107,6 +107,9 @@ cat <<'EOF' > /usr/local/bin/vxlan-failover.sh
 CONF_FILE="/etc/vxlan-failover.conf"
 LOG_FILE="/var/log/vxlan-failover.log"
 
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+touch "$LOG_FILE" 2>/dev/null || true
+
 log() {
     echo "[$(date +'%F %T')] $*" | tee -a "$LOG_FILE"
 }
@@ -124,8 +127,8 @@ PRIMARY_INDEX=0
 
 # Health-check parameters
 PING_COUNT=1        # one ping
-PING_TIMEOUT=5      # seconds per ping (≈ 5s failover)
-SLEEP_INTERVAL=1    # between loops
+PING_TIMEOUT=5      # seconds per ping (~5s failover)
+SLEEP_INTERVAL=1    # seconds between loops
 
 CURRENT=-1          # current active index (-1 = none)
 
@@ -140,25 +143,51 @@ switch_to_index() {
 
     log "Switching VXLAN to IRAN[index=$INDEX, ip=$REMOTE_IP]"
 
+    # 1) Backup current routes on VXLAN interface (if any)
+    local ROUTES=""
+    if ip link show "$VXLAN_IF" >/dev/null 2>&1; then
+        ROUTES=$(ip route show dev "$VXLAN_IF" 2>/dev/null || true)
+    fi
+
+    # 2) Remove old interface
+    ip link set "$VXLAN_IF" down >/dev/null 2>&1 || true
     ip link del "$VXLAN_IF" >/dev/null 2>&1 || true
 
+    # 3) Create new VXLAN interface pointing to new IRAN endpoint
     ip link add "$VXLAN_IF" type vxlan id "$VXLAN_ID" dev "$IFACE" remote "$REMOTE_IP" dstport 4789
     if [[ $? -ne 0 ]]; then
         log "ERROR: failed to create VXLAN interface to $REMOTE_IP"
         return 1
     fi
 
+   # 4) Assign IP addresses
     ip addr flush dev "$VXLAN_IF" || true
+
     ip addr add "$VXLAN_IPV4_KHAREJ" dev "$VXLAN_IF" || {
         log "ERROR: failed to set IPv4 address on $VXLAN_IF"
         return 1
     }
+
     ip -6 addr add "$VXLAN_IPV6_KHAREJ" dev "$VXLAN_IF" >/dev/null 2>&1 || true
 
     ip link set "$VXLAN_IF" up || {
         log "ERROR: failed to set $VXLAN_IF up"
         return 1
     }
+
+    # 5) Restore routes that were previously on this interface
+    if [[ -n "$ROUTES" ]]; then
+        log "Restoring routes on $VXLAN_IF:"
+        while IFS= read -r R; do
+            [[ -z "$R" ]] && continue
+            log "  ip route add $R"
+            ip route add $R 2>/dev/null || log "WARN: failed to restore route: $R"
+        done <<< "$ROUTES"
+    fi
+
+    # 6) Flush ARP and FDB to avoid stale MAC/neighbor entries
+    ip neigh flush dev "$VXLAN_IF" 2>/dev/null || true
+    bridge fdb flush dev "$VXLAN_IF" 2>/dev/null || true
 
     CURRENT="$INDEX"
     log "VXLAN is now using IRAN[ip=$REMOTE_IP]"
@@ -183,7 +212,7 @@ monitor_loop() {
     log "Starting VXLAN failover monitor. IRAN IPs: ${IRAN_IPS[*]}"
 
     while true; do
-        # If primary is reachable → prefer it
+        # Prefer primary when it's reachable
         if check_server "${IRAN_IPS[$PRIMARY_INDEX]}"; then
             if [[ "$CURRENT" -ne "$PRIMARY_INDEX" ]]; then
                 log "Primary IRAN is reachable, switching back to primary."
@@ -206,7 +235,7 @@ monitor_loop() {
                     fi
                 fi
             else
-                # We were on primary or nothing; try to find backup
+                # We were on primary or none; try to find backup
                 log "Trying to find a backup IRAN..."
                 local B
                 B=$(find_backup_index)
@@ -226,6 +255,9 @@ monitor_loop
 EOF
 
     chmod +x /usr/local/bin/vxlan-failover.sh
+
+    # Kill any existing failover monitor to avoid duplicates
+    pkill -f /usr/local/bin/vxlan-failover.sh 2>/dev/null || true
 
     # Start failover script now (background)
     /usr/local/bin/vxlan-failover.sh &
