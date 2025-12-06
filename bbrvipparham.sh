@@ -136,13 +136,12 @@ DEGRADED_RTT=250          # >= this ms => degraded
 
 BAD_STREAK_LIMIT=3        # number of consecutive degraded checks before switching
 
-PRIMARY_OK_LOSS=15        # for return: primary must be this good or better
-PRIMARY_OK_RTT=200
-PRIMARY_STABLE_ROUNDS=10  # how many good loops before returning to primary
+PRIMARY_OK_LOSS=20        # for return: primary must be this good or better
+PRIMARY_OK_RTT=220
+PRIMARY_STABLE_ROUNDS=5   # how many good loops before returning to primary
 
 # Score = loss*100 + rtt (lower is better)
-SCORE_MARGIN_SWITCH=300   # candidate must be this much better than current to switch
-SCORE_MARGIN_RETURN=150   # for return to primary
+SCORE_MARGIN_SWITCH=300   # candidate must be this much better than current to switch *away* from current
 
 SLEEP_INTERVAL=2          # seconds between health checks
 
@@ -296,14 +295,14 @@ monitor_loop() {
         local prim_score
         prim_score=$(compute_score "$prim_loss" "$prim_rtt")
 
-        # Track primary stability
+        # Track primary stability (برای برگشت)
         if (( prim_loss <= PRIMARY_OK_LOSS && prim_rtt <= PRIMARY_OK_RTT )); then
             PRIMARY_GOOD_STREAK=$((PRIMARY_GOOD_STREAK + 1))
         else
             PRIMARY_GOOD_STREAK=0
         fi
 
-        # Track current degradation
+        # Track current degradation (برای سوئیچ به بکاپ)
         if (( curr_loss >= DEGRADED_LOSS || curr_rtt >= DEGRADED_RTT )); then
             CURRENT_BAD_STREAK=$((CURRENT_BAD_STREAK + 1))
         else
@@ -345,15 +344,12 @@ monitor_loop() {
                     fi
                 fi
 
-                # 2c) If we are on backup, maybe return to primary
+                # 2c) اگر روی بکاپ هستیم و primary چند دور خوب بوده → حتماً برگرد روی primary
                 if (( CURRENT != PRIMARY_INDEX )); then
                     if (( PRIMARY_GOOD_STREAK >= PRIMARY_STABLE_ROUNDS )); then
-                        if (( prim_score + SCORE_MARGIN_RETURN < curr_score )); then
-                            log "Primary has been stable long enough and is clearly better. Switching back to primary."
-                            switch_to_index "$PRIMARY_INDEX"
-                        else
-                            log "Primary is stable but not significantly better than current (no return yet)."
-                        fi
+                        log "Primary IRAN has been stable for ${PRIMARY_GOOD_STREAK} checks. Switching back to PRIMARY (index=$PRIMARY_INDEX)."
+                        switch_to_index "$PRIMARY_INDEX"
+                        PRIMARY_GOOD_STREAK=0
                     fi
                 fi
             fi
