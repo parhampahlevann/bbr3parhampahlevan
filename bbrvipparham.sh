@@ -7,7 +7,7 @@
 VXLAN_IF="vxlan100"
 VXLAN_ID=100
 
-# Local VXLAN IPs
+# Local VXLAN IPs (inside tunnel)
 VXLAN_IPV4_KHAREJ="10.123.1.2/30"
 VXLAN_IPV4_IRAN="10.123.1.1/30"
 VXLAN_IPV6_KHAREJ="fd11:1ceb:1d11::2/64"
@@ -125,23 +125,23 @@ source "$CONF_FILE"
 
 # --------- HEALTH & FAILOVER PARAMETERS (TUNABLE) ---------
 
-PRIMARY_INDEX=0           # IRAN[0] is primary
+PRIMARY_INDEX=0           # IRAN[0] is PRIMARY (main Iran server)
 
 PING_COUNT=3              # pings per check
 PING_TIMEOUT=1            # seconds per ping
 
+# When is a server fully DOWN?
 HARD_DOWN_LOSS=90         # >= this % loss => server considered DOWN
-DEGRADED_LOSS=40          # >= this % => degraded
-DEGRADED_RTT=250          # >= this ms => degraded
 
+# When is current considered degraded (برای رفتن روی بکاپ)
+DEGRADED_LOSS=40          # >= this % => degraded
+DEGRADED_RTT=300          # >= this ms => degraded
 BAD_STREAK_LIMIT=3        # number of consecutive degraded checks before switching
 
-PRIMARY_OK_LOSS=20        # for return: primary must be this good or better
-PRIMARY_OK_RTT=220
-PRIMARY_STABLE_ROUNDS=5   # how many good loops before returning to primary
-
-# Score = loss*100 + rtt (lower is better)
-SCORE_MARGIN_SWITCH=300   # candidate must be this much better than current to switch *away* from current
+# شرایط "پایداری" سرور اصلی برای برگشت:
+PRIMARY_OK_LOSS=50        # loss <= this%
+PRIMARY_OK_RTT=450        # rtt <= this ms
+PRIMARY_STABLE_ROUNDS=3   # چند حلقه پشت‌سرهم خوب باشد (با SLEEP=2 یعنی حدود ۶ ثانیه)
 
 SLEEP_INTERVAL=2          # seconds between health checks
 
@@ -193,6 +193,7 @@ probe_server() {
 compute_score() {
     local loss="$1"
     local rtt="$2"
+    # lower score = better
     echo $(( loss * 100 + rtt ))
 }
 
@@ -257,8 +258,6 @@ monitor_loop() {
 
     while true; do
         local i
-        local best_index=-1
-        local best_score=999999999
 
         # Probe all IRAN servers
         for ((i=0; i<COUNT; i++)); do
@@ -272,82 +271,95 @@ monitor_loop() {
             score=$(compute_score "$loss" "$rtt")
 
             log "Health index=$i ip=$IP loss=${loss}% rtt=${rtt}ms score=$score"
-
-            # Only consider servers that are not totally dead
-            if (( loss < HARD_DOWN_LOSS && score < best_score )); then
-                best_score=$score
-                best_index=$i
-            fi
         done
 
         local curr_loss=100
         local curr_rtt=1000
-        local curr_score=999999999
 
         if (( CURRENT >= 0 )); then
             curr_loss=${LOSS_ARR[$CURRENT]:-100}
             curr_rtt=${RTT_ARR[$CURRENT]:-1000}
-            curr_score=$(compute_score "$curr_loss" "$curr_rtt")
         fi
 
         local prim_loss=${LOSS_ARR[$PRIMARY_INDEX]:-100}
         local prim_rtt=${RTT_ARR[$PRIMARY_INDEX]:-1000}
-        local prim_score
-        prim_score=$(compute_score "$prim_loss" "$prim_rtt")
 
-        # Track primary stability (برای برگشت)
+        # Track primary stability (برای برگشت روی سرور اصلی)
         if (( prim_loss <= PRIMARY_OK_LOSS && prim_rtt <= PRIMARY_OK_RTT )); then
             PRIMARY_GOOD_STREAK=$((PRIMARY_GOOD_STREAK + 1))
         else
             PRIMARY_GOOD_STREAK=0
         fi
 
-        # Track current degradation (برای سوئیچ به بکاپ)
+        # Track current degradation (برای رفتن روی بکاپ)
         if (( curr_loss >= DEGRADED_LOSS || curr_rtt >= DEGRADED_RTT )); then
             CURRENT_BAD_STREAK=$((CURRENT_BAD_STREAK + 1))
         else
             CURRENT_BAD_STREAK=0
         fi
 
-        log "Summary: current_index=$CURRENT curr_loss=${curr_loss}% curr_rtt=${curr_rtt}ms curr_score=$curr_score | best_index=$best_index best_score=$best_score | primary_loss=${prim_loss}% primary_rtt=${prim_rtt}ms primary_good_streak=$PRIMARY_GOOD_STREAK bad_streak=$CURRENT_BAD_STREAK"
+        log "Summary: current_index=$CURRENT curr_loss=${curr_loss}% curr_rtt=${curr_rtt}ms | primary_loss=${prim_loss}% primary_rtt=${prim_rtt}ms primary_good_streak=$PRIMARY_GOOD_STREAK bad_streak=$CURRENT_BAD_STREAK"
 
-        # Case 1: No active server yet → pick best reachable
+        # --------- تصمیم‌گیری ---------
+
+        # Case 1: هیچ سرور فعالی نداریم → سعی کن روی primary بری، اگر DOWN بود روی بعدی
         if (( CURRENT < 0 )); then
-            if (( best_index >= 0 )); then
-                log "No active IRAN server. Switching to best index=$best_index"
-                switch_to_index "$best_index"
+            if (( prim_loss < HARD_DOWN_LOSS )); then
+                log "No active IRAN. PRIMARY seems reachable, switching to PRIMARY."
+                switch_to_index "$PRIMARY_INDEX"
+            else
+                # اگر خود primary هم Down بود، یک بکاپ سالم پیدا کن
+                for ((i=0; i<COUNT; i++)); do
+                    (( i == PRIMARY_INDEX )) && continue
+                    if (( ${LOSS_ARR[$i]:-100} < HARD_DOWN_LOSS )); then
+                        log "No active IRAN and PRIMARY is down. Switching to backup index=$i."
+                        switch_to_index "$i"
+                        break
+                    fi
+                done
             fi
-        else
-            # Case 2: Active server exists
 
-            # 2a) if current is effectively DOWN → immediate switch to best
+        else
+            # Case 2: سرور فعلی داریم
+
+            # 2a) اگر سرور فعلی کاملاً DOWN شد → برو روی بهترین مورد بعدی
             if (( curr_loss >= HARD_DOWN_LOSS )); then
-                if (( best_index >= 0 && best_index != CURRENT )); then
-                    log "Current IRAN is effectively DOWN (loss=${curr_loss}%). Switching to best index=$best_index"
-                    switch_to_index "$best_index"
+                log "Current IRAN is effectively DOWN (loss=${curr_loss}%). Looking for alternative..."
+                # اولویت با PRIMARY اگر قابل قبول باشد
+                if (( prim_loss < HARD_DOWN_LOSS )); then
+                    log "PRIMARY is reachable enough. Switching to PRIMARY."
+                    switch_to_index "$PRIMARY_INDEX"
                 else
-                    log "Current IRAN is DOWN but no better candidate found."
+                    # PRIMARY هم down است → یکی از بکاپ‌ها را انتخاب کن
+                    for ((i=0; i<COUNT; i++)); do
+                        (( i == CURRENT )) && continue
+                        if (( ${LOSS_ARR[$i]:-100} < HARD_DOWN_LOSS )); then
+                            log "Switching to backup index=$i (PRIMARY also bad)."
+                            switch_to_index "$i"
+                            break
+                        fi
+                    done
                 fi
 
             else
-                # 2b) current is not fully down, but may be degraded
-                if (( CURRENT_BAD_STREAK >= BAD_STREAK_LIMIT )); then
-                    if (( best_index >= 0 && best_index != CURRENT )); then
-                        if (( best_score + SCORE_MARGIN_SWITCH < curr_score )); then
-                            log "Current IRAN degraded for $CURRENT_BAD_STREAK checks, better candidate index=$best_index found. Switching."
-                            switch_to_index "$best_index"
-                        else
-                            log "Current IRAN degraded but candidate is not significantly better (score margin)."
-                        fi
-                    else
-                        log "Current IRAN degraded but no alternative reachable server."
+                # 2b) اگر روی PRIMARY هستیم و degrade شد → برو روی بکاپ
+                if (( CURRENT == PRIMARY_INDEX )); then
+                    if (( CURRENT_BAD_STREAK >= BAD_STREAK_LIMIT )); then
+                        log "PRIMARY degraded for $CURRENT_BAD_STREAK checks. Searching for a better backup..."
+                        for ((i=0; i<COUNT; i++)); do
+                            (( i == PRIMARY_INDEX )) && continue
+                            if (( ${LOSS_ARR[$i]:-100} < HARD_DOWN_LOSS )); then
+                                log "Found backup index=$i. Switching from degraded PRIMARY to backup."
+                                switch_to_index "$i"
+                                break
+                            fi
+                        done
+                        CURRENT_BAD_STREAK=0
                     fi
-                fi
-
-                # 2c) اگر روی بکاپ هستیم و primary چند دور خوب بوده → حتماً برگرد روی primary
-                if (( CURRENT != PRIMARY_INDEX )); then
+                else
+                    # 2c) اگر روی بکاپ هستیم و PRIMARY چند دور خوب بوده → حتماً برگرد روی PRIMARY
                     if (( PRIMARY_GOOD_STREAK >= PRIMARY_STABLE_ROUNDS )); then
-                        log "Primary IRAN has been stable for ${PRIMARY_GOOD_STREAK} checks. Switching back to PRIMARY (index=$PRIMARY_INDEX)."
+                        log "PRIMARY has been stable for ${PRIMARY_GOOD_STREAK} checks. Switching back to PRIMARY."
                         switch_to_index "$PRIMARY_INDEX"
                         PRIMARY_GOOD_STREAK=0
                     fi
