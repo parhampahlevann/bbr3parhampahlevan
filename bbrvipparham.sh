@@ -1085,6 +1085,89 @@ EOL
     fi
 }
 
+# =========================================================================
+# Optional extra layer: Cake queue discipline with explicit bandwidth
+# shaping. This targets LOCAL bufferbloat/jitter (queueing on this
+# server's own network interface under load), which is a different
+# problem from backbone-level jitter/reordering further out on the
+# path (which no server-side setting can fix). Cake needs to know the
+# real uplink speed to shape effectively, so it's a separate opt-in
+# step rather than something applied blindly by default.
+# =========================================================================
+configure_bandwidth_shaping() {
+    root_access
+
+    if ! tc qdisc add dev lo root cake 2>/dev/null; then
+        echo -e "${yellow}This kernel may not support the 'cake' qdisc. Attempting to load the module...${rest}"
+        modprobe sch_cake 2>/dev/null
+    fi
+    tc qdisc del dev lo root 2>/dev/null
+
+    if ! tc qdisc show | grep -q cake && ! modprobe sch_cake 2>/dev/null; then
+        echo -e "${red}The 'cake' qdisc is not available on this kernel. Skipping.${rest}"
+        echo -e "${yellow}(Usually available on kernel 4.19+ / most current Ubuntu, Debian 11+, CentOS Stream.)${rest}"
+        return
+    fi
+
+    local iface
+    iface=$(ip route | grep default | awk '{print $5}' | head -n1)
+    if [ -z "$iface" ]; then
+        echo -e "${red}Could not detect the default network interface.${rest}"
+        return
+    fi
+
+    echo -e "${cyan}Enter this server's real, sustained uplink bandwidth (not the burst/marketing number).${rest}"
+    echo -e "${cyan}If unsure, run a speed test first and use the upload result.${rest}"
+    read -p "Uplink bandwidth in Mbit/s (e.g. 500): " uplink_mbit
+
+    if ! [[ "$uplink_mbit" =~ ^[0-9]+$ ]] || [ "$uplink_mbit" -le 0 ]; then
+        echo "Invalid value."
+        return
+    fi
+
+    # Shape to ~95% of the real link speed: this makes THIS server's own
+    # qdisc the bottleneck (where active queue management can act)
+    # instead of some upstream/ISP queue with no AQM, which is a very
+    # common hidden source of jitter under load.
+    local shaped_mbit=$((uplink_mbit * 95 / 100))
+    [ "$shaped_mbit" -lt 1 ] && shaped_mbit=1
+
+    tc qdisc del dev "$iface" root 2>/dev/null
+    if tc qdisc replace dev "$iface" root cake bandwidth "${shaped_mbit}mbit" nat dual-srchost 2>/dev/null; then
+        echo -e "${green}Cake shaping applied on $iface at ${shaped_mbit}mbit (95% of ${uplink_mbit}mbit).${rest}"
+    else
+        echo -e "${red}Failed to apply cake qdisc on $iface.${rest}"
+        return
+    fi
+
+    # Persist across reboot with a small oneshot systemd unit
+    cat <<EOF > /usr/local/sbin/rtt-cake-shaping.sh
+#!/bin/bash
+IFACE=\$(ip route | grep default | awk '{print \$5}' | head -n1)
+[ -n "\$IFACE" ] && tc qdisc replace dev "\$IFACE" root cake bandwidth ${shaped_mbit}mbit nat dual-srchost
+EOF
+    chmod +x /usr/local/sbin/rtt-cake-shaping.sh
+
+    cat <<EOF > /etc/systemd/system/rtt-cake-shaping.service
+[Unit]
+Description=RTT tunnel Cake bandwidth shaping (persists across reboot)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/rtt-cake-shaping.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable rtt-cake-shaping.service > /dev/null 2>&1
+
+    echo -e "${yellow}Note: this reduces jitter caused by local queueing under load. It cannot${rest}"
+    echo -e "${yellow}fix jitter/reordering that occurs further out on the backbone path.${rest}"
+}
+
 # ip & version
 myip=$(hostname -I | awk '{print $1}')
 version=$([ -f "$INSTALL_DIR/RTT" ] && "$INSTALL_DIR/RTT" -v 2>&1 | grep -o 'version="[0-9.]*"')
@@ -1122,6 +1205,7 @@ echo -e "${purple}18) Re-apply kernel tuning profile only${rest}"
 echo -e "${cyan}19) Change Tunnel SNI (no reinstall)${rest}"
 echo -e "${cyan}20) Install HAProxy (port forwarding)${rest}"
 echo -e "${purple}21) Setup Multi-SNI parallel tunnels${rest}"
+echo -e "${purple}22) Configure Cake bandwidth shaping (jitter reduction)${rest}"
 echo "0) Exit"
 echo -e "${purple} --------------${cyan}$version${purple}--------------${rest}"
 read -p "Please choose: " choice
@@ -1148,6 +1232,7 @@ case $choice in
     19) change_sni ;;
     20) install_haproxy ;;
     21) install_multi_sni ;;
+    22) configure_bandwidth_shaping ;;
     0) exit ;;
     *) echo "Invalid choice. Please try again." ;;
 esac
