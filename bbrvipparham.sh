@@ -1,4 +1,9 @@
 #!/bin/bash
+# =========================================================================
+# RTT (ReverseTlsTunnel) Installer - v2
+# بازنویسی کامل با فیکس باگ‌های نصب/سرویس + اعمال خودکار پروفایل تیونینگ
+# کرنل/شبکه در لحظه‌ی نصب تونل، برای رفع ناپایداری پینگ.
+# =========================================================================
 
 #colors
 red='\033[0;31m'
@@ -10,12 +15,10 @@ cyan='\033[0;36m'
 white='\033[0;37m'
 rest='\033[0m'
 
-# -----------------------------------------------------------------------
-# FIX: همیشه در /root کار می‌کنیم تا با مسیر هاردکد شده در سرویس‌ها
-# (ExecStart=/root/RTT) همخوانی داشته باشه، صرف نظر از این که اسکریپت
-# از کدام دایرکتوری اجرا شده باشد.
-# -----------------------------------------------------------------------
 INSTALL_DIR="/root"
+TUNNEL_MSS=1340
+MSS_CLAMP_SCRIPT="/usr/local/sbin/rtt-mss-clamp.sh"
+MSS_CLAMP_SERVICE="/etc/systemd/system/rtt-mss-clamp.service"
 
 root_access() {
     if [ "$EUID" -ne 0 ]; then
@@ -46,25 +49,136 @@ detect_distribution() {
 check_dependencies() {
     detect_distribution
 
-    local dependencies=("wget" "lsof" "iptables" "unzip" "gcc" "git" "curl" "tar")
+    local dependencies=("wget" "lsof" "iptables" "unzip" "gcc" "git" "curl" "tar" "mtr" "iproute2")
 
     for dep in "${dependencies[@]}"; do
+        # iproute2 دستوری به همین اسم نداره (ss/ip داره)، پس چک جدا
+        if [ "$dep" == "iproute2" ]; then
+            command -v ss &> /dev/null || sudo "${package_manager}" install -y iproute2 2>/dev/null || sudo "${package_manager}" install -y iproute
+            continue
+        fi
         if ! command -v "${dep}" &> /dev/null; then
             echo "${dep} is not installed. Installing..."
             sudo "${package_manager}" install "${dep}" -y
         fi
     done
 
-    # -------------------------------------------------------------------
-    # FIX (باگ ۵): روی CentOS/Fedora معمولا firewalld فعاله؛ RTT خودش
-    # فقط ufw رو غیرفعال میکنه، پس اینجا صریحا با firewalld هم کنار میایم.
-    # -------------------------------------------------------------------
+    # روی CentOS/Fedora معمولا firewalld فعاله؛ RTT خودش فقط ufw رو غیرفعال میکنه.
     if command -v firewall-cmd &> /dev/null && sudo systemctl is-active --quiet firewalld; then
-        echo -e "${yellow}firewalld detected and active.${rest}"
-        echo -e "${yellow}Opening required ports (23-65535/tcp) so the tunnel isn't blocked...${rest}"
+        echo -e "${yellow}firewalld detected and active. Opening 23-65535/tcp...${rest}"
         sudo firewall-cmd --permanent --add-port=23-65535/tcp > /dev/null 2>&1
         sudo firewall-cmd --reload > /dev/null 2>&1
     fi
+}
+
+# =========================================================================
+# پروفایل تیونینگ کرنل/شبکه - برگرفته از آنالیز واقعی مشکل ناپایداری:
+#   - BBR + fq برای رفتار بهتر زیر لاس/جیتر بالا
+#   - بافرهای TCP متعادل (نه bufferbloat، نه گلوگاه)
+#   - tcp_reordering بالاتر: چون مسیر ایران-خارج از ECMP در بک‌بون‌های
+#     بین‌الملل عبور میکنه و باعث packet reordering شدید میشه که TCP
+#     پیش‌فرض اون رو با loss اشتباه میگیره و بی‌جهت retransmit میکنه.
+#   - MSS Clamp ثابت (نه پویا بر پایه‌ی PMTUD) چون ICMP روی این مسیرها
+#     معمولا rate-limit/drop میشه و باعث PMTUD Blackhole میشه.
+# این تابع idempotent هست: هر بار اجرا بشه امن هست (رونویسی میکنه).
+# =========================================================================
+apply_kernel_tuning() {
+    echo -e "${cyan}===> Applying kernel/network tuning profile for tunnel stability...${rest}"
+
+    modprobe tcp_bbr 2>/dev/null
+
+    cat <<'EOF' > /etc/sysctl.d/99-rtt-tunnel-tuning.conf
+# --- Congestion Control ---
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# --- جلوگیری از bufferbloat ---
+net.core.netdev_max_backlog = 5000
+
+# --- بافرهای TCP متعادل ---
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.ipv4.tcp_rmem = 4096 1048576 16777216
+net.ipv4.tcp_wmem = 4096 1048576 16777216
+
+# --- رفتار بهتر بعد از idle (مناسب تونل‌ها) ---
+net.ipv4.tcp_slow_start_after_idle = 0
+
+# --- واکنش سریع‌تر به packet loss واقعی ---
+net.ipv4.tcp_frto = 2
+net.ipv4.tcp_early_retrans = 3
+
+# --- کاهش لتنسی هندشیک ---
+net.ipv4.tcp_fastopen = 3
+
+# --- ظرفیت بالاتر برای تعداد زیاد کانکشن موازی (mux) ---
+net.core.somaxconn = 8192
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.ip_local_port_range = 10000 65535
+
+# --- مدیریت بهتر اتصالات نیمه‌بسته / پایداری reconnect ---
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 6
+net.ipv4.tcp_tw_reuse = 1
+
+# --- تحمل بیشتر در برابر packet reordering (کلیدی برای مسیرهای ECMP) ---
+net.ipv4.tcp_reordering = 127
+net.ipv4.tcp_max_reordering = 300
+
+# --- عدم کش کردن متریک مسیر قبلی (چون مسیر بین کانکشن‌ها فرق میکنه) ---
+net.ipv4.tcp_no_metrics_save = 1
+
+# --- افزایش سقف فایل‌های باز (برای mux با تعداد بالای کانکشن) ---
+fs.file-max = 2097152
+EOF
+
+    sysctl --system > /dev/null 2>&1
+
+    # --- LimitNOFILE روی سرویس‌های RTT ---
+    for svc in tunnel.service lbtunnel.service custom_tunnel.service; do
+        if [ -f "/etc/systemd/system/$svc" ]; then
+            if ! grep -q "LimitNOFILE" "/etc/systemd/system/$svc"; then
+                sed -i '/\[Service\]/a LimitNOFILE=1048576' "/etc/systemd/system/$svc"
+            fi
+        fi
+    done
+
+    # --- MSS Clamp ثابت، هم الان و هم دائمی بعد از ریبوت (systemd oneshot) ---
+    cat <<EOF > "$MSS_CLAMP_SCRIPT"
+#!/bin/bash
+IFACE=\$(ip route | grep default | awk '{print \$5}' | head -n1)
+if [ -n "\$IFACE" ]; then
+    iptables -t mangle -C FORWARD -o "\$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $TUNNEL_MSS 2>/dev/null \\
+        || iptables -t mangle -A FORWARD -o "\$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $TUNNEL_MSS
+    iptables -t mangle -C OUTPUT -o "\$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $TUNNEL_MSS 2>/dev/null \\
+        || iptables -t mangle -A OUTPUT -o "\$IFACE" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $TUNNEL_MSS
+fi
+EOF
+    chmod +x "$MSS_CLAMP_SCRIPT"
+    bash "$MSS_CLAMP_SCRIPT"
+
+    cat <<EOF > "$MSS_CLAMP_SERVICE"
+[Unit]
+Description=RTT tunnel MSS clamp (persist across reboot)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=$MSS_CLAMP_SCRIPT
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable rtt-mss-clamp.service > /dev/null 2>&1
+    sudo systemctl start rtt-mss-clamp.service
+
+    echo -e "${green}===> Tuning applied. congestion_control=$(sysctl -n net.ipv4.tcp_congestion_control) qdisc=$(sysctl -n net.core.default_qdisc)${rest}"
 }
 
 check_installed() {
@@ -84,12 +198,9 @@ install_selected_version() {
     fi
 }
 
-# Function to download and install RTT
 install_rtt() {
     cd "$INSTALL_DIR" || { echo "Cannot cd to $INSTALL_DIR"; exit 1; }
 
-    # FIX (باگ ۳): بررسی نتیجه دانلود؛ اگر شکست خورد، اجرا متوقف میشه
-    # به جای اینکه سرویس با یک باینری خراب/خالی ساخته بشه.
     if ! wget "https://raw.githubusercontent.com/radkesvat/ReverseTlsTunnel/master/scripts/install.sh" -O install.sh; then
         echo -e "${red}Failed to download install.sh. Check your internet/DNS/GitHub access.${rest}"
         exit 1
@@ -107,7 +218,6 @@ install_rtt() {
     fi
 }
 
-# custom version
 install_rtt_custom() {
     if pgrep -x "RTT" > /dev/null; then
         echo "Tunnel is running! You must stop the tunnel before update. (pkill RTT)"
@@ -123,9 +233,6 @@ install_rtt_custom() {
     echo "Downloading ReverseTlsTunnel version : $version"
     printf "\n"
 
-    # FIX (باگ ۴): حذف شاخه‌ی اشتباه arm32->arm64 و مشخص کردن معماری‌های
-    # واقعا پشتیبانی‌شده. اگر معماری arm واقعی (32-bit) بود، خطای واضح میدیم
-    # چون در ریلیزهای پروژه بیلد جداگانه‌ای برایش منتشر نشده.
     case "$(uname -m)" in
         x86_64)
             URL="https://github.com/radkesvat/ReverseTlsTunnel/releases/download/V${version}/v${version}_linux_amd64.zip"
@@ -162,15 +269,13 @@ install_rtt_custom() {
     echo "Finished."
 }
 
-# Function to configure arguments based on user's choice
 configure_arguments() {
     read -p "Which server do you want to use? (Enter '1' for Iran(internal-server) or '2' for Kharej(external-server) ) : " server_choice
     read -p "Please Enter SNI (default : sheypoor.com): " sni
     sni=${sni:-sheypoor.com}
 
-    # FIX (باگ ۱): استفاده از --connection-age:4800 طبق توصیه رسمی پروژه
-    # برای نسخه‌های بالاتر از 5.4 که مشکل قطعی زمانی داره، به‌جای
-    # فلگ منسوخ/ناشناخته --terminate که باعث کرش/ری‌استارت مکرر میشه.
+    # به‌جای --terminate (منسوخ/ناشناخته در نسخه‌های جدید و باعث کرش/ری‌استارت
+    # مکرر سرویس) از --connection-age طبق توصیه رسمی پروژه استفاده میشه.
     local stability_flag="--connection-age:4800"
 
     if [ "$server_choice" == "2" ]; then
@@ -203,8 +308,6 @@ install() {
 
     cd /etc/systemd/system || exit 1
 
-    # FIX (باگ ۲): ExecStart همیشه به INSTALL_DIR اشاره میکنه که همون جاییه
-    # که واقعا فایل RTT دانلود شده (نه یک مسیر هاردکد که ممکنه نادرست باشه).
     cat <<EOL > tunnel.service
 [Unit]
 Description=my tunnel service
@@ -217,6 +320,7 @@ WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/RTT $arguments
 Restart=always
 RestartSec=3
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
@@ -225,6 +329,9 @@ EOL
     sudo systemctl daemon-reload
     sudo systemctl start tunnel.service
     sudo systemctl enable tunnel.service
+
+    # اعمال خودکار پروفایل تیونینگ کرنل/شبکه بلافاصله بعد از نصب تونل
+    apply_kernel_tuning
 
     sleep 2
     if sudo systemctl is-active --quiet tunnel.service; then
@@ -315,6 +422,7 @@ WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/RTT $arguments
 Restart=always
 RestartSec=3
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
@@ -323,6 +431,8 @@ EOL
     sudo systemctl daemon-reload
     sudo systemctl start lbtunnel.service
     sudo systemctl enable lbtunnel.service
+
+    apply_kernel_tuning
 
     sleep 2
     if sudo systemctl is-active --quiet lbtunnel.service; then
@@ -366,9 +476,7 @@ uninstall() {
     echo "Uninstallation completed successfully."
 }
 
-# FIX (باگ ۶): مقایسه‌ی صحیح نسخه‌ها با sort -V به‌جای مقایسه‌ی رشته‌ای
 version_gt() {
-    # returns 0 (true) if $1 > $2, using version sort
     [ "$1" = "$2" ] && return 1
     [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$1" ]
 }
@@ -392,13 +500,10 @@ update_services() {
         local was_lb_active=0
 
         if sudo systemctl is-active --quiet tunnel.service; then
-            echo "tunnel.service is active, stopping..."
             sudo systemctl stop tunnel.service > /dev/null 2>&1
             was_tunnel_active=1
         fi
-
         if sudo systemctl is-active --quiet lbtunnel.service; then
-            echo "lbtunnel.service is active, stopping..."
             sudo systemctl stop lbtunnel.service > /dev/null 2>&1
             was_lb_active=1
         fi
@@ -410,8 +515,8 @@ update_services() {
         chmod +x install.sh
         bash install.sh
 
-        [ "$was_tunnel_active" -eq 1 ] && { echo "Starting tunnel.service..."; sudo systemctl start tunnel.service; }
-        [ "$was_lb_active" -eq 1 ] && { echo "Starting lbtunnel.service..."; sudo systemctl start lbtunnel.service; }
+        [ "$was_tunnel_active" -eq 1 ] && sudo systemctl start tunnel.service
+        [ "$was_lb_active" -eq 1 ] && sudo systemctl start lbtunnel.service
 
         echo "Service updated and restarted successfully."
     else
@@ -464,7 +569,6 @@ compile() {
 start_tunnel() {
     if sudo systemctl is-enabled --quiet tunnel.service; then
         sudo systemctl start tunnel.service > /dev/null 2>&1
-
         if sudo systemctl is-active --quiet tunnel.service; then
             echo "Tunnel service started."
         else
@@ -478,7 +582,6 @@ start_tunnel() {
 stop_tunnel() {
     if sudo systemctl is-enabled --quiet tunnel.service; then
         sudo systemctl stop tunnel.service > /dev/null 2>&1
-
         if sudo systemctl is-active --quiet tunnel.service; then
             echo "Tunnel service failed to stop."
         else
@@ -500,7 +603,6 @@ check_tunnel_status() {
 start_lb_tunnel() {
     if sudo systemctl is-enabled --quiet lbtunnel.service; then
         sudo systemctl start lbtunnel.service > /dev/null 2>&1
-
         if sudo systemctl is-active --quiet lbtunnel.service; then
             echo "Tunnel service started."
         else
@@ -514,7 +616,6 @@ start_lb_tunnel() {
 stop_lb_tunnel() {
     if sudo systemctl is-enabled --quiet lbtunnel.service; then
         sudo systemctl stop lbtunnel.service > /dev/null 2>&1
-
         if sudo systemctl is-active --quiet lbtunnel.service; then
             echo "Load-Balancer failed to stop."
         else
@@ -543,7 +644,6 @@ check_c_installed() {
 start_c_tunnel() {
     if sudo systemctl is-enabled --quiet custom_tunnel.service; then
         sudo systemctl start custom_tunnel.service > /dev/null 2>&1
-
         if sudo systemctl is-active --quiet custom_tunnel.service; then
             echo "Custom Tunnel started."
         else
@@ -565,7 +665,6 @@ check_c_tunnel_status() {
 stop_c_tunnel() {
     if sudo systemctl is-enabled --quiet custom_tunnel.service; then
         sudo systemctl stop custom_tunnel.service > /dev/null 2>&1
-
         if sudo systemctl is-active --quiet custom_tunnel.service; then
             echo "Custom Tunnel failed to stop."
         else
@@ -597,6 +696,7 @@ WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/$arguments
 Restart=always
 RestartSec=3
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
@@ -605,6 +705,8 @@ EOL
     sudo systemctl daemon-reload
     sudo systemctl start custom_tunnel.service
     sudo systemctl enable custom_tunnel.service
+
+    apply_kernel_tuning
 }
 
 c_uninstall() {
@@ -629,7 +731,7 @@ myip=$(hostname -I | awk '{print $1}')
 version=$([ -f "$INSTALL_DIR/RTT" ] && "$INSTALL_DIR/RTT" -v 2>&1 | grep -o 'version="[0-9.]*"')
 
 clear
-echo -e "${cyan}By --> Peyman * Github.com/Ptechgithub * (fixed)${rest}"
+echo -e "${cyan}By --> Peyman * Github.com/Ptechgithub * (v2 - auto-tuning)${rest}"
 echo -e "Your IP is: ${cyan}($myip)${rest} "
 echo -e "${yellow}******************************${rest}"
 check_tunnel_status
@@ -657,6 +759,7 @@ echo "15) Check status"
 echo -e "${yellow} ----------------------------${rest}"
 echo -e "${cyan}16) Update RTT${rest}"
 echo -e "${cyan}17) Compile RTT${rest}"
+echo -e "${purple}18) Re-apply kernel tuning profile only${rest}"
 echo "0) Exit"
 echo -e "${purple} --------------${cyan}$version${purple}--------------${rest}"
 read -p "Please choose: " choice
@@ -679,6 +782,7 @@ case $choice in
     15) check_c_tunnel_status ;;
     16) update_services ;;
     17) compile ;;
+    18) root_access; apply_kernel_tuning ;;
     0) exit ;;
     *) echo "Invalid choice. Please try again." ;;
 esac
