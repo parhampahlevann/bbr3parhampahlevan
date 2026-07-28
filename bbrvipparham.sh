@@ -28,6 +28,28 @@ root_access() {
     fi
 }
 
+# Returns 0 (true) if any RTT-based service OTHER than the ones passed as
+# arguments is still installed. Used to avoid deleting the shared
+# $INSTALL_DIR/RTT binary while some other running service still needs it.
+other_rtt_services_installed() {
+    local exclude=("$@")
+    local all_services=(tunnel.service lbtunnel.service custom_tunnel.service)
+    # include any multisni-N.service files present
+    for f in /etc/systemd/system/multisni-*.service; do
+        [ -e "$f" ] && all_services+=("$(basename "$f")")
+    done
+
+    for svc in "${all_services[@]}"; do
+        local skip=0
+        for ex in "${exclude[@]}"; do
+            [ "$svc" == "$ex" ] && skip=1
+        done
+        [ "$skip" -eq 1 ] && continue
+        [ -f "/etc/systemd/system/$svc" ] && return 0
+    done
+    return 1
+}
+
 detect_distribution() {
     local supported_distributions=("ubuntu" "debian" "centos" "fedora")
 
@@ -231,6 +253,17 @@ install_selected_version() {
 install_rtt() {
     cd "$INSTALL_DIR" || { echo "Cannot cd to $INSTALL_DIR"; exit 1; }
 
+    # Self-heal: if RTT processes are running but the binary file no
+    # longer exists on disk (e.g. a previous uninstall removed the
+    # shared binary while other services still referenced it), those
+    # are orphaned/zombie processes referencing a deleted inode. Kill
+    # them so the fresh install isn't blocked and can proceed cleanly.
+    if pgrep -x "RTT" > /dev/null && [ ! -f "$INSTALL_DIR/RTT" ]; then
+        echo -e "${yellow}Detected orphaned RTT process(es) referencing a missing binary. Cleaning up...${rest}"
+        pkill -x RTT 2>/dev/null
+        sleep 1
+    fi
+
     if ! wget "https://raw.githubusercontent.com/radkesvat/ReverseTlsTunnel/master/scripts/install.sh" -O install.sh; then
         echo -e "${red}Failed to download install.sh. Check your internet/DNS/GitHub access.${rest}"
         exit 1
@@ -246,6 +279,18 @@ install_rtt() {
         echo -e "${red}RTT binary not found after install. Aborting before creating a broken service.${rest}"
         exit 1
     fi
+
+    # After a fresh binary is in place, restart any other RTT services
+    # so they pick up the new file instead of continuing to run on a
+    # stale/orphaned in-memory copy.
+    for svc in tunnel.service lbtunnel.service custom_tunnel.service; do
+        if [ -f "/etc/systemd/system/$svc" ]; then
+            sudo systemctl restart "$svc" 2>/dev/null
+        fi
+    done
+    for f in /etc/systemd/system/multisni-*.service; do
+        [ -e "$f" ] && sudo systemctl restart "$(basename "$f")" 2>/dev/null
+    done
 }
 
 install_rtt_custom() {
@@ -484,8 +529,12 @@ lb_uninstall() {
 
     sudo rm -f /etc/systemd/system/lbtunnel.service
     sudo systemctl reset-failed
-    sudo rm -f "$INSTALL_DIR/RTT"
-    sudo rm -f "$INSTALL_DIR/install.sh" 2>/dev/null
+    if other_rtt_services_installed "lbtunnel.service"; then
+        echo -e "${yellow}Other RTT services are still installed - keeping the shared RTT binary.${rest}"
+    else
+        sudo rm -f "$INSTALL_DIR/RTT"
+        sudo rm -f "$INSTALL_DIR/install.sh" 2>/dev/null
+    fi
 
     echo "Uninstallation completed successfully."
 }
@@ -501,8 +550,12 @@ uninstall() {
 
     sudo rm -f /etc/systemd/system/tunnel.service
     sudo systemctl reset-failed
-    sudo rm -f "$INSTALL_DIR/RTT"
-    sudo rm -f "$INSTALL_DIR/install.sh" 2>/dev/null
+    if other_rtt_services_installed "tunnel.service"; then
+        echo -e "${yellow}Other RTT services are still installed - keeping the shared RTT binary.${rest}"
+    else
+        sudo rm -f "$INSTALL_DIR/RTT"
+        sudo rm -f "$INSTALL_DIR/install.sh" 2>/dev/null
+    fi
 
     echo "Uninstallation completed successfully."
 }
@@ -751,8 +804,12 @@ c_uninstall() {
 
     sudo rm -f /etc/systemd/system/custom_tunnel.service
     sudo systemctl reset-failed
-    sudo rm -f "$INSTALL_DIR/RTT"
-    sudo rm -f "$INSTALL_DIR/install.sh" 2>/dev/null
+    if other_rtt_services_installed "custom_tunnel.service"; then
+        echo -e "${yellow}Other RTT services are still installed - keeping the shared RTT binary.${rest}"
+    else
+        sudo rm -f "$INSTALL_DIR/RTT"
+        sudo rm -f "$INSTALL_DIR/install.sh" 2>/dev/null
+    fi
 
     echo "Uninstallation completed successfully."
 }
@@ -1168,6 +1225,42 @@ EOF
     echo -e "${yellow}fix jitter/reordering that occurs further out on the backbone path.${rest}"
 }
 
+# =========================================================================
+# Uninstall all multi-SNI instances (multisni-N.service). The shared RTT
+# binary is only removed if no other RTT service still depends on it.
+# =========================================================================
+uninstall_multi_sni() {
+    root_access
+
+    local found=0
+    for f in /etc/systemd/system/multisni-*.service; do
+        [ -e "$f" ] || continue
+        found=1
+        local svc
+        svc=$(basename "$f")
+        sudo systemctl stop "$svc" 2>/dev/null
+        sudo systemctl disable "$svc" 2>/dev/null
+        sudo rm -f "/etc/systemd/system/$svc"
+        echo "Removed $svc"
+    done
+
+    if [ "$found" -eq 0 ]; then
+        echo "No multi-SNI instances are installed."
+        return
+    fi
+
+    sudo systemctl reset-failed
+
+    if other_rtt_services_installed; then
+        echo -e "${yellow}Other RTT services are still installed - keeping the shared RTT binary.${rest}"
+    else
+        sudo rm -f "$INSTALL_DIR/RTT"
+        sudo rm -f "$INSTALL_DIR/install.sh" 2>/dev/null
+    fi
+
+    echo "Multi-SNI uninstallation completed successfully."
+}
+
 # ip & version
 myip=$(hostname -I | awk '{print $1}')
 version=$([ -f "$INSTALL_DIR/RTT" ] && "$INSTALL_DIR/RTT" -v 2>&1 | grep -o 'version="[0-9.]*"')
@@ -1206,6 +1299,7 @@ echo -e "${cyan}19) Change Tunnel SNI (no reinstall)${rest}"
 echo -e "${cyan}20) Install HAProxy (port forwarding)${rest}"
 echo -e "${purple}21) Setup Multi-SNI parallel tunnels${rest}"
 echo -e "${purple}22) Configure Cake bandwidth shaping (jitter reduction)${rest}"
+echo -e "${red}23) Uninstall Multi-SNI instances${rest}"
 echo "0) Exit"
 echo -e "${purple} --------------${cyan}$version${purple}--------------${rest}"
 read -p "Please choose: " choice
@@ -1233,6 +1327,7 @@ case $choice in
     20) install_haproxy ;;
     21) install_multi_sni ;;
     22) configure_bandwidth_shaping ;;
+    23) uninstall_multi_sni ;;
     0) exit ;;
     *) echo "Invalid choice. Please try again." ;;
 esac
