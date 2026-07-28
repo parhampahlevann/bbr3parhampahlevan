@@ -726,6 +726,180 @@ c_uninstall() {
     echo "Uninstallation completed successfully."
 }
 
+# =========================================================================
+# تغییر مستقیم SNI بدون نیاز به نصب مجدد کامل تونل
+# سرویس نصب‌شده رو پیدا میکنه، مقدار --sni: رو داخل ExecStart جایگزین
+# میکنه و سرویس رو ری‌استارت میکنه.
+# نکته: SNI باید همزمان روی هر دو سرور (ایران و خارج) یکسان تغییر کنه.
+# =========================================================================
+change_sni() {
+    root_access
+
+    local services=()
+    for svc in tunnel.service lbtunnel.service custom_tunnel.service; do
+        [ -f "/etc/systemd/system/$svc" ] && services+=("$svc")
+    done
+
+    if [ ${#services[@]} -eq 0 ]; then
+        echo -e "${red}هیچ سرویس RTT روی این سرور نصب نشده.${rest}"
+        return
+    fi
+
+    local target_svc
+    if [ ${#services[@]} -eq 1 ]; then
+        target_svc="${services[0]}"
+    else
+        echo "چند سرویس نصب شده، کدوم رو میخواید تغییر بدید؟"
+        select target_svc in "${services[@]}"; do
+            [ -n "$target_svc" ] && break
+        done
+    fi
+
+    local svc_path="/etc/systemd/system/$target_svc"
+
+    if ! grep -q -- "--sni:" "$svc_path"; then
+        echo -e "${red}هیچ پارامتر --sni در این سرویس پیدا نشد (شاید custom بدون sni باشه).${rest}"
+        return
+    fi
+
+    local current_sni
+    current_sni=$(grep "ExecStart=" "$svc_path" | sed -n 's/.*--sni:\([^ ]*\).*/\1/p')
+    echo -e "SNI فعلی: ${cyan}$current_sni${rest}"
+    read -p "SNI جدید رو وارد کنید (مثلا yahoo.com): " new_sni
+
+    if [ -z "$new_sni" ]; then
+        echo "چیزی وارد نشد، لغو شد."
+        return
+    fi
+
+    cp "$svc_path" "${svc_path}.bak.$(date +%s)"
+    sed -i "s/--sni:[^ ]*/--sni:$new_sni/" "$svc_path"
+
+    sudo systemctl daemon-reload
+    sudo systemctl restart "$target_svc"
+
+    sleep 2
+    if sudo systemctl is-active --quiet "$target_svc"; then
+        echo -e "${green}SNI با موفقیت به '$new_sni' تغییر کرد و سرویس ری‌استارت شد.${rest}"
+        echo -e "${yellow}یادتون نره همین تغییر رو روی سرور مقابل (ایران/خارج) هم انجام بدید، SNI باید هر دو طرف یکسان باشه.${rest}"
+    else
+        echo -e "${red}سرویس بعد از تغییر SNI بالا نیومد! برای بررسی: journalctl -u $target_svc -n 50${rest}"
+        echo -e "${yellow}میتونید با فایل بکاپ (${svc_path}.bak.*) به حالت قبل برگردید.${rest}"
+    fi
+}
+
+# =========================================================================
+# نصب HAProxy برای فوروارد پورت‌های TCP دلخواه (مثلا پورت‌های سرویس‌های
+# داخلی که پشت تونل هستن) بدون نیاز به دستکاری دستی iptables/socat.
+# =========================================================================
+install_haproxy() {
+    root_access
+    detect_distribution
+
+    if ! command -v haproxy &> /dev/null; then
+        echo -e "${cyan}===> Installing HAProxy...${rest}"
+        sudo "${package_manager}" install -y haproxy
+    fi
+
+    if ! command -v haproxy &> /dev/null; then
+        echo -e "${red}نصب HAProxy ناموفق بود.${rest}"
+        return
+    fi
+
+    echo -e "${yellow}برای هر پورتی که میخواید فوروارد بشه، پورت شنود و مقصد رو وارد کنید.${rest}"
+    echo -e "${yellow}مثال مقصد: 127.0.0.1:8080 یا یک IP دیگه:پورت${rest}"
+
+    local cfg_entries=""
+    local ports_opened=()
+    local port_num=0
+
+    while true; do
+        ((port_num++))
+        read -p "پورت شنود #$port_num (یا 'done' برای پایان): " listen_port
+        [ "$listen_port" == "done" ] && break
+
+        if ! [[ "$listen_port" =~ ^[0-9]+$ ]]; then
+            echo "پورت نامعتبره، دوباره امتحان کنید."
+            ((port_num--))
+            continue
+        fi
+
+        read -p "آدرس مقصد برای پورت $listen_port (IP:PORT): " dest_addr
+        if [ -z "$dest_addr" ]; then
+            echo "آدرس مقصد خالیه، این پورت رد شد."
+            ((port_num--))
+            continue
+        fi
+
+        cfg_entries+="
+frontend front_${listen_port}
+    bind *:${listen_port}
+    mode tcp
+    default_backend back_${listen_port}
+
+backend back_${listen_port}
+    mode tcp
+    server srv_${listen_port} ${dest_addr}
+"
+        ports_opened+=("$listen_port")
+    done
+
+    if [ -z "$cfg_entries" ]; then
+        echo "هیچ پورتی وارد نشد، نصب لغو شد."
+        return
+    fi
+
+    mkdir -p /etc/haproxy
+    if [ -f /etc/haproxy/haproxy.cfg ]; then
+        cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.bak.$(date +%s)
+    fi
+
+    cat <<EOF > /etc/haproxy/haproxy.cfg
+global
+    log /dev/log local0
+    maxconn 8192
+    daemon
+
+defaults
+    log     global
+    mode    tcp
+    option  tcplog
+    timeout connect 5s
+    timeout client  120s
+    timeout server  120s
+$cfg_entries
+EOF
+
+    if ! haproxy -c -f /etc/haproxy/haproxy.cfg > /dev/null 2>&1; then
+        echo -e "${red}کانفیگ HAProxy خطا داره:${rest}"
+        haproxy -c -f /etc/haproxy/haproxy.cfg
+        return
+    fi
+
+    # باز کردن پورت‌ها روی فایروال (firewalld / ufw هر کدوم فعال بود)
+    for p in "${ports_opened[@]}"; do
+        if command -v firewall-cmd &> /dev/null && sudo systemctl is-active --quiet firewalld; then
+            sudo firewall-cmd --permanent --add-port="${p}/tcp" > /dev/null 2>&1
+        fi
+        if command -v ufw &> /dev/null && sudo ufw status | grep -q "Status: active"; then
+            sudo ufw allow "${p}/tcp" > /dev/null 2>&1
+        fi
+    done
+    command -v firewall-cmd &> /dev/null && sudo firewall-cmd --reload > /dev/null 2>&1
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable haproxy > /dev/null 2>&1
+    sudo systemctl restart haproxy
+
+    sleep 1
+    if sudo systemctl is-active --quiet haproxy; then
+        echo -e "${green}HAProxy با موفقیت نصب شد و پورت‌های زیر فوروارد شدن:${rest}"
+        printf '%s\n' "${ports_opened[@]}"
+    else
+        echo -e "${red}HAProxy بالا نیومد! برای بررسی: journalctl -u haproxy -n 50${rest}"
+    fi
+}
+
 # ip & version
 myip=$(hostname -I | awk '{print $1}')
 version=$([ -f "$INSTALL_DIR/RTT" ] && "$INSTALL_DIR/RTT" -v 2>&1 | grep -o 'version="[0-9.]*"')
@@ -760,6 +934,8 @@ echo -e "${yellow} ----------------------------${rest}"
 echo -e "${cyan}16) Update RTT${rest}"
 echo -e "${cyan}17) Compile RTT${rest}"
 echo -e "${purple}18) Re-apply kernel tuning profile only${rest}"
+echo -e "${cyan}19) Change Tunnel SNI (no reinstall)${rest}"
+echo -e "${cyan}20) Install HAProxy (port forwarding)${rest}"
 echo "0) Exit"
 echo -e "${purple} --------------${cyan}$version${purple}--------------${rest}"
 read -p "Please choose: " choice
@@ -783,6 +959,8 @@ case $choice in
     16) update_services ;;
     17) compile ;;
     18) root_access; apply_kernel_tuning ;;
+    19) change_sni ;;
+    20) install_haproxy ;;
     0) exit ;;
     *) echo "Invalid choice. Please try again." ;;
 esac
