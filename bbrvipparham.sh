@@ -855,12 +855,36 @@ install_haproxy() {
             continue
         fi
 
-        read -p "Destination address for port $listen_port (IP:PORT): " dest_addr
-        if [ -z "$dest_addr" ]; then
-            echo "Destination address is empty, skipping this port."
+        echo -e "${yellow}Enter one or more backend destinations for port $listen_port.${rest}"
+        echo -e "${yellow}If you enter more than one, HAProxy will round-robin between them${rest}"
+        echo -e "${yellow}(useful for spreading traffic across multi-SNI tunnel instances).${rest}"
+
+        local backends=()
+        local b=0
+        while true; do
+            ((b++))
+            read -p "  Backend #$b (IP:PORT, or 'done' to finish this port): " dest
+            [ "$dest" == "done" ] && break
+            [ -z "$dest" ] && { ((b--)); continue; }
+            backends+=("$dest")
+        done
+
+        if [ ${#backends[@]} -eq 0 ]; then
+            echo "No backend given, skipping this port."
             ((port_num--))
             continue
         fi
+
+        local balance_line=""
+        [ ${#backends[@]} -gt 1 ] && balance_line="    balance roundrobin"
+
+        local server_lines=""
+        local sidx=0
+        for dest in "${backends[@]}"; do
+            ((sidx++))
+            server_lines+="    server srv_${listen_port}_${sidx} ${dest} check
+"
+        done
 
         cfg_entries+="
 frontend front_${listen_port}
@@ -870,8 +894,8 @@ frontend front_${listen_port}
 
 backend back_${listen_port}
     mode tcp
-    server srv_${listen_port} ${dest_addr}
-"
+${balance_line}
+${server_lines}"
         ports_opened+=("$listen_port")
     done
 
@@ -931,6 +955,136 @@ EOF
     fi
 }
 
+# =========================================================================
+# Multi-SNI mode: runs N parallel, independent RTT tunnel instances
+# between the same Iran/Kharej pair, each with its own SNI. Different
+# client connections get spread across these tunnels (via HAProxy round
+# robin, see below), so overall traffic is not tied to a single SNI
+# fingerprint - and if one SNI gets throttled/blocked, the others keep
+# working.
+#
+# Port allocation is computed deterministically from the number of SNIs,
+# so as long as you enter the same count and the same SNIs in the same
+# order on both servers, the ports line up automatically - no need to
+# copy numbers between servers by hand.
+# =========================================================================
+install_multi_sni() {
+    root_access
+    check_dependencies
+
+    echo -e "${cyan}This sets up several parallel RTT tunnels, each using a different SNI,${rest}"
+    echo -e "${cyan}so overall traffic isn't tied to a single TLS fingerprint.${rest}"
+    read -p "Which server is this? (1=Iran, 2=Kharej): " side
+    if [[ "$side" != "1" && "$side" != "2" ]]; then
+        echo "Invalid choice."
+        return
+    fi
+
+    read -p "How many SNIs do you want to run in parallel? (default 3): " n_sni
+    n_sni=${n_sni:-3}
+    if ! [[ "$n_sni" =~ ^[0-9]+$ ]] || [ "$n_sni" -lt 2 ]; then
+        echo "Please enter a number >= 2."
+        return
+    fi
+
+    read -p "Enter the shared password (must be identical on both servers): " password
+
+    local snis=()
+    for ((i = 1; i <= n_sni; i++)); do
+        read -p "SNI #$i (e.g. site${i}.example.com): " s
+        snis+=("$s")
+    done
+
+    local iran_ip=""
+    if [ "$side" == "2" ]; then
+        read -p "Enter IRAN IP (internal-server): " iran_ip
+    fi
+
+    # Deterministic port allocation
+    local range_start=1000
+    local range_end=65000
+    local total=$((range_end - range_start + 1))
+    local chunk=$((total / n_sni))
+
+    local starts=() ends=() controls=()
+    for ((i = 0; i < n_sni; i++)); do
+        local s=$((range_start + i * chunk))
+        local e
+        if [ "$i" -eq "$((n_sni - 1))" ]; then
+            e=$range_end
+        else
+            e=$((s + chunk - 1))
+        fi
+        starts+=("$s")
+        ends+=("$e")
+        controls+=("$s")
+    done
+
+    echo -e "${cyan}Port allocation (identical on both servers if inputs match):${rest}"
+    for ((i = 0; i < n_sni; i++)); do
+        echo "  Instance $((i + 1)): SNI=${snis[$i]}  range=${starts[$i]}-${ends[$i]}  control-port=${controls[$i]}"
+    done
+
+    for ((i = 0; i < n_sni; i++)); do
+        local idx=$((i + 1))
+        local svc="multisni-${idx}.service"
+        local sni="${snis[$i]}"
+        local lrange="${starts[$i]}-${ends[$i]}"
+        local cport="${controls[$i]}"
+        local arguments
+
+        if [ "$side" == "1" ]; then
+            arguments="--iran --lport:$lrange --sni:$sni --password:$password --connection-age:4800"
+        else
+            arguments="--kharej --iran-ip:$iran_ip --iran-port:$cport --toip:127.0.0.1 --toport:multiport --password:$password --sni:$sni --connection-age:4800"
+        fi
+
+        cat <<EOL > /etc/systemd/system/$svc
+[Unit]
+Description=RTT multi-SNI tunnel instance $idx ($sni)
+After=network.target
+
+[Service]
+Type=idle
+User=root
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$INSTALL_DIR/RTT $arguments
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOL
+        sudo systemctl daemon-reload
+        sudo systemctl enable "$svc" > /dev/null 2>&1
+        sudo systemctl restart "$svc"
+    done
+
+    apply_kernel_tuning
+
+    sleep 2
+    echo -e "${cyan}===> Status of multi-SNI instances:${rest}"
+    for ((i = 1; i <= n_sni; i++)); do
+        if sudo systemctl is-active --quiet "multisni-${i}.service"; then
+            echo -e "  Instance $i (${snis[$((i - 1))]}): ${green}running${rest}"
+        else
+            echo -e "  Instance $i (${snis[$((i - 1))]}): ${red}failed - check: journalctl -u multisni-${i}.service -n 50${rest}"
+        fi
+    done
+
+    if [ "$side" == "1" ]; then
+        echo ""
+        echo -e "${yellow}To make clients transparently spread across all $n_sni SNIs through a${rest}"
+        echo -e "${yellow}single public port, use menu option 20 (Install HAProxy) and, when asked${rest}"
+        echo -e "${yellow}for backend destinations, add ALL of the following for the same listen port:${rest}"
+        for ((i = 0; i < n_sni; i++)); do
+            echo "  - 127.0.0.1:${starts[$i]}"
+        done
+        echo -e "${yellow}HAProxy will round-robin new connections across them automatically.${rest}"
+    fi
+}
+
 # ip & version
 myip=$(hostname -I | awk '{print $1}')
 version=$([ -f "$INSTALL_DIR/RTT" ] && "$INSTALL_DIR/RTT" -v 2>&1 | grep -o 'version="[0-9.]*"')
@@ -967,6 +1121,7 @@ echo -e "${cyan}17) Compile RTT${rest}"
 echo -e "${purple}18) Re-apply kernel tuning profile only${rest}"
 echo -e "${cyan}19) Change Tunnel SNI (no reinstall)${rest}"
 echo -e "${cyan}20) Install HAProxy (port forwarding)${rest}"
+echo -e "${purple}21) Setup Multi-SNI parallel tunnels${rest}"
 echo "0) Exit"
 echo -e "${purple} --------------${cyan}$version${purple}--------------${rest}"
 read -p "Please choose: " choice
@@ -992,6 +1147,7 @@ case $choice in
     18) root_access; apply_kernel_tuning ;;
     19) change_sni ;;
     20) install_haproxy ;;
+    21) install_multi_sni ;;
     0) exit ;;
     *) echo "Invalid choice. Please try again." ;;
 esac
