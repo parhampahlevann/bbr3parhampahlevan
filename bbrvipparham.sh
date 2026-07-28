@@ -1,8 +1,9 @@
 #!/bin/bash
 # =========================================================================
-# RTT (ReverseTlsTunnel) Installer - v2
-# بازنویسی کامل با فیکس باگ‌های نصب/سرویس + اعمال خودکار پروفایل تیونینگ
-# کرنل/شبکه در لحظه‌ی نصب تونل، برای رفع ناپایداری پینگ.
+# RTT (ReverseTlsTunnel) Installer - v3
+# Full rewrite (English) with a stronger network/kernel stability profile,
+# automatic tuning on install, in-place SNI change, and HAProxy port
+# forwarding.
 # =========================================================================
 
 #colors
@@ -22,7 +23,7 @@ MSS_CLAMP_SERVICE="/etc/systemd/system/rtt-mss-clamp.service"
 
 root_access() {
     if [ "$EUID" -ne 0 ]; then
-        echo "This script requires root access. please run as root."
+        echo "This script requires root access. Please run as root."
         exit 1
     fi
 }
@@ -49,21 +50,18 @@ detect_distribution() {
 check_dependencies() {
     detect_distribution
 
-    local dependencies=("wget" "lsof" "iptables" "unzip" "gcc" "git" "curl" "tar" "mtr" "iproute2")
+    local dependencies=("wget" "lsof" "iptables" "unzip" "gcc" "git" "curl" "tar" "mtr")
 
     for dep in "${dependencies[@]}"; do
-        # iproute2 دستوری به همین اسم نداره (ss/ip داره)، پس چک جدا
-        if [ "$dep" == "iproute2" ]; then
-            command -v ss &> /dev/null || sudo "${package_manager}" install -y iproute2 2>/dev/null || sudo "${package_manager}" install -y iproute
-            continue
-        fi
         if ! command -v "${dep}" &> /dev/null; then
             echo "${dep} is not installed. Installing..."
             sudo "${package_manager}" install "${dep}" -y
         fi
     done
 
-    # روی CentOS/Fedora معمولا firewalld فعاله؛ RTT خودش فقط ufw رو غیرفعال میکنه.
+    command -v ss &> /dev/null || sudo "${package_manager}" install -y iproute2 2>/dev/null || sudo "${package_manager}" install -y iproute
+
+    # CentOS/Fedora usually run firewalld; RTT itself only disables ufw.
     if command -v firewall-cmd &> /dev/null && sudo systemctl is-active --quiet firewalld; then
         echo -e "${yellow}firewalld detected and active. Opening 23-65535/tcp...${rest}"
         sudo firewall-cmd --permanent --add-port=23-65535/tcp > /dev/null 2>&1
@@ -72,73 +70,103 @@ check_dependencies() {
 }
 
 # =========================================================================
-# پروفایل تیونینگ کرنل/شبکه - برگرفته از آنالیز واقعی مشکل ناپایداری:
-#   - BBR + fq برای رفتار بهتر زیر لاس/جیتر بالا
-#   - بافرهای TCP متعادل (نه bufferbloat، نه گلوگاه)
-#   - tcp_reordering بالاتر: چون مسیر ایران-خارج از ECMP در بک‌بون‌های
-#     بین‌الملل عبور میکنه و باعث packet reordering شدید میشه که TCP
-#     پیش‌فرض اون رو با loss اشتباه میگیره و بی‌جهت retransmit میکنه.
-#   - MSS Clamp ثابت (نه پویا بر پایه‌ی PMTUD) چون ICMP روی این مسیرها
-#     معمولا rate-limit/drop میشه و باعث PMTUD Blackhole میشه.
-# این تابع idempotent هست: هر بار اجرا بشه امن هست (رونویسی میکنه).
+# Kernel / network stability profile.
+#
+# Rationale (based on live diagnostics on an Iran <-> foreign RTT link):
+#   - BBR + fq: much better behavior than cubic under high latency/jitter
+#     international paths.
+#   - tcp_mtu_probing: enables automatic PMTUD black-hole detection/repair.
+#     This matters because ICMP "fragmentation needed" packets are commonly
+#     rate-limited or dropped on Iran <-> abroad backbone paths, which
+#     silently breaks classic PMTU discovery and causes stalls/timeouts
+#     that look like random instability.
+#   - tcp_reordering / tcp_max_reordering raised: international backbones
+#     (e.g. ECMP load-balancing across parallel links) frequently deliver
+#     packets out of order. With default settings TCP mistakes this for
+#     loss and triggers unnecessary retransmits/backoffs, which is a major
+#     source of the "ping spikes" users report even when the underlying
+#     link has 0% real loss.
+#   - Balanced buffers: large enough to avoid starving throughput, not so
+#     large that they cause bufferbloat under load.
+#   - Fixed MSS clamp (not PMTU-based): since ICMP is unreliable on this
+#     path, a static clamp avoids relying on ICMP-driven PMTU discovery.
+#   - Faster dead-connection detection via keepalive + syn/synack retries,
+#     so the tunnel recovers quickly instead of hanging on a half-dead
+#     socket.
+#
+# This function is idempotent: safe to run multiple times.
 # =========================================================================
 apply_kernel_tuning() {
-    echo -e "${cyan}===> Applying kernel/network tuning profile for tunnel stability...${rest}"
+    echo -e "${cyan}===> Applying kernel/network stability profile...${rest}"
 
     modprobe tcp_bbr 2>/dev/null
 
-    cat <<'EOF' > /etc/sysctl.d/99-rtt-tunnel-tuning.conf
-# --- Congestion Control ---
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
+    local cc="bbr"
+    if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null \
+        && ! modprobe tcp_bbr 2>/dev/null; then
+        echo -e "${yellow}BBR module not available on this kernel, falling back to cubic + fq_codel.${rest}"
+        cc="cubic"
+    fi
 
-# --- جلوگیری از bufferbloat ---
+    cat <<EOF > /etc/sysctl.d/99-rtt-tunnel-tuning.conf
+# --- Congestion control ---
+net.core.default_qdisc = $( [ "$cc" == "bbr" ] && echo fq || echo fq_codel )
+net.ipv4.tcp_congestion_control = $cc
+
+# --- Avoid bufferbloat while still allowing headroom for throughput ---
 net.core.netdev_max_backlog = 5000
-
-# --- بافرهای TCP متعادل ---
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
 net.core.rmem_default = 1048576
 net.core.wmem_default = 1048576
-net.ipv4.tcp_rmem = 4096 1048576 16777216
-net.ipv4.tcp_wmem = 4096 1048576 16777216
+net.ipv4.tcp_rmem = 4096 1048576 33554432
+net.ipv4.tcp_wmem = 4096 1048576 33554432
+net.ipv4.tcp_moderate_rcvbuf = 1
 
-# --- رفتار بهتر بعد از idle (مناسب تونل‌ها) ---
+# --- Better behavior for bursty/idle tunnel traffic ---
 net.ipv4.tcp_slow_start_after_idle = 0
 
-# --- واکنش سریع‌تر به packet loss واقعی ---
+# --- Faster, smarter reaction to genuine packet loss ---
 net.ipv4.tcp_frto = 2
 net.ipv4.tcp_early_retrans = 3
 
-# --- کاهش لتنسی هندشیک ---
+# --- PMTUD black-hole detection/repair (important when ICMP is filtered) ---
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_base_mss = 1024
+
+# --- Faster TCP handshake ---
 net.ipv4.tcp_fastopen = 3
 
-# --- ظرفیت بالاتر برای تعداد زیاد کانکشن موازی (mux) ---
+# --- Faster failure detection so dead attempts don't hang the tunnel ---
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_synack_retries = 3
+
+# --- Headroom for many parallel mux connections ---
 net.core.somaxconn = 8192
 net.ipv4.tcp_max_syn_backlog = 8192
 net.ipv4.ip_local_port_range = 10000 65535
 
-# --- مدیریت بهتر اتصالات نیمه‌بسته / پایداری reconnect ---
+# --- Half-closed connection handling / reconnect stability ---
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_keepalive_time = 60
 net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 6
 net.ipv4.tcp_tw_reuse = 1
 
-# --- تحمل بیشتر در برابر packet reordering (کلیدی برای مسیرهای ECMP) ---
+# --- Tolerate heavy packet reordering (key fix for ECMP international paths) ---
 net.ipv4.tcp_reordering = 127
 net.ipv4.tcp_max_reordering = 300
 
-# --- عدم کش کردن متریک مسیر قبلی (چون مسیر بین کانکشن‌ها فرق میکنه) ---
+# --- Don't cache stale path metrics between connections on multipath routes ---
 net.ipv4.tcp_no_metrics_save = 1
 
-# --- افزایش سقف فایل‌های باز (برای mux با تعداد بالای کانکشن) ---
+# --- Higher open-file ceiling for mux with many concurrent sockets ---
 fs.file-max = 2097152
 EOF
 
     sysctl --system > /dev/null 2>&1
 
-    # --- LimitNOFILE روی سرویس‌های RTT ---
+    # LimitNOFILE on all installed RTT services
     for svc in tunnel.service lbtunnel.service custom_tunnel.service; do
         if [ -f "/etc/systemd/system/$svc" ]; then
             if ! grep -q "LimitNOFILE" "/etc/systemd/system/$svc"; then
@@ -147,7 +175,9 @@ EOF
         fi
     done
 
-    # --- MSS Clamp ثابت، هم الان و هم دائمی بعد از ریبوت (systemd oneshot) ---
+    # Fixed MSS clamp, applied now and persisted across reboot via a
+    # small oneshot systemd service (iptables rules don't survive reboot
+    # by default).
     cat <<EOF > "$MSS_CLAMP_SCRIPT"
 #!/bin/bash
 IFACE=\$(ip route | grep default | awk '{print \$5}' | head -n1)
@@ -163,7 +193,7 @@ EOF
 
     cat <<EOF > "$MSS_CLAMP_SERVICE"
 [Unit]
-Description=RTT tunnel MSS clamp (persist across reboot)
+Description=RTT tunnel MSS clamp (persists across reboot)
 After=network.target
 
 [Service]
@@ -227,10 +257,10 @@ install_rtt_custom() {
 
     cd "$INSTALL_DIR" || { echo "Cannot cd to $INSTALL_DIR"; exit 1; }
 
-    read -p "Please Enter your custom version (e.g : 7.1) : " version
+    read -p "Please enter your custom version (e.g. 7.1): " version
     apt-get update -y 2>/dev/null
 
-    echo "Downloading ReverseTlsTunnel version : $version"
+    echo "Downloading ReverseTlsTunnel version: $version"
     printf "\n"
 
     case "$(uname -m)" in
@@ -270,23 +300,24 @@ install_rtt_custom() {
 }
 
 configure_arguments() {
-    read -p "Which server do you want to use? (Enter '1' for Iran(internal-server) or '2' for Kharej(external-server) ) : " server_choice
-    read -p "Please Enter SNI (default : sheypoor.com): " sni
+    read -p "Which server do you want to use? (Enter '1' for Iran/internal-server or '2' for Kharej/external-server): " server_choice
+    read -p "Please enter SNI (default: sheypoor.com): " sni
     sni=${sni:-sheypoor.com}
 
-    # به‌جای --terminate (منسوخ/ناشناخته در نسخه‌های جدید و باعث کرش/ری‌استارت
-    # مکرر سرویس) از --connection-age طبق توصیه رسمی پروژه استفاده میشه.
+    # --connection-age is used instead of the deprecated/unrecognized
+    # --terminate flag, which can cause the binary to error out and get
+    # stuck in a systemd restart loop on current releases.
     local stability_flag="--connection-age:4800"
 
     if [ "$server_choice" == "2" ]; then
-        read -p "Please Enter IRAN IP(internal-server) : " server_ip
-        read -p "Please Enter Password (Please choose the same password on both servers): " password
+        read -p "Please enter IRAN IP (internal-server): " server_ip
+        read -p "Please enter password (must match on both servers): " password
         arguments="--kharej --iran-ip:$server_ip --iran-port:443 --toip:127.0.0.1 --toport:multiport --password:$password --sni:$sni $stability_flag"
     elif [ "$server_choice" == "1" ]; then
-        read -p "Please Enter Password (Please choose the same password on both servers): " password
+        read -p "Please enter password (must match on both servers): " password
         read -p "Do you want to use fake upload? (yes/no): " use_fake_upload
         if [ "$use_fake_upload" == "yes" ]; then
-            read -p "Enter upload-to-download ratio (e.g., 5 for 5:1 ratio): " upload_ratio
+            read -p "Enter upload-to-download ratio (e.g. 5 for 5:1): " upload_ratio
             upload_ratio=$((upload_ratio - 1))
             arguments="--iran --lport:23-65535 --sni:$sni --password:$password --noise:$upload_ratio $stability_flag"
         else
@@ -330,7 +361,7 @@ EOL
     sudo systemctl start tunnel.service
     sudo systemctl enable tunnel.service
 
-    # اعمال خودکار پروفایل تیونینگ کرنل/شبکه بلافاصله بعد از نصب تونل
+    # Automatically apply the stability profile right after install
     apply_kernel_tuning
 
     sleep 2
@@ -349,21 +380,21 @@ check_lbinstalled() {
 }
 
 configure_arguments2() {
-    read -p "Which server do you want to use? (Enter '1' for Iran(internal-server) or '2' for Kharej(external-server) ) : " server_choice
-    read -p "Please Enter SNI (default : sheypoor.com): " sni
+    read -p "Which server do you want to use? (Enter '1' for Iran/internal-server or '2' for Kharej/external-server): " server_choice
+    read -p "Please enter SNI (default: sheypoor.com): " sni
     sni=${sni:-sheypoor.com}
 
     local stability_flag="--connection-age:4800"
 
     if [ "$server_choice" == "2" ]; then
         read -p "Is this your main server (VPN server)? (yes/no): " is_main_server
-        read -p "Please Enter IRAN IP(internal-server) : " server_ip
-        read -p "Please Enter Password (Please choose the same password on both servers): " password
+        read -p "Please enter IRAN IP (internal-server): " server_ip
+        read -p "Please enter password (must match on both servers): " password
 
         if [ "$is_main_server" == "yes" ]; then
             arguments="--kharej --iran-ip:$server_ip --iran-port:443 --toip:127.0.0.1 --toport:multiport --password:$password --sni:$sni $stability_flag"
         elif [ "$is_main_server" == "no" ]; then
-            read -p "Enter your main IP (VPN Server):  " main_ip
+            read -p "Enter your main IP (VPN server): " main_ip
             arguments="--kharej --iran-ip:$server_ip --iran-port:443 --toip:$main_ip --toport:multiport --password:$password --sni:$sni $stability_flag"
         else
             echo "Invalid choice for main server. Please enter 'yes' or 'no'."
@@ -371,10 +402,10 @@ configure_arguments2() {
         fi
 
     elif [ "$server_choice" == "1" ]; then
-        read -p "Please Enter Password (Please choose the same password on both servers): " password
+        read -p "Please enter password (must match on both servers): " password
         read -p "Do you want to use fake upload? (yes/no): " use_fake_upload
         if [ "$use_fake_upload" == "yes" ]; then
-            read -p "Enter upload-to-download ratio (e.g., 5 for 5:1 ratio): " upload_ratio
+            read -p "Enter upload-to-download ratio (e.g. 5 for 5:1): " upload_ratio
             upload_ratio=$((upload_ratio - 1))
             arguments="--iran --lport:23-65535 --password:$password --sni:$sni --noise:$upload_ratio $stability_flag"
         else
@@ -384,7 +415,7 @@ configure_arguments2() {
         num_ips=0
         while true; do
             ((num_ips++))
-            read -p "Please enter ip server $num_ips (or type 'done' to finish): " ip
+            read -p "Please enter IP of peer server $num_ips (or type 'done' to finish): " ip
 
             if [ "$ip" == "done" ]; then
                 break
@@ -594,9 +625,9 @@ stop_tunnel() {
 
 check_tunnel_status() {
     if sudo systemctl is-active --quiet tunnel.service; then
-        echo -e "${yellow}Multiport is: ${green}    [running ✔]${rest}"
+        echo -e "${yellow}Multiport is: ${green}    [running OK]${rest}"
     else
-        echo -e "${yellow}Multiport is:${red}    [Not running ✗ ]${rest}"
+        echo -e "${yellow}Multiport is:${red}    [Not running]${rest}"
     fi
 }
 
@@ -628,9 +659,9 @@ stop_lb_tunnel() {
 
 check_lb_tunnel_status() {
     if sudo systemctl is-active --quiet lbtunnel.service; then
-        echo -e "${yellow}Load balancer is: ${green}[running ✔]${rest}"
+        echo -e "${yellow}Load balancer is: ${green}[running OK]${rest}"
     else
-        echo -e "${yellow}Load balancer is:${red}[Not running ✗ ]${rest}"
+        echo -e "${yellow}Load balancer is:${red}[Not running]${rest}"
     fi
 }
 
@@ -656,9 +687,9 @@ start_c_tunnel() {
 
 check_c_tunnel_status() {
     if sudo systemctl is-active --quiet custom_tunnel.service; then
-        echo -e "${yellow}Custom Tunnel is: ${green}[running ✔]${rest}"
+        echo -e "${yellow}Custom Tunnel is: ${green}[running OK]${rest}"
     else
-        echo -e "${yellow}Custom Tunnel is:${red}[Not running ✗ ]${rest}"
+        echo -e "${yellow}Custom Tunnel is:${red}[Not running]${rest}"
     fi
 }
 
@@ -682,7 +713,7 @@ install_custom() {
     install_selected_version
 
     cd /etc/systemd/system || exit 1
-    read -p "Enter RTT arguments (Example: RTT --iran --lport:443 --sni:splus.ir --password:123): " arguments
+    read -p "Enter RTT arguments (example: RTT --iran --lport:443 --sni:splus.ir --password:123): " arguments
 
     cat <<EOL > custom_tunnel.service
 [Unit]
@@ -727,10 +758,9 @@ c_uninstall() {
 }
 
 # =========================================================================
-# تغییر مستقیم SNI بدون نیاز به نصب مجدد کامل تونل
-# سرویس نصب‌شده رو پیدا میکنه، مقدار --sni: رو داخل ExecStart جایگزین
-# میکنه و سرویس رو ری‌استارت میکنه.
-# نکته: SNI باید همزمان روی هر دو سرور (ایران و خارج) یکسان تغییر کنه.
+# Change the tunnel's SNI in place, without a full reinstall.
+# Finds whichever service is installed, edits ExecStart, restarts it.
+# Note: SNI must match on both the Iran and Kharej server.
 # =========================================================================
 change_sni() {
     root_access
@@ -741,7 +771,7 @@ change_sni() {
     done
 
     if [ ${#services[@]} -eq 0 ]; then
-        echo -e "${red}هیچ سرویس RTT روی این سرور نصب نشده.${rest}"
+        echo -e "${red}No RTT service is installed on this server.${rest}"
         return
     fi
 
@@ -749,7 +779,7 @@ change_sni() {
     if [ ${#services[@]} -eq 1 ]; then
         target_svc="${services[0]}"
     else
-        echo "چند سرویس نصب شده، کدوم رو میخواید تغییر بدید؟"
+        echo "Multiple services are installed. Which one do you want to change?"
         select target_svc in "${services[@]}"; do
             [ -n "$target_svc" ] && break
         done
@@ -758,17 +788,17 @@ change_sni() {
     local svc_path="/etc/systemd/system/$target_svc"
 
     if ! grep -q -- "--sni:" "$svc_path"; then
-        echo -e "${red}هیچ پارامتر --sni در این سرویس پیدا نشد (شاید custom بدون sni باشه).${rest}"
+        echo -e "${red}No --sni parameter found in this service (maybe a custom install without SNI).${rest}"
         return
     fi
 
     local current_sni
     current_sni=$(grep "ExecStart=" "$svc_path" | sed -n 's/.*--sni:\([^ ]*\).*/\1/p')
-    echo -e "SNI فعلی: ${cyan}$current_sni${rest}"
-    read -p "SNI جدید رو وارد کنید (مثلا yahoo.com): " new_sni
+    echo -e "Current SNI: ${cyan}$current_sni${rest}"
+    read -p "Enter the new SNI (e.g. yahoo.com): " new_sni
 
     if [ -z "$new_sni" ]; then
-        echo "چیزی وارد نشد، لغو شد."
+        echo "Nothing entered, canceled."
         return
     fi
 
@@ -780,17 +810,18 @@ change_sni() {
 
     sleep 2
     if sudo systemctl is-active --quiet "$target_svc"; then
-        echo -e "${green}SNI با موفقیت به '$new_sni' تغییر کرد و سرویس ری‌استارت شد.${rest}"
-        echo -e "${yellow}یادتون نره همین تغییر رو روی سرور مقابل (ایران/خارج) هم انجام بدید، SNI باید هر دو طرف یکسان باشه.${rest}"
+        echo -e "${green}SNI successfully changed to '$new_sni' and the service was restarted.${rest}"
+        echo -e "${yellow}Remember to make the same change on the peer server (Iran/Kharej) - SNI must match on both sides.${rest}"
     else
-        echo -e "${red}سرویس بعد از تغییر SNI بالا نیومد! برای بررسی: journalctl -u $target_svc -n 50${rest}"
-        echo -e "${yellow}میتونید با فایل بکاپ (${svc_path}.bak.*) به حالت قبل برگردید.${rest}"
+        echo -e "${red}Service failed to come up after changing SNI! Check: journalctl -u $target_svc -n 50${rest}"
+        echo -e "${yellow}You can restore the backup file (${svc_path}.bak.*) to roll back.${rest}"
     fi
 }
 
 # =========================================================================
-# نصب HAProxy برای فوروارد پورت‌های TCP دلخواه (مثلا پورت‌های سرویس‌های
-# داخلی که پشت تونل هستن) بدون نیاز به دستکاری دستی iptables/socat.
+# Install HAProxy for forwarding arbitrary TCP ports (e.g. internal
+# services sitting behind the tunnel) without manually editing
+# iptables/socat rules.
 # =========================================================================
 install_haproxy() {
     root_access
@@ -802,12 +833,12 @@ install_haproxy() {
     fi
 
     if ! command -v haproxy &> /dev/null; then
-        echo -e "${red}نصب HAProxy ناموفق بود.${rest}"
+        echo -e "${red}HAProxy installation failed.${rest}"
         return
     fi
 
-    echo -e "${yellow}برای هر پورتی که میخواید فوروارد بشه، پورت شنود و مقصد رو وارد کنید.${rest}"
-    echo -e "${yellow}مثال مقصد: 127.0.0.1:8080 یا یک IP دیگه:پورت${rest}"
+    echo -e "${yellow}For each port you want to forward, enter the listen port and the destination.${rest}"
+    echo -e "${yellow}Destination example: 127.0.0.1:8080 or another-ip:port${rest}"
 
     local cfg_entries=""
     local ports_opened=()
@@ -815,18 +846,18 @@ install_haproxy() {
 
     while true; do
         ((port_num++))
-        read -p "پورت شنود #$port_num (یا 'done' برای پایان): " listen_port
+        read -p "Listen port #$port_num (or 'done' to finish): " listen_port
         [ "$listen_port" == "done" ] && break
 
         if ! [[ "$listen_port" =~ ^[0-9]+$ ]]; then
-            echo "پورت نامعتبره، دوباره امتحان کنید."
+            echo "Invalid port, try again."
             ((port_num--))
             continue
         fi
 
-        read -p "آدرس مقصد برای پورت $listen_port (IP:PORT): " dest_addr
+        read -p "Destination address for port $listen_port (IP:PORT): " dest_addr
         if [ -z "$dest_addr" ]; then
-            echo "آدرس مقصد خالیه، این پورت رد شد."
+            echo "Destination address is empty, skipping this port."
             ((port_num--))
             continue
         fi
@@ -845,7 +876,7 @@ backend back_${listen_port}
     done
 
     if [ -z "$cfg_entries" ]; then
-        echo "هیچ پورتی وارد نشد، نصب لغو شد."
+        echo "No ports entered, installation canceled."
         return
     fi
 
@@ -871,12 +902,12 @@ $cfg_entries
 EOF
 
     if ! haproxy -c -f /etc/haproxy/haproxy.cfg > /dev/null 2>&1; then
-        echo -e "${red}کانفیگ HAProxy خطا داره:${rest}"
+        echo -e "${red}HAProxy config has an error:${rest}"
         haproxy -c -f /etc/haproxy/haproxy.cfg
         return
     fi
 
-    # باز کردن پورت‌ها روی فایروال (firewalld / ufw هر کدوم فعال بود)
+    # Open the configured ports on the active firewall (firewalld/ufw)
     for p in "${ports_opened[@]}"; do
         if command -v firewall-cmd &> /dev/null && sudo systemctl is-active --quiet firewalld; then
             sudo firewall-cmd --permanent --add-port="${p}/tcp" > /dev/null 2>&1
@@ -893,10 +924,10 @@ EOF
 
     sleep 1
     if sudo systemctl is-active --quiet haproxy; then
-        echo -e "${green}HAProxy با موفقیت نصب شد و پورت‌های زیر فوروارد شدن:${rest}"
+        echo -e "${green}HAProxy installed successfully. Forwarded ports:${rest}"
         printf '%s\n' "${ports_opened[@]}"
     else
-        echo -e "${red}HAProxy بالا نیومد! برای بررسی: journalctl -u haproxy -n 50${rest}"
+        echo -e "${red}HAProxy failed to start! Check: journalctl -u haproxy -n 50${rest}"
     fi
 }
 
@@ -905,7 +936,7 @@ myip=$(hostname -I | awk '{print $1}')
 version=$([ -f "$INSTALL_DIR/RTT" ] && "$INSTALL_DIR/RTT" -v 2>&1 | grep -o 'version="[0-9.]*"')
 
 clear
-echo -e "${cyan}By --> Peyman * Github.com/Ptechgithub * (v2 - auto-tuning)${rest}"
+echo -e "${cyan}Radkesvat Fixed By Parham Pahlean${rest}"
 echo -e "Your IP is: ${cyan}($myip)${rest} "
 echo -e "${yellow}******************************${rest}"
 check_tunnel_status
