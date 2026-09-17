@@ -1,9 +1,74 @@
 #!/bin/bash
 # =========================================================================
-# RTT (ReverseTlsTunnel) Installer - v3
-# Full rewrite (English) with a stronger network/kernel stability profile,
-# automatic tuning on install, in-place SNI change, and HAProxy port
-# forwarding.
+# RTT (ReverseTlsTunnel) Installer - v4
+#
+# CHANGELOG vs v3 (full audit requested by user):
+#   Bug fixes:
+#     - All generated systemd units now set StartLimitIntervalSec=0. This
+#       was the most important correctness bug in v3: with Restart=always
+#       + RestartSec=3, a burst of 5+ crashes in a row (a real scenario on
+#       a lossy Iran<->abroad link) would hit systemd's default restart
+#       burst limit and the service would silently stop being restarted
+#       at all, sitting "failed (start-limit-hit)" until someone noticed
+#       and ran `systemctl reset-failed`. This is very likely the cause
+#       of the "قطعی های مکرر" (repeated drops that don't come back on
+#       their own) some RTT users report.
+#     - Every "sudo ..." call is now routed through a $SUDO variable that
+#       is empty when already running as root. v3 always shelled out to
+#       `sudo`, which is missing by default on some minimal VPS/container
+#       images even when logged in as root - on those images every single
+#       sudo-based action (start/stop/status/tuning) silently failed with
+#       "sudo: command not found".
+#     - Cake qdisc availability detection was actually broken: it deleted
+#       its own test qdisc from `lo` and then checked for cake in
+#       `tc qdisc show`, which will almost never find it again even when
+#       cake IS supported (especially when cake is compiled directly into
+#       the kernel rather than as a loadable module). Fixed to remember
+#       the result of the actual test instead of re-deriving it.
+#     - update_services() only stopped/restarted tunnel.service and
+#       lbtunnel.service around a binary update; custom_tunnel.service and
+#       any multisni-N.service kept running the in-memory old binary and
+#       were never restarted onto the new one. Fixed to handle all
+#       installed service types.
+#     - install_rtt_custom() (custom-version install) refused to run at
+#       all if ANY RTT process was running, instead of stopping/restarting
+#       the other services the way the "latest version" path already did.
+#       Harmonized the two paths.
+#     - apply_kernel_tuning()'s LimitNOFILE safety-net loop only checked
+#       tunnel/lbtunnel/custom_tunnel, not multisni-N services. Extended.
+#     - Added basic input validation: a password, SNI or IP containing a
+#       space silently breaks the generated ExecStart line (systemd splits
+#       it on whitespace), producing a service that starts with wrong
+#       arguments and no obvious error. Now rejected up front.
+#     - Distro detection now also recognizes rocky/almalinux/rhel (treated
+#       like centos) instead of hard-exiting as "unsupported".
+#     - CentOS-family installs now attempt to enable epel-release first,
+#       since mtr/haproxy are unreliable to install without it there.
+#
+#   Stability / stability-related additions:
+#     - New: an optional connection watchdog (see install_watchdog),
+#       installed automatically at the end of every install path on BOTH
+#       the Iran server and the Kharej server. It runs every 15s via a
+#       systemd timer and: restarts a crashed service immediately,
+#       restarts a service that is "active" but not actually listening
+#       (a hung process), and on the Kharej side, restarts a tunnel that
+#       has lost all connectivity to the Iran server for several checks
+#       in a row (sustained packet loss / dead path) or that has had zero
+#       established connections to the Iran server for a while despite
+#       being "active". Restarts are rate-limited per service so a truly
+#       dead upstream path cannot cause a restart storm.
+#     - Added an optional --keep-ufw prompt: RTT disables UFW on startup
+#       by default (undocumented side effect for anyone relying on UFW),
+#       so the installer now asks and, if you opt to keep UFW, also opens
+#       the tunnel's own port range on it automatically.
+#     - configure_bandwidth_shaping() no longer passes the "nat" cake
+#       keyword, which only makes sense on a NAT gateway shaping multiple
+#       internal hosts - this box is the tunnel endpoint itself.
+#
+#   NOTE: radkesvat/ReverseTlsTunnel was archived by its author on
+#   2025-08-16 ("این پروژه دیگه آپدیت نمیشه"). update_services() will
+#   still fetch whatever the last published release is, but no new
+#   upstream releases are expected.
 # =========================================================================
 
 #colors
@@ -20,6 +85,19 @@ INSTALL_DIR="/root"
 TUNNEL_MSS=1340
 MSS_CLAMP_SCRIPT="/usr/local/sbin/rtt-mss-clamp.sh"
 MSS_CLAMP_SERVICE="/etc/systemd/system/rtt-mss-clamp.service"
+WATCHDOG_SCRIPT="/usr/local/sbin/rtt-watchdog.sh"
+WATCHDOG_SERVICE="/etc/systemd/system/rtt-watchdog.service"
+WATCHDOG_TIMER="/etc/systemd/system/rtt-watchdog.timer"
+
+# Route every privileged call through $SUDO instead of a hardcoded "sudo".
+# When we are already root (the normal case, since root_access() enforces
+# it before any real action), SUDO is empty so we never depend on a sudo
+# binary that may not exist on minimal images.
+if [ "$EUID" -eq 0 ]; then
+    SUDO=""
+else
+    SUDO="sudo"
+fi
 
 root_access() {
     if [ "$EUID" -ne 0 ]; then
@@ -50,15 +128,27 @@ other_rtt_services_installed() {
     return 1
 }
 
+# Reject a value that contains whitespace: it would silently break the
+# generated ExecStart= line, since systemd tokenizes on whitespace.
+validate_no_space() {
+    local val="$1" label="$2"
+    if [[ "$val" == *" "* ]]; then
+        echo -e "${red}Error: $label cannot contain spaces (systemd would split the command line on it and RTT would get the wrong arguments). Please run this again without spaces.${rest}"
+        exit 1
+    fi
+}
+
 detect_distribution() {
-    local supported_distributions=("ubuntu" "debian" "centos" "fedora")
+    local supported_distributions=("ubuntu" "debian" "centos" "fedora" "rocky" "almalinux" "rhel")
 
     if [ -f /etc/os-release ]; then
         source /etc/os-release
-        if [[ "${ID}" = "ubuntu" || "${ID}" = "debian" || "${ID}" = "centos" || "${ID}" = "fedora" ]]; then
+        if [[ " ${supported_distributions[*]} " == *" ${ID} "* ]]; then
             package_manager="apt-get"
-            [ "${ID}" = "centos" ] && package_manager="yum"
-            [ "${ID}" = "fedora" ] && package_manager="dnf"
+            case "${ID}" in
+                centos|rocky|almalinux|rhel) package_manager="yum" ;;
+                fedora) package_manager="dnf" ;;
+            esac
         else
             echo "Unsupported distribution!"
             exit 1
@@ -72,22 +162,48 @@ detect_distribution() {
 check_dependencies() {
     detect_distribution
 
+    # RHEL-family images frequently need EPEL for mtr/haproxy to resolve.
+    if [ "$package_manager" == "yum" ] && [[ "${ID}" == "centos" || "${ID}" == "rocky" || "${ID}" == "almalinux" ]]; then
+        $SUDO "${package_manager}" install -y epel-release 2>/dev/null
+    fi
+
     local dependencies=("wget" "lsof" "iptables" "unzip" "gcc" "git" "curl" "tar" "mtr")
 
     for dep in "${dependencies[@]}"; do
         if ! command -v "${dep}" &> /dev/null; then
             echo "${dep} is not installed. Installing..."
-            sudo "${package_manager}" install "${dep}" -y
+            $SUDO "${package_manager}" install "${dep}" -y
         fi
     done
 
-    command -v ss &> /dev/null || sudo "${package_manager}" install -y iproute2 2>/dev/null || sudo "${package_manager}" install -y iproute
+    command -v ss &> /dev/null || $SUDO "${package_manager}" install -y iproute2 2>/dev/null || $SUDO "${package_manager}" install -y iproute
 
     # CentOS/Fedora usually run firewalld; RTT itself only disables ufw.
-    if command -v firewall-cmd &> /dev/null && sudo systemctl is-active --quiet firewalld; then
+    if command -v firewall-cmd &> /dev/null && $SUDO systemctl is-active --quiet firewalld; then
         echo -e "${yellow}firewalld detected and active. Opening 23-65535/tcp...${rest}"
-        sudo firewall-cmd --permanent --add-port=23-65535/tcp > /dev/null 2>&1
-        sudo firewall-cmd --reload > /dev/null 2>&1
+        $SUDO firewall-cmd --permanent --add-port=23-65535/tcp > /dev/null 2>&1
+        $SUDO firewall-cmd --reload > /dev/null 2>&1
+    fi
+}
+
+# RTT disables UFW on startup by default. Ask once, and if the person
+# wants to keep it, open the tunnel's own port range on it.
+KEEP_UFW_FLAG=""
+prompt_keep_ufw() {
+    KEEP_UFW_FLAG=""
+    if command -v ufw &> /dev/null && $SUDO ufw status 2>/dev/null | grep -q "Status: active"; then
+        echo -e "${yellow}UFW is active on this server. By default RTT disables UFW when it starts.${rest}"
+        read -p "Keep UFW active instead (adds --keep-ufw)? [yes/no] (default: no): " keep_ufw_choice
+        if [ "$keep_ufw_choice" == "yes" ]; then
+            KEEP_UFW_FLAG=" --keep-ufw"
+        fi
+    fi
+}
+
+open_ufw_range() {
+    # $1 = "start-end" or a single port
+    if [ -n "$KEEP_UFW_FLAG" ]; then
+        $SUDO ufw allow "${1}/tcp" > /dev/null 2>&1
     fi
 }
 
@@ -120,8 +236,6 @@ check_dependencies() {
 # =========================================================================
 apply_kernel_tuning() {
     echo -e "${cyan}===> Applying kernel/network stability profile...${rest}"
-
-    modprobe tcp_bbr 2>/dev/null
 
     local cc="bbr"
     if ! grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null \
@@ -186,10 +300,21 @@ net.ipv4.tcp_no_metrics_save = 1
 fs.file-max = 2097152
 EOF
 
-    sysctl --system > /dev/null 2>&1
+    $SUDO sysctl --system > /dev/null 2>&1
 
-    # LimitNOFILE on all installed RTT services
-    for svc in tunnel.service lbtunnel.service custom_tunnel.service; do
+    if ! $SUDO sysctl -w fs.file-max=2097152 > /dev/null 2>&1; then
+        echo -e "${yellow}Could not raise fs.file-max (likely a restricted container). If RTT logs${rest}"
+        echo -e "${yellow}\"Could not increase system max connection\" or a file-descriptor error,${rest}"
+        echo -e "${yellow}add --keep-os-limit to its arguments (menu options 19/change_sni won't do${rest}"
+        echo -e "${yellow}this for you, edit the service's ExecStart manually).${rest}"
+    fi
+
+    # LimitNOFILE on all installed RTT services (regular + multi-SNI)
+    local nofile_services=(tunnel.service lbtunnel.service custom_tunnel.service)
+    for f in /etc/systemd/system/multisni-*.service; do
+        [ -e "$f" ] && nofile_services+=("$(basename "$f")")
+    done
+    for svc in "${nofile_services[@]}"; do
         if [ -f "/etc/systemd/system/$svc" ]; then
             if ! grep -q "LimitNOFILE" "/etc/systemd/system/$svc"; then
                 sed -i '/\[Service\]/a LimitNOFILE=1048576' "/etc/systemd/system/$svc"
@@ -226,9 +351,9 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-    sudo systemctl daemon-reload
-    sudo systemctl enable rtt-mss-clamp.service > /dev/null 2>&1
-    sudo systemctl start rtt-mss-clamp.service
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl enable rtt-mss-clamp.service > /dev/null 2>&1
+    $SUDO systemctl start rtt-mss-clamp.service
 
     echo -e "${green}===> Tuning applied. congestion_control=$(sysctl -n net.ipv4.tcp_congestion_control) qdisc=$(sysctl -n net.core.default_qdisc)${rest}"
 }
@@ -280,24 +405,37 @@ install_rtt() {
         exit 1
     fi
 
-    # After a fresh binary is in place, restart any other RTT services
-    # so they pick up the new file instead of continuing to run on a
-    # stale/orphaned in-memory copy.
+    restart_all_rtt_services
+}
+
+# Restart every currently-installed RTT service (tunnel/lb/custom/multi-sni)
+# so they all pick up a freshly (re)placed binary instead of continuing to
+# run on a stale in-memory copy. Shared by install_rtt(), install_rtt_custom()
+# and update_services() so all three code paths behave the same way.
+restart_all_rtt_services() {
     for svc in tunnel.service lbtunnel.service custom_tunnel.service; do
         if [ -f "/etc/systemd/system/$svc" ]; then
-            sudo systemctl restart "$svc" 2>/dev/null
+            $SUDO systemctl restart "$svc" 2>/dev/null
         fi
     done
     for f in /etc/systemd/system/multisni-*.service; do
-        [ -e "$f" ] && sudo systemctl restart "$(basename "$f")" 2>/dev/null
+        [ -e "$f" ] && $SUDO systemctl restart "$(basename "$f")" 2>/dev/null
     done
 }
 
 install_rtt_custom() {
+    local was_running=0
     if pgrep -x "RTT" > /dev/null; then
-        echo "Tunnel is running! You must stop the tunnel before update. (pkill RTT)"
-        echo "Update is canceled."
-        exit 1
+        was_running=1
+        echo -e "${yellow}Stopping running RTT service(s) before swapping the binary...${rest}"
+        for svc in tunnel.service lbtunnel.service custom_tunnel.service; do
+            [ -f "/etc/systemd/system/$svc" ] && $SUDO systemctl stop "$svc" 2>/dev/null
+        done
+        for f in /etc/systemd/system/multisni-*.service; do
+            [ -e "$f" ] && $SUDO systemctl stop "$(basename "$f")" 2>/dev/null
+        done
+        pkill -x RTT 2>/dev/null
+        sleep 1
     fi
 
     cd "$INSTALL_DIR" || { echo "Cannot cd to $INSTALL_DIR"; exit 1; }
@@ -341,13 +479,21 @@ install_rtt_custom() {
         exit 1
     fi
 
-    echo "Finished."
+    if [ "$was_running" -eq 1 ]; then
+        restart_all_rtt_services
+        echo "Binary updated and previously-running services restarted."
+    else
+        echo "Finished."
+    fi
 }
 
 configure_arguments() {
     read -p "Which server do you want to use? (Enter '1' for Iran/internal-server or '2' for Kharej/external-server): " server_choice
     read -p "Please enter SNI (default: sheypoor.com): " sni
     sni=${sni:-sheypoor.com}
+    validate_no_space "$sni" "SNI"
+
+    prompt_keep_ufw
 
     # --connection-age is used instead of the deprecated/unrecognized
     # --terminate flag, which can cause the binary to error out and get
@@ -356,18 +502,22 @@ configure_arguments() {
 
     if [ "$server_choice" == "2" ]; then
         read -p "Please enter IRAN IP (internal-server): " server_ip
+        validate_no_space "$server_ip" "IRAN IP"
         read -p "Please enter password (must match on both servers): " password
-        arguments="--kharej --iran-ip:$server_ip --iran-port:443 --toip:127.0.0.1 --toport:multiport --password:$password --sni:$sni $stability_flag"
+        validate_no_space "$password" "password"
+        arguments="--kharej --iran-ip:$server_ip --iran-port:443 --toip:127.0.0.1 --toport:multiport --password:$password --sni:$sni $stability_flag$KEEP_UFW_FLAG"
     elif [ "$server_choice" == "1" ]; then
         read -p "Please enter password (must match on both servers): " password
+        validate_no_space "$password" "password"
         read -p "Do you want to use fake upload? (yes/no): " use_fake_upload
         if [ "$use_fake_upload" == "yes" ]; then
             read -p "Enter upload-to-download ratio (e.g. 5 for 5:1): " upload_ratio
             upload_ratio=$((upload_ratio - 1))
-            arguments="--iran --lport:23-65535 --sni:$sni --password:$password --noise:$upload_ratio $stability_flag"
+            arguments="--iran --lport:23-65535 --sni:$sni --password:$password --noise:$upload_ratio $stability_flag$KEEP_UFW_FLAG"
         else
-            arguments="--iran --lport:23-65535 --sni:$sni --password:$password $stability_flag"
+            arguments="--iran --lport:23-65535 --sni:$sni --password:$password $stability_flag$KEEP_UFW_FLAG"
         fi
+        open_ufw_range "23:65535"
     else
         echo "Invalid choice. Please enter '1' or '2'."
         exit 1
@@ -388,6 +538,7 @@ install() {
 [Unit]
 Description=my tunnel service
 After=network.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=idle
@@ -402,15 +553,16 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOL
 
-    sudo systemctl daemon-reload
-    sudo systemctl start tunnel.service
-    sudo systemctl enable tunnel.service
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl start tunnel.service
+    $SUDO systemctl enable tunnel.service
 
     # Automatically apply the stability profile right after install
     apply_kernel_tuning
+    install_watchdog
 
     sleep 2
-    if sudo systemctl is-active --quiet tunnel.service; then
+    if $SUDO systemctl is-active --quiet tunnel.service; then
         echo -e "${green}Tunnel service started successfully.${rest}"
     else
         echo -e "${red}Tunnel service failed to start! Check: journalctl -u tunnel.service -n 50${rest}"
@@ -428,19 +580,25 @@ configure_arguments2() {
     read -p "Which server do you want to use? (Enter '1' for Iran/internal-server or '2' for Kharej/external-server): " server_choice
     read -p "Please enter SNI (default: sheypoor.com): " sni
     sni=${sni:-sheypoor.com}
+    validate_no_space "$sni" "SNI"
+
+    prompt_keep_ufw
 
     local stability_flag="--connection-age:4800"
 
     if [ "$server_choice" == "2" ]; then
         read -p "Is this your main server (VPN server)? (yes/no): " is_main_server
         read -p "Please enter IRAN IP (internal-server): " server_ip
+        validate_no_space "$server_ip" "IRAN IP"
         read -p "Please enter password (must match on both servers): " password
+        validate_no_space "$password" "password"
 
         if [ "$is_main_server" == "yes" ]; then
-            arguments="--kharej --iran-ip:$server_ip --iran-port:443 --toip:127.0.0.1 --toport:multiport --password:$password --sni:$sni $stability_flag"
+            arguments="--kharej --iran-ip:$server_ip --iran-port:443 --toip:127.0.0.1 --toport:multiport --password:$password --sni:$sni $stability_flag$KEEP_UFW_FLAG"
         elif [ "$is_main_server" == "no" ]; then
             read -p "Enter your main IP (VPN server): " main_ip
-            arguments="--kharej --iran-ip:$server_ip --iran-port:443 --toip:$main_ip --toport:multiport --password:$password --sni:$sni $stability_flag"
+            validate_no_space "$main_ip" "main IP"
+            arguments="--kharej --iran-ip:$server_ip --iran-port:443 --toip:$main_ip --toport:multiport --password:$password --sni:$sni $stability_flag$KEEP_UFW_FLAG"
         else
             echo "Invalid choice for main server. Please enter 'yes' or 'no'."
             exit 1
@@ -448,14 +606,16 @@ configure_arguments2() {
 
     elif [ "$server_choice" == "1" ]; then
         read -p "Please enter password (must match on both servers): " password
+        validate_no_space "$password" "password"
         read -p "Do you want to use fake upload? (yes/no): " use_fake_upload
         if [ "$use_fake_upload" == "yes" ]; then
             read -p "Enter upload-to-download ratio (e.g. 5 for 5:1): " upload_ratio
             upload_ratio=$((upload_ratio - 1))
-            arguments="--iran --lport:23-65535 --password:$password --sni:$sni --noise:$upload_ratio $stability_flag"
+            arguments="--iran --lport:23-65535 --password:$password --sni:$sni --noise:$upload_ratio $stability_flag$KEEP_UFW_FLAG"
         else
-            arguments="--iran --lport:23-65535 --password:$password --sni:$sni $stability_flag"
+            arguments="--iran --lport:23-65535 --password:$password --sni:$sni $stability_flag$KEEP_UFW_FLAG"
         fi
+        open_ufw_range "23:65535"
 
         num_ips=0
         while true; do
@@ -465,6 +625,7 @@ configure_arguments2() {
             if [ "$ip" == "done" ]; then
                 break
             else
+                validate_no_space "$ip" "peer IP"
                 arguments="$arguments --peer:$ip"
             fi
         done
@@ -490,6 +651,7 @@ load-balancer() {
 [Unit]
 Description=my lbtunnel service
 After=network.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=idle
@@ -504,14 +666,15 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOL
 
-    sudo systemctl daemon-reload
-    sudo systemctl start lbtunnel.service
-    sudo systemctl enable lbtunnel.service
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl start lbtunnel.service
+    $SUDO systemctl enable lbtunnel.service
 
     apply_kernel_tuning
+    install_watchdog
 
     sleep 2
-    if sudo systemctl is-active --quiet lbtunnel.service; then
+    if $SUDO systemctl is-active --quiet lbtunnel.service; then
         echo -e "${green}Load-balancer service started successfully.${rest}"
     else
         echo -e "${red}Load-balancer service failed to start! Check: journalctl -u lbtunnel.service -n 50${rest}"
@@ -524,16 +687,16 @@ lb_uninstall() {
         return
     fi
 
-    sudo systemctl stop lbtunnel.service
-    sudo systemctl disable lbtunnel.service
+    $SUDO systemctl stop lbtunnel.service
+    $SUDO systemctl disable lbtunnel.service
 
-    sudo rm -f /etc/systemd/system/lbtunnel.service
-    sudo systemctl reset-failed
+    $SUDO rm -f /etc/systemd/system/lbtunnel.service
+    $SUDO systemctl reset-failed
     if other_rtt_services_installed "lbtunnel.service"; then
         echo -e "${yellow}Other RTT services are still installed - keeping the shared RTT binary.${rest}"
     else
-        sudo rm -f "$INSTALL_DIR/RTT"
-        sudo rm -f "$INSTALL_DIR/install.sh" 2>/dev/null
+        $SUDO rm -f "$INSTALL_DIR/RTT"
+        $SUDO rm -f "$INSTALL_DIR/install.sh" 2>/dev/null
     fi
 
     echo "Uninstallation completed successfully."
@@ -545,16 +708,16 @@ uninstall() {
         return
     fi
 
-    sudo systemctl stop tunnel.service
-    sudo systemctl disable tunnel.service
+    $SUDO systemctl stop tunnel.service
+    $SUDO systemctl disable tunnel.service
 
-    sudo rm -f /etc/systemd/system/tunnel.service
-    sudo systemctl reset-failed
+    $SUDO rm -f /etc/systemd/system/tunnel.service
+    $SUDO systemctl reset-failed
     if other_rtt_services_installed "tunnel.service"; then
         echo -e "${yellow}Other RTT services are still installed - keeping the shared RTT binary.${rest}"
     else
-        sudo rm -f "$INSTALL_DIR/RTT"
-        sudo rm -f "$INSTALL_DIR/install.sh" 2>/dev/null
+        $SUDO rm -f "$INSTALL_DIR/RTT"
+        $SUDO rm -f "$INSTALL_DIR/install.sh" 2>/dev/null
     fi
 
     echo "Uninstallation completed successfully."
@@ -573,36 +736,47 @@ update_services() {
         | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4 | sed 's/^[Vv]//')
 
     if [ -z "$latest_version" ]; then
-        echo -e "${red}Could not fetch latest version from GitHub API (rate-limited or blocked?).${rest}"
+        echo -e "${red}Could not fetch latest version from GitHub API (rate-limited, blocked, or the repo has no releases reachable this way).${rest}"
         return 1
     fi
 
     if version_gt "$latest_version" "$installed_version"; then
         echo "Updating to $latest_version (Installed: $installed_version)..."
+        echo -e "${yellow}Note: this upstream project was archived by its author, so this is likely${rest}"
+        echo -e "${yellow}the last release that will ever appear here.${rest}"
 
-        local was_tunnel_active=0
-        local was_lb_active=0
-
-        if sudo systemctl is-active --quiet tunnel.service; then
-            sudo systemctl stop tunnel.service > /dev/null 2>&1
-            was_tunnel_active=1
-        fi
-        if sudo systemctl is-active --quiet lbtunnel.service; then
-            sudo systemctl stop lbtunnel.service > /dev/null 2>&1
-            was_lb_active=1
-        fi
+        # Stop every installed RTT service (not just tunnel/lbtunnel) so
+        # none of them keep running the old in-memory binary afterwards.
+        local stopped=()
+        for svc in tunnel.service lbtunnel.service custom_tunnel.service; do
+            if [ -f "/etc/systemd/system/$svc" ] && $SUDO systemctl is-active --quiet "$svc"; then
+                $SUDO systemctl stop "$svc" > /dev/null 2>&1
+                stopped+=("$svc")
+            fi
+        done
+        for f in /etc/systemd/system/multisni-*.service; do
+            [ -e "$f" ] || continue
+            local svc
+            svc="$(basename "$f")"
+            if $SUDO systemctl is-active --quiet "$svc"; then
+                $SUDO systemctl stop "$svc" > /dev/null 2>&1
+                stopped+=("$svc")
+            fi
+        done
 
         if ! wget "https://raw.githubusercontent.com/radkesvat/ReverseTlsTunnel/master/scripts/install.sh" -O install.sh; then
             echo -e "${red}Failed to download install.sh, update aborted.${rest}"
+            for svc in "${stopped[@]}"; do $SUDO systemctl start "$svc" > /dev/null 2>&1; done
             return 1
         fi
         chmod +x install.sh
         bash install.sh
 
-        [ "$was_tunnel_active" -eq 1 ] && sudo systemctl start tunnel.service
-        [ "$was_lb_active" -eq 1 ] && sudo systemctl start lbtunnel.service
+        for svc in "${stopped[@]}"; do
+            $SUDO systemctl start "$svc" > /dev/null 2>&1
+        done
 
-        echo "Service updated and restarted successfully."
+        echo "Service(s) updated and restarted successfully."
     else
         echo "You have the latest version ($installed_version)."
     fi
@@ -651,9 +825,9 @@ compile() {
 }
 
 start_tunnel() {
-    if sudo systemctl is-enabled --quiet tunnel.service; then
-        sudo systemctl start tunnel.service > /dev/null 2>&1
-        if sudo systemctl is-active --quiet tunnel.service; then
+    if $SUDO systemctl is-enabled --quiet tunnel.service; then
+        $SUDO systemctl start tunnel.service > /dev/null 2>&1
+        if $SUDO systemctl is-active --quiet tunnel.service; then
             echo "Tunnel service started."
         else
             echo "Tunnel service failed to start."
@@ -664,9 +838,9 @@ start_tunnel() {
 }
 
 stop_tunnel() {
-    if sudo systemctl is-enabled --quiet tunnel.service; then
-        sudo systemctl stop tunnel.service > /dev/null 2>&1
-        if sudo systemctl is-active --quiet tunnel.service; then
+    if $SUDO systemctl is-enabled --quiet tunnel.service; then
+        $SUDO systemctl stop tunnel.service > /dev/null 2>&1
+        if $SUDO systemctl is-active --quiet tunnel.service; then
             echo "Tunnel service failed to stop."
         else
             echo "Tunnel service stopped."
@@ -677,7 +851,7 @@ stop_tunnel() {
 }
 
 check_tunnel_status() {
-    if sudo systemctl is-active --quiet tunnel.service; then
+    if $SUDO systemctl is-active --quiet tunnel.service; then
         echo -e "${yellow}Multiport is: ${green}    [running OK]${rest}"
     else
         echo -e "${yellow}Multiport is:${red}    [Not running]${rest}"
@@ -685,9 +859,9 @@ check_tunnel_status() {
 }
 
 start_lb_tunnel() {
-    if sudo systemctl is-enabled --quiet lbtunnel.service; then
-        sudo systemctl start lbtunnel.service > /dev/null 2>&1
-        if sudo systemctl is-active --quiet lbtunnel.service; then
+    if $SUDO systemctl is-enabled --quiet lbtunnel.service; then
+        $SUDO systemctl start lbtunnel.service > /dev/null 2>&1
+        if $SUDO systemctl is-active --quiet lbtunnel.service; then
             echo "Tunnel service started."
         else
             echo "Tunnel service failed to start."
@@ -698,9 +872,9 @@ start_lb_tunnel() {
 }
 
 stop_lb_tunnel() {
-    if sudo systemctl is-enabled --quiet lbtunnel.service; then
-        sudo systemctl stop lbtunnel.service > /dev/null 2>&1
-        if sudo systemctl is-active --quiet lbtunnel.service; then
+    if $SUDO systemctl is-enabled --quiet lbtunnel.service; then
+        $SUDO systemctl stop lbtunnel.service > /dev/null 2>&1
+        if $SUDO systemctl is-active --quiet lbtunnel.service; then
             echo "Load-Balancer failed to stop."
         else
             echo "Load-Balancer stopped."
@@ -711,7 +885,7 @@ stop_lb_tunnel() {
 }
 
 check_lb_tunnel_status() {
-    if sudo systemctl is-active --quiet lbtunnel.service; then
+    if $SUDO systemctl is-active --quiet lbtunnel.service; then
         echo -e "${yellow}Load balancer is: ${green}[running OK]${rest}"
     else
         echo -e "${yellow}Load balancer is:${red}[Not running]${rest}"
@@ -726,9 +900,9 @@ check_c_installed() {
 }
 
 start_c_tunnel() {
-    if sudo systemctl is-enabled --quiet custom_tunnel.service; then
-        sudo systemctl start custom_tunnel.service > /dev/null 2>&1
-        if sudo systemctl is-active --quiet custom_tunnel.service; then
+    if $SUDO systemctl is-enabled --quiet custom_tunnel.service; then
+        $SUDO systemctl start custom_tunnel.service > /dev/null 2>&1
+        if $SUDO systemctl is-active --quiet custom_tunnel.service; then
             echo "Custom Tunnel started."
         else
             echo "Custom Tunnel failed to start."
@@ -739,7 +913,7 @@ start_c_tunnel() {
 }
 
 check_c_tunnel_status() {
-    if sudo systemctl is-active --quiet custom_tunnel.service; then
+    if $SUDO systemctl is-active --quiet custom_tunnel.service; then
         echo -e "${yellow}Custom Tunnel is: ${green}[running OK]${rest}"
     else
         echo -e "${yellow}Custom Tunnel is:${red}[Not running]${rest}"
@@ -747,9 +921,9 @@ check_c_tunnel_status() {
 }
 
 stop_c_tunnel() {
-    if sudo systemctl is-enabled --quiet custom_tunnel.service; then
-        sudo systemctl stop custom_tunnel.service > /dev/null 2>&1
-        if sudo systemctl is-active --quiet custom_tunnel.service; then
+    if $SUDO systemctl is-enabled --quiet custom_tunnel.service; then
+        $SUDO systemctl stop custom_tunnel.service > /dev/null 2>&1
+        if $SUDO systemctl is-active --quiet custom_tunnel.service; then
             echo "Custom Tunnel failed to stop."
         else
             echo "Custom Tunnel stopped."
@@ -766,12 +940,16 @@ install_custom() {
     install_selected_version
 
     cd /etc/systemd/system || exit 1
+    echo -e "${yellow}Tip: you can add --keep-ufw (don't disable UFW) or --keep-os-limit (if this${rest}"
+    echo -e "${yellow}box can't raise its file-descriptor limit, e.g. some containers) to the${rest}"
+    echo -e "${yellow}arguments below if you need them.${rest}"
     read -p "Enter RTT arguments (example: RTT --iran --lport:443 --sni:splus.ir --password:123): " arguments
 
     cat <<EOL > custom_tunnel.service
 [Unit]
 Description=my custom tunnel service
 After=network.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=idle
@@ -786,11 +964,12 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOL
 
-    sudo systemctl daemon-reload
-    sudo systemctl start custom_tunnel.service
-    sudo systemctl enable custom_tunnel.service
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl start custom_tunnel.service
+    $SUDO systemctl enable custom_tunnel.service
 
     apply_kernel_tuning
+    install_watchdog
 }
 
 c_uninstall() {
@@ -799,16 +978,16 @@ c_uninstall() {
         return
     fi
 
-    sudo systemctl stop custom_tunnel.service
-    sudo systemctl disable custom_tunnel.service
+    $SUDO systemctl stop custom_tunnel.service
+    $SUDO systemctl disable custom_tunnel.service
 
-    sudo rm -f /etc/systemd/system/custom_tunnel.service
-    sudo systemctl reset-failed
+    $SUDO rm -f /etc/systemd/system/custom_tunnel.service
+    $SUDO systemctl reset-failed
     if other_rtt_services_installed "custom_tunnel.service"; then
         echo -e "${yellow}Other RTT services are still installed - keeping the shared RTT binary.${rest}"
     else
-        sudo rm -f "$INSTALL_DIR/RTT"
-        sudo rm -f "$INSTALL_DIR/install.sh" 2>/dev/null
+        $SUDO rm -f "$INSTALL_DIR/RTT"
+        $SUDO rm -f "$INSTALL_DIR/install.sh" 2>/dev/null
     fi
 
     echo "Uninstallation completed successfully."
@@ -825,6 +1004,9 @@ change_sni() {
     local services=()
     for svc in tunnel.service lbtunnel.service custom_tunnel.service; do
         [ -f "/etc/systemd/system/$svc" ] && services+=("$svc")
+    done
+    for f in /etc/systemd/system/multisni-*.service; do
+        [ -e "$f" ] && services+=("$(basename "$f")")
     done
 
     if [ ${#services[@]} -eq 0 ]; then
@@ -853,6 +1035,7 @@ change_sni() {
     current_sni=$(grep "ExecStart=" "$svc_path" | sed -n 's/.*--sni:\([^ ]*\).*/\1/p')
     echo -e "Current SNI: ${cyan}$current_sni${rest}"
     read -p "Enter the new SNI (e.g. yahoo.com): " new_sni
+    validate_no_space "$new_sni" "SNI"
 
     if [ -z "$new_sni" ]; then
         echo "Nothing entered, canceled."
@@ -862,11 +1045,11 @@ change_sni() {
     cp "$svc_path" "${svc_path}.bak.$(date +%s)"
     sed -i "s/--sni:[^ ]*/--sni:$new_sni/" "$svc_path"
 
-    sudo systemctl daemon-reload
-    sudo systemctl restart "$target_svc"
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl restart "$target_svc"
 
     sleep 2
-    if sudo systemctl is-active --quiet "$target_svc"; then
+    if $SUDO systemctl is-active --quiet "$target_svc"; then
         echo -e "${green}SNI successfully changed to '$new_sni' and the service was restarted.${rest}"
         echo -e "${yellow}Remember to make the same change on the peer server (Iran/Kharej) - SNI must match on both sides.${rest}"
     else
@@ -886,7 +1069,7 @@ install_haproxy() {
 
     if ! command -v haproxy &> /dev/null; then
         echo -e "${cyan}===> Installing HAProxy...${rest}"
-        sudo "${package_manager}" install -y haproxy
+        $SUDO "${package_manager}" install -y haproxy
     fi
 
     if ! command -v haproxy &> /dev/null; then
@@ -951,6 +1134,7 @@ frontend front_${listen_port}
 
 backend back_${listen_port}
     mode tcp
+    retries 3
 ${balance_line}
 ${server_lines}"
         ports_opened+=("$listen_port")
@@ -990,21 +1174,21 @@ EOF
 
     # Open the configured ports on the active firewall (firewalld/ufw)
     for p in "${ports_opened[@]}"; do
-        if command -v firewall-cmd &> /dev/null && sudo systemctl is-active --quiet firewalld; then
-            sudo firewall-cmd --permanent --add-port="${p}/tcp" > /dev/null 2>&1
+        if command -v firewall-cmd &> /dev/null && $SUDO systemctl is-active --quiet firewalld; then
+            $SUDO firewall-cmd --permanent --add-port="${p}/tcp" > /dev/null 2>&1
         fi
-        if command -v ufw &> /dev/null && sudo ufw status | grep -q "Status: active"; then
-            sudo ufw allow "${p}/tcp" > /dev/null 2>&1
+        if command -v ufw &> /dev/null && $SUDO ufw status | grep -q "Status: active"; then
+            $SUDO ufw allow "${p}/tcp" > /dev/null 2>&1
         fi
     done
-    command -v firewall-cmd &> /dev/null && sudo firewall-cmd --reload > /dev/null 2>&1
+    command -v firewall-cmd &> /dev/null && $SUDO firewall-cmd --reload > /dev/null 2>&1
 
-    sudo systemctl daemon-reload
-    sudo systemctl enable haproxy > /dev/null 2>&1
-    sudo systemctl restart haproxy
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl enable haproxy > /dev/null 2>&1
+    $SUDO systemctl restart haproxy
 
     sleep 1
-    if sudo systemctl is-active --quiet haproxy; then
+    if $SUDO systemctl is-active --quiet haproxy; then
         echo -e "${green}HAProxy installed successfully. Forwarded ports:${rest}"
         printf '%s\n' "${ports_opened[@]}"
     else
@@ -1045,16 +1229,21 @@ install_multi_sni() {
     fi
 
     read -p "Enter the shared password (must be identical on both servers): " password
+    validate_no_space "$password" "password"
+
+    prompt_keep_ufw
 
     local snis=()
     for ((i = 1; i <= n_sni; i++)); do
         read -p "SNI #$i (e.g. site${i}.example.com): " s
+        validate_no_space "$s" "SNI #$i"
         snis+=("$s")
     done
 
     local iran_ip=""
     if [ "$side" == "2" ]; then
         read -p "Enter IRAN IP (internal-server): " iran_ip
+        validate_no_space "$iran_ip" "IRAN IP"
     fi
 
     # Deterministic port allocation
@@ -1091,15 +1280,17 @@ install_multi_sni() {
         local arguments
 
         if [ "$side" == "1" ]; then
-            arguments="--iran --lport:$lrange --sni:$sni --password:$password --connection-age:4800"
+            arguments="--iran --lport:$lrange --sni:$sni --password:$password --connection-age:4800$KEEP_UFW_FLAG"
+            open_ufw_range "${starts[$i]}:${ends[$i]}"
         else
-            arguments="--kharej --iran-ip:$iran_ip --iran-port:$cport --toip:127.0.0.1 --toport:multiport --password:$password --sni:$sni --connection-age:4800"
+            arguments="--kharej --iran-ip:$iran_ip --iran-port:$cport --toip:127.0.0.1 --toport:multiport --password:$password --sni:$sni --connection-age:4800$KEEP_UFW_FLAG"
         fi
 
         cat <<EOL > /etc/systemd/system/$svc
 [Unit]
 Description=RTT multi-SNI tunnel instance $idx ($sni)
 After=network.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=idle
@@ -1113,17 +1304,18 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOL
-        sudo systemctl daemon-reload
-        sudo systemctl enable "$svc" > /dev/null 2>&1
-        sudo systemctl restart "$svc"
+        $SUDO systemctl daemon-reload
+        $SUDO systemctl enable "$svc" > /dev/null 2>&1
+        $SUDO systemctl restart "$svc"
     done
 
     apply_kernel_tuning
+    install_watchdog
 
     sleep 2
     echo -e "${cyan}===> Status of multi-SNI instances:${rest}"
     for ((i = 1; i <= n_sni; i++)); do
-        if sudo systemctl is-active --quiet "multisni-${i}.service"; then
+        if $SUDO systemctl is-active --quiet "multisni-${i}.service"; then
             echo -e "  Instance $i (${snis[$((i - 1))]}): ${green}running${rest}"
         else
             echo -e "  Instance $i (${snis[$((i - 1))]}): ${red}failed - check: journalctl -u multisni-${i}.service -n 50${rest}"
@@ -1154,13 +1346,24 @@ EOL
 configure_bandwidth_shaping() {
     root_access
 
-    if ! tc qdisc add dev lo root cake 2>/dev/null; then
-        echo -e "${yellow}This kernel may not support the 'cake' qdisc. Attempting to load the module...${rest}"
+    # Test cake support directly and remember the result - don't re-derive
+    # it later from `tc qdisc show`, since we're about to remove our own
+    # test qdisc and that check would then almost always come back empty
+    # even when cake genuinely is available (e.g. compiled in, not a
+    # loadable module).
+    local cake_available=0
+    if tc qdisc add dev lo root cake 2>/dev/null; then
+        cake_available=1
+        tc qdisc del dev lo root 2>/dev/null
+    else
         modprobe sch_cake 2>/dev/null
+        if tc qdisc add dev lo root cake 2>/dev/null; then
+            cake_available=1
+            tc qdisc del dev lo root 2>/dev/null
+        fi
     fi
-    tc qdisc del dev lo root 2>/dev/null
 
-    if ! tc qdisc show | grep -q cake && ! modprobe sch_cake 2>/dev/null; then
+    if [ "$cake_available" -eq 0 ]; then
         echo -e "${red}The 'cake' qdisc is not available on this kernel. Skipping.${rest}"
         echo -e "${yellow}(Usually available on kernel 4.19+ / most current Ubuntu, Debian 11+, CentOS Stream.)${rest}"
         return
@@ -1190,7 +1393,11 @@ configure_bandwidth_shaping() {
     [ "$shaped_mbit" -lt 1 ] && shaped_mbit=1
 
     tc qdisc del dev "$iface" root 2>/dev/null
-    if tc qdisc replace dev "$iface" root cake bandwidth "${shaped_mbit}mbit" nat dual-srchost 2>/dev/null; then
+    # No "nat": that keyword is for a NAT gateway shaping multiple
+    # internal hosts by their pre/post-NAT address via conntrack. This
+    # box is the tunnel endpoint itself, not a NAT router, so plain
+    # per-flow/per-host fairness is what applies here.
+    if tc qdisc replace dev "$iface" root cake bandwidth "${shaped_mbit}mbit" dual-srchost 2>/dev/null; then
         echo -e "${green}Cake shaping applied on $iface at ${shaped_mbit}mbit (95% of ${uplink_mbit}mbit).${rest}"
     else
         echo -e "${red}Failed to apply cake qdisc on $iface.${rest}"
@@ -1201,7 +1408,7 @@ configure_bandwidth_shaping() {
     cat <<EOF > /usr/local/sbin/rtt-cake-shaping.sh
 #!/bin/bash
 IFACE=\$(ip route | grep default | awk '{print \$5}' | head -n1)
-[ -n "\$IFACE" ] && tc qdisc replace dev "\$IFACE" root cake bandwidth ${shaped_mbit}mbit nat dual-srchost
+[ -n "\$IFACE" ] && tc qdisc replace dev "\$IFACE" root cake bandwidth ${shaped_mbit}mbit dual-srchost
 EOF
     chmod +x /usr/local/sbin/rtt-cake-shaping.sh
 
@@ -1218,8 +1425,8 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-    sudo systemctl daemon-reload
-    sudo systemctl enable rtt-cake-shaping.service > /dev/null 2>&1
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl enable rtt-cake-shaping.service > /dev/null 2>&1
 
     echo -e "${yellow}Note: this reduces jitter caused by local queueing under load. It cannot${rest}"
     echo -e "${yellow}fix jitter/reordering that occurs further out on the backbone path.${rest}"
@@ -1238,9 +1445,9 @@ uninstall_multi_sni() {
         found=1
         local svc
         svc=$(basename "$f")
-        sudo systemctl stop "$svc" 2>/dev/null
-        sudo systemctl disable "$svc" 2>/dev/null
-        sudo rm -f "/etc/systemd/system/$svc"
+        $SUDO systemctl stop "$svc" 2>/dev/null
+        $SUDO systemctl disable "$svc" 2>/dev/null
+        $SUDO rm -f "/etc/systemd/system/$svc"
         echo "Removed $svc"
     done
 
@@ -1249,16 +1456,233 @@ uninstall_multi_sni() {
         return
     fi
 
-    sudo systemctl reset-failed
+    $SUDO systemctl reset-failed
 
     if other_rtt_services_installed; then
         echo -e "${yellow}Other RTT services are still installed - keeping the shared RTT binary.${rest}"
     else
-        sudo rm -f "$INSTALL_DIR/RTT"
-        sudo rm -f "$INSTALL_DIR/install.sh" 2>/dev/null
+        $SUDO rm -f "$INSTALL_DIR/RTT"
+        $SUDO rm -f "$INSTALL_DIR/install.sh" 2>/dev/null
     fi
 
     echo "Multi-SNI uninstallation completed successfully."
+}
+
+# =========================================================================
+# Connection watchdog: installed automatically on both the Iran server
+# and the Kharej server at the end of every install path (options 1, 6,
+# 11, 21), and available standalone via the menu.
+#
+# Runs every 15s via a systemd timer. Each run:
+#   - restarts any installed RTT service that is not "active" at all
+#     (crashed) - immediate recovery instead of waiting on the user;
+#   - restarts a service that IS "active" per systemd but isn't actually
+#     listening on its configured port (a hung/zombie process);
+#   - on the Kharej side, tracks pings to the configured iran-ip and, if
+#     several checks in a row get no response, restarts that instance -
+#     this catches a link that is technically "up" but has gone dead or
+#     is dropping essentially all packets, where a fresh reconnect
+#     attempt is often what actually recovers it;
+#   - on the Kharej side, also tracks whether the service has ANY
+#     established TCP connection toward the Iran server; if it has had
+#     none for a while despite being "active", treats it the same way.
+# Restarts of the SAME service are rate-limited (45s) so a genuinely
+# dead upstream path cannot turn into a restart storm.
+# =========================================================================
+install_watchdog() {
+    root_access
+    echo -e "${cyan}===> Installing the connection watchdog (fast crash/hang/packet-loss recovery)...${rest}"
+
+    mkdir -p /var/lib/rtt-watchdog
+
+    cat <<'WDEOF' > /usr/local/sbin/rtt-watchdog.sh
+#!/bin/bash
+# RTT connection watchdog - see install_watchdog() in the installer for
+# the full explanation of what this checks and why.
+
+STATE_DIR="/var/lib/rtt-watchdog"
+mkdir -p "$STATE_DIR"
+
+log() {
+    logger -t rtt-watchdog -- "$1"
+}
+
+# Minimum seconds between two restarts of the SAME service, so a
+# genuinely dead upstream path can't trigger a restart storm.
+MIN_RESTART_GAP=45
+
+# How many consecutive failed checks before we treat something as real
+# and act on it (each watchdog run is one sample, runs every ~15s).
+LOSS_STREAK_THRESHOLD=3
+NOCONN_STREAK_THRESHOLD=6
+
+restart_service() {
+    local svc="$1"
+    local reason="$2"
+    local last_file="$STATE_DIR/${svc}.last_restart"
+    local now
+    now=$(date +%s)
+
+    if [ -f "$last_file" ]; then
+        local last diff
+        last=$(cat "$last_file" 2>/dev/null || echo 0)
+        diff=$((now - last))
+        if [ "$diff" -lt "$MIN_RESTART_GAP" ]; then
+            log "$svc: needs restart ($reason) but last restart was ${diff}s ago - waiting to avoid a restart loop."
+            return
+        fi
+    fi
+
+    log "$svc: restarting - $reason"
+    systemctl reset-failed "$svc" 2>/dev/null
+    systemctl restart "$svc" 2>/dev/null
+    echo "$now" > "$last_file"
+}
+
+extract_arg() {
+    local svc_path="$1" flag="$2"
+    grep "ExecStart=" "$svc_path" | sed -n "s/.*${flag}:\([^ ]*\).*/\1/p"
+}
+
+is_kharej_service() {
+    grep -q -- "--kharej" "$1"
+}
+
+any_port_listening() {
+    local lport_spec="$1"
+    local first_port="${lport_spec%%-*}"
+    [ -z "$first_port" ] && return 1
+    ss -H -ltn "( sport = :$first_port )" 2>/dev/null | grep -q LISTEN
+}
+
+check_service() {
+    local svc="$1"
+    local svc_path="/etc/systemd/system/$svc"
+    [ -f "$svc_path" ] || return
+
+    systemctl is-enabled --quiet "$svc" 2>/dev/null || return
+
+    if ! systemctl is-active --quiet "$svc"; then
+        restart_service "$svc" "service is not active"
+        return
+    fi
+
+    if is_kharej_service "$svc_path"; then
+        local iran_ip iran_port
+        iran_ip=$(extract_arg "$svc_path" "--iran-ip")
+        iran_port=$(extract_arg "$svc_path" "--iran-port")
+
+        if [ -n "$iran_ip" ]; then
+            local streak_file="$STATE_DIR/${svc}.loss_streak"
+            if ping -c 1 -W 2 "$iran_ip" > /dev/null 2>&1; then
+                echo 0 > "$streak_file"
+            else
+                local streak
+                streak=$(cat "$streak_file" 2>/dev/null || echo 0)
+                streak=$((streak + 1))
+                echo "$streak" > "$streak_file"
+                if [ "$streak" -ge "$LOSS_STREAK_THRESHOLD" ]; then
+                    restart_service "$svc" "no response from iran-ip ($iran_ip) for $streak checks in a row"
+                    echo 0 > "$streak_file"
+                    return
+                fi
+            fi
+        fi
+
+        if [ -n "$iran_port" ]; then
+            local est noconn_file
+            est=$(ss -H -tn state established "( dport = :$iran_port )" 2>/dev/null | wc -l)
+            noconn_file="$STATE_DIR/${svc}.noconn_streak"
+            if [ "$est" -gt 0 ]; then
+                echo 0 > "$noconn_file"
+            else
+                local ns
+                ns=$(cat "$noconn_file" 2>/dev/null || echo 0)
+                ns=$((ns + 1))
+                echo "$ns" > "$noconn_file"
+                if [ "$ns" -ge "$NOCONN_STREAK_THRESHOLD" ]; then
+                    restart_service "$svc" "no established connection to the Iran server for a while"
+                    echo 0 > "$noconn_file"
+                fi
+            fi
+        fi
+    else
+        local lport
+        lport=$(extract_arg "$svc_path" "--lport")
+        if [ -n "$lport" ] && ! any_port_listening "$lport"; then
+            restart_service "$svc" "process is running but not listening on its configured port"
+        fi
+    fi
+}
+
+for svc in tunnel.service lbtunnel.service custom_tunnel.service; do
+    check_service "$svc"
+done
+
+for f in /etc/systemd/system/multisni-*.service; do
+    [ -e "$f" ] || continue
+    check_service "$(basename "$f")"
+done
+WDEOF
+    chmod +x /usr/local/sbin/rtt-watchdog.sh
+
+    cat <<EOF > "$WATCHDOG_SERVICE"
+[Unit]
+Description=RTT tunnel watchdog (one-shot health check)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=$WATCHDOG_SCRIPT
+EOF
+
+    cat <<EOF > "$WATCHDOG_TIMER"
+[Unit]
+Description=Run the RTT tunnel watchdog periodically
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=15s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl enable --now rtt-watchdog.timer > /dev/null 2>&1
+
+    if $SUDO systemctl is-active --quiet rtt-watchdog.timer; then
+        echo -e "${green}Watchdog installed and running (checks every 15s).${rest}"
+    else
+        echo -e "${red}Watchdog timer failed to start! Check: journalctl -u rtt-watchdog.timer -n 50${rest}"
+    fi
+}
+
+uninstall_watchdog() {
+    root_access
+    $SUDO systemctl disable --now rtt-watchdog.timer 2>/dev/null
+    $SUDO systemctl stop rtt-watchdog.service 2>/dev/null
+    $SUDO rm -f "$WATCHDOG_TIMER" "$WATCHDOG_SERVICE" "$WATCHDOG_SCRIPT"
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl reset-failed 2>/dev/null
+    echo "Watchdog removed."
+}
+
+show_watchdog_log() {
+    if [ ! -f "$WATCHDOG_SCRIPT" ]; then
+        echo "Watchdog is not installed."
+        return
+    fi
+    journalctl -t rtt-watchdog -n 100 --no-pager
+}
+
+check_watchdog_status() {
+    if $SUDO systemctl is-active --quiet rtt-watchdog.timer 2>/dev/null; then
+        echo -e "${yellow}Watchdog is: ${green}[running OK]${rest}"
+    else
+        echo -e "${yellow}Watchdog is:${red}    [Not installed/running]${rest}"
+    fi
 }
 
 # ip & version
@@ -1272,6 +1696,7 @@ echo -e "${yellow}******************************${rest}"
 check_tunnel_status
 check_lb_tunnel_status
 check_c_tunnel_status
+check_watchdog_status
 echo -e "${yellow}******************************${rest}"
 echo -e " ${purple}--------#- Reverse Tls Tunnel -#--------${rest}"
 echo -e "${green}1) Install (Multiport)${rest}"
@@ -1300,6 +1725,10 @@ echo -e "${cyan}20) Install HAProxy (port forwarding)${rest}"
 echo -e "${purple}21) Setup Multi-SNI parallel tunnels${rest}"
 echo -e "${purple}22) Configure Cake bandwidth shaping (jitter reduction)${rest}"
 echo -e "${red}23) Uninstall Multi-SNI instances${rest}"
+echo -e "${yellow} ----------------------------${rest}"
+echo -e "${green}24) Install/reinstall connection watchdog${rest}"
+echo -e "${cyan}25) Show watchdog log${rest}"
+echo -e "${red}26) Uninstall watchdog${rest}"
 echo "0) Exit"
 echo -e "${purple} --------------${cyan}$version${purple}--------------${rest}"
 read -p "Please choose: " choice
@@ -1328,6 +1757,9 @@ case $choice in
     21) install_multi_sni ;;
     22) configure_bandwidth_shaping ;;
     23) uninstall_multi_sni ;;
+    24) install_watchdog ;;
+    25) show_watchdog_log ;;
+    26) uninstall_watchdog ;;
     0) exit ;;
     *) echo "Invalid choice. Please try again." ;;
 esac
