@@ -203,6 +203,8 @@ IFACE=\$(ip route | grep default | awk '{print \$5}' | head -n1)
 if [ -n "\$IFACE" ]; then
     iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $TUNNEL_MSS 2>/dev/null \
         || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $TUNNEL_MSS
+    iptables -t mangle -C INPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $TUNNEL_MSS 2>/dev/null \
+        || iptables -t mangle -A INPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $TUNNEL_MSS
     iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $TUNNEL_MSS 2>/dev/null \
         || iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $TUNNEL_MSS
 fi
@@ -404,11 +406,24 @@ EOL
     apply_kernel_tuning
     install_watchdog
 
-    sleep 2
-    if $SUDO systemctl is-active --quiet tunnel.service; then
-        echo -e "${green}Tunnel service started successfully.${rest}"
-    else
+    sleep 3
+    if ! $SUDO systemctl is-active --quiet tunnel.service; then
         echo -e "${red}Tunnel service failed to start! Check: journalctl -u tunnel.service -n 50${rest}"
+    elif [ "$server_choice" == "1" ]; then
+        # Iran role: RTT must actually bind a listening socket. is-active alone
+        # does not prove that - it only proves the process launched.
+        sleep 2
+        local pid
+        pid=$($SUDO systemctl show -p MainPID --value tunnel.service)
+        if [ -n "$pid" ] && [ "$pid" -gt 0 ] && ss -tlnp 2>/dev/null | grep -q "pid=${pid},"; then
+            echo -e "${green}Tunnel service started successfully and is listening.${rest}"
+        else
+            echo -e "${yellow}Tunnel service is running but is NOT listening yet.${rest}"
+            echo -e "${yellow}Give it a few more seconds, then check: journalctl -u tunnel.service -n 50${rest}"
+        fi
+    else
+        echo -e "${green}Tunnel service started successfully.${rest}"
+        echo -e "${yellow}Note: this is a Kharej client - it makes an outbound connection, it won't show as 'listening'. Confirm the Iran side sees an active peer too.${rest}"
     fi
 }
 
@@ -545,6 +560,7 @@ version_gt() {
 }
 
 update_services() {
+    root_access
     cd "$INSTALL_DIR" || exit 1
     installed_version=$(./RTT -v 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -n1)
     latest_version=$(curl -s https://api.github.com/repos/radkesvat/ReverseTlsTunnel/releases/latest \
@@ -556,9 +572,20 @@ update_services() {
     fi
 
     if version_gt "$latest_version" "$installed_version"; then
-        echo "Updating to $latest_version..."
-        restart_all_rtt_services
-        echo "Updated."
+        echo "Updating from ${installed_version:-unknown} to $latest_version..."
+        # This used to only call restart_all_rtt_services here, which just
+        # relaunched the OLD binary - nothing was actually downloaded.
+        if wget "https://raw.githubusercontent.com/radkesvat/ReverseTlsTunnel/master/scripts/install.sh" -O install.sh; then
+            chmod +x install.sh
+            if bash install.sh; then
+                restart_all_rtt_services
+                echo -e "${green}Updated to $latest_version and restarted.${rest}"
+            else
+                echo -e "${red}install.sh failed - binary was NOT updated.${rest}"
+            fi
+        else
+            echo -e "${red}Failed to download the installer - binary was NOT updated.${rest}"
+        fi
     else
         echo "Already latest version ($installed_version)."
     fi
@@ -741,6 +768,29 @@ check_service() {
         restart_service "$svc" "process is stuck in D-state"
         return
     fi
+
+    # Check 4: Listening-socket check - Iran role ONLY.
+    # A --kharej instance is an outbound TLS client and never binds a
+    # listening socket of its own, so running this check on it will ALWAYS
+    # fail and restart a perfectly healthy tunnel forever. That mismatch is
+    # almost certainly what caused the original restart-loop bug.
+    local exec_line
+    exec_line=$(grep -m1 "^ExecStart=" "$svc_path")
+    if [[ "$exec_line" == *" --iran"* && "$exec_line" != *"--iran-ip"* ]]; then
+        local start_iso start_ts now_ts uptime
+        start_iso=$(systemctl show -p ActiveEnterTimestamp --value "$svc" 2>/dev/null)
+        start_ts=$(date -d "$start_iso" +%s 2>/dev/null || echo 0)
+        now_ts=$(date +%s)
+        uptime=$((now_ts - start_ts))
+
+        # Give a freshly (re)started process time to actually bind before
+        # judging it - avoids false positives right after a restart.
+        if [ "$uptime" -ge 25 ]; then
+            if ! ss -tlnp 2>/dev/null | grep -q "pid=${main_pid},"; then
+                restart_service "$svc" "process is running but not listening on its configured port"
+            fi
+        fi
+    fi
 }
 
 for svc in tunnel.service lbtunnel.service custom_tunnel.service; do
@@ -800,7 +850,7 @@ myip=$(hostname -I | awk '{print $1}')
 version=$([ -f "$INSTALL_DIR/RTT" ] && "$INSTALL_DIR/RTT" -v 2>&1 | grep -o 'version="[0-9.]*"')
 
 clear
-echo -e "${cyan}Radkesvat Fixed By Parham Pahlean (v4.1 Patched)${rest}"
+echo -e "${cyan}Radkesvat Fixed By Parham Pahlean (v4.2 Patched)${rest}"
 echo -e "Your IP is: ${cyan}($myip)${rest} "
 echo -e "${yellow}******************************${rest}"
 check_tunnel_status
@@ -819,6 +869,8 @@ echo -e "${cyan}19) Change Tunnel SNI${rest}"
 echo -e "${green}24) Reinstall fixed watchdog${rest}"
 echo -e "${cyan}25) Show watchdog log${rest}"
 echo -e "${red}26) Uninstall watchdog${rest}"
+echo -e "${purple}27) Update RTT binary to latest version${rest}"
+echo -e "${purple}28) Install HAProxy (optional)${rest}"
 echo "0) Exit"
 read -p "Please choose: " choice
 
@@ -835,6 +887,8 @@ case $choice in
     24) install_watchdog ;;
     25) show_watchdog_log ;;
     26) uninstall_watchdog ;;
+    27) update_services ;;
+    28) install_haproxy ;;
     0) exit ;;
     *) echo "Invalid choice." ;;
 esac
