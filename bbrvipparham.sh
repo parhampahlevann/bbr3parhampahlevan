@@ -1,6 +1,15 @@
 #!/bin/bash
 # =========================================================================
-# RTT (ReverseTlsTunnel) Installer - v4.1 (Stability & Watchdog Hotfix)
+# RTT (ReverseTlsTunnel) Installer - v4.3 (Stability & Low-Latency Edition)
+#
+# Changes vs v4.2:
+#   Watchdog : restarts only after 3 consecutive failed checks (~2-3 min),
+#              hourly soft-restart budget, and the Kharej side now checks its
+#              real established session to the Iran server (v4.2 did not).
+#   Kernel   : TCP buffers capped at 16 MB (less RAM per socket on small VPS),
+#              MTU probing enabled (fallback when ICMP is filtered),
+#              tcp_notsent_lowat for lower interactive latency.
+#   Service  : RestartSec 5 -> 3 (new installs), diagnostics menu item (29).
 # =========================================================================
 
 #colors
@@ -32,6 +41,11 @@ root_access() {
         echo "This script requires root access. Please run as root."
         exit 1
     fi
+}
+
+# Extract a value such as --iran-ip:1.2.3.4 from an ExecStart line.
+get_exec_arg() {
+    echo "$1" | sed -n "s/.*--$2:\([^ ]*\).*/\1/p"
 }
 
 other_rtt_services_installed() {
@@ -139,26 +153,31 @@ apply_kernel_tuning() {
 net.core.default_qdisc = $( [ "$cc" == "bbr" ] && echo fq || echo fq_codel )
 net.ipv4.tcp_congestion_control = $cc
 
-# Buffer headroom
+# Buffers: 16 MB ceiling is roughly 500 Mbit/s at 250 ms RTT (bandwidth-delay
+# product). Larger ceilings only raise RAM use per socket on small VPS.
 net.core.netdev_max_backlog = 10000
-net.core.rmem_max = 33554432
-net.core.wmem_max = 33554432
-net.core.rmem_default = 1048576
-net.core.wmem_default = 1048576
-net.ipv4.tcp_rmem = 4096 1048576 33554432
-net.ipv4.tcp_wmem = 4096 1048576 33554432
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.ipv4.tcp_rmem = 4096 262144 16777216
+net.ipv4.tcp_wmem = 4096 262144 16777216
 net.ipv4.tcp_moderate_rcvbuf = 1
+
+# Latency: do not let unsent data pile up in socket buffers
+net.ipv4.tcp_notsent_lowat = 16384
 
 # Tunnel traffic responsiveness
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_frto = 2
 net.ipv4.tcp_early_retrans = 3
 
-# Disable TCP FastOpen (prevents DPI drops in Iran)
+# TCP FastOpen off: no measured benefit for this tunnel, kept predictable
 net.ipv4.tcp_fastopen = 0
 
-# Conservative MTU discovery
-net.ipv4.tcp_mtu_probing = 0
+# PMTU black-hole fallback: ICMP "fragmentation needed" is often filtered,
+# so probing lets TCP recover instead of stalling on large transfers
+net.ipv4.tcp_mtu_probing = 1
 
 # Keepalive & syn limits
 net.ipv4.tcp_syn_retries = 3
@@ -173,7 +192,7 @@ net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 5
 net.ipv4.tcp_tw_reuse = 1
 
-# Standard reordering (re-enables Fast Retransmit on packet loss)
+# Standard reordering tolerance
 net.ipv4.tcp_reordering = 3
 net.ipv4.tcp_max_reordering = 300
 net.ipv4.tcp_sack = 1
@@ -199,15 +218,9 @@ EOF
 
     cat <<EOF > "$MSS_CLAMP_SCRIPT"
 #!/bin/bash
-IFACE=\$(ip route | grep default | awk '{print \$5}' | head -n1)
-if [ -n "\$IFACE" ]; then
-    iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $TUNNEL_MSS 2>/dev/null \
-        || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $TUNNEL_MSS
-    iptables -t mangle -C INPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $TUNNEL_MSS 2>/dev/null \
-        || iptables -t mangle -A INPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $TUNNEL_MSS
-    iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $TUNNEL_MSS 2>/dev/null \
-        || iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $TUNNEL_MSS
-fi
+for chain in FORWARD INPUT OUTPUT; do
+    iptables -t mangle -C \$chain -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $TUNNEL_MSS 2>/dev/null || iptables -t mangle -A \$chain -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss $TUNNEL_MSS
+done
 EOF
     chmod +x "$MSS_CLAMP_SCRIPT"
     bash "$MSS_CLAMP_SCRIPT"
@@ -392,7 +405,7 @@ User=root
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/RTT $arguments
 Restart=always
-RestartSec=5
+RestartSec=3
 LimitNOFILE=1048576
 
 [Install]
@@ -509,7 +522,7 @@ User=root
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/RTT $arguments
 Restart=always
-RestartSec=5
+RestartSec=3
 LimitNOFILE=1048576
 
 [Install]
@@ -573,8 +586,6 @@ update_services() {
 
     if version_gt "$latest_version" "$installed_version"; then
         echo "Updating from ${installed_version:-unknown} to $latest_version..."
-        # This used to only call restart_all_rtt_services here, which just
-        # relaunched the OLD binary - nothing was actually downloaded.
         if wget "https://raw.githubusercontent.com/radkesvat/ReverseTlsTunnel/master/scripts/install.sh" -O install.sh; then
             chmod +x install.sh
             if bash install.sh; then
@@ -646,7 +657,7 @@ User=root
 WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/$arguments
 Restart=always
-RestartSec=5
+RestartSec=3
 LimitNOFILE=1048576
 
 [Install]
@@ -700,36 +711,49 @@ install_haproxy() {
 
 install_watchdog() {
     root_access
-    echo -e "${cyan}===> Installing the stabilized connection watchdog...${rest}"
+    echo -e "${cyan}===> Installing the stabilized connection watchdog (v4.3)...${rest}"
     mkdir -p /var/lib/rtt-watchdog
 
     cat <<'WDEOF' > /usr/local/sbin/rtt-watchdog.sh
 #!/bin/bash
-# Fixed RTT Watchdog: Prevents false-positive restart loops
+# RTT watchdog v4.3 - restarts only after repeated, confirmed failures.
 
 STATE_DIR="/var/lib/rtt-watchdog"
 mkdir -p "$STATE_DIR"
+
+STRIKE_LIMIT=3          # consecutive failed checks (60s apart) before a soft restart
+MAX_SOFT_RESTARTS_H=3   # max soft restarts per service per hour
+MIN_RESTART_GAP=180     # seconds between two restarts of the same service
+STARTUP_GRACE=60        # seconds after (re)start before a process is judged
 
 log() {
     logger -t rtt-watchdog -- "$1"
 }
 
-# Increased cooldown to 120s to eliminate restart storms
-MIN_RESTART_GAP=120
+get_arg() {
+    echo "$1" | sed -n "s/.*--$2:\([^ ]*\).*/\1/p"
+}
 
+# restart_service <svc> <reason> <hard|soft>
 restart_service() {
-    local svc="$1"
-    local reason="$2"
-    local last_file="$STATE_DIR/${svc}.last_restart"
-    local now
+    local svc="$1" reason="$2" kind="$3"
+    local hist="$STATE_DIR/${svc}.restarts"
+    local now last count
     now=$(date +%s)
+    touch "$hist"
 
-    if [ -f "$last_file" ]; then
-        local last diff
-        last=$(cat "$last_file" 2>/dev/null || echo 0)
-        diff=$((now - last))
-        if [ "$diff" -lt "$MIN_RESTART_GAP" ]; then
-            log "$svc: needs restart ($reason) but cooled down for ${diff}s - skipping."
+    last=$(tail -n1 "$hist")
+    last=${last:-0}
+    if [ $((now - last)) -lt "$MIN_RESTART_GAP" ]; then
+        log "$svc: $reason - last restart $((now - last))s ago, skipping"
+        return
+    fi
+
+    if [ "$kind" == "soft" ]; then
+        awk -v t=$((now - 3600)) '$1 > t' "$hist" > "$hist.tmp" && mv "$hist.tmp" "$hist"
+        count=$(wc -l < "$hist")
+        if [ "$count" -ge "$MAX_SOFT_RESTARTS_H" ]; then
+            log "$svc: $reason - hourly restart budget used ($count), not restarting"
             return
         fi
     fi
@@ -737,58 +761,89 @@ restart_service() {
     log "$svc: restarting - $reason"
     systemctl reset-failed "$svc" 2>/dev/null
     systemctl restart "$svc" 2>/dev/null
-    echo "$now" > "$last_file"
+    echo "$now" >> "$hist"
+}
+
+# strike <svc> <reason>: count a failed check; restart only when confirmed
+strike() {
+    local svc="$1" reason="$2"
+    local f="$STATE_DIR/${svc}.strikes" n
+    n=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 ))
+    if [ "$n" -lt "$STRIKE_LIMIT" ]; then
+        echo "$n" > "$f"
+        log "$svc: check failed ($reason) [$n/$STRIKE_LIMIT]"
+        return
+    fi
+    echo 0 > "$f"
+    restart_service "$svc" "$reason (confirmed after $STRIKE_LIMIT checks)" soft
+}
+
+clear_strike() {
+    echo 0 > "$STATE_DIR/${1}.strikes"
 }
 
 check_service() {
     local svc="$1"
     local svc_path="/etc/systemd/system/$svc"
     [ -f "$svc_path" ] || return
-
     systemctl is-enabled --quiet "$svc" 2>/dev/null || return
 
-    # Check 1: Systemd inactive/crashed state
+    # Hard failures: service down or process gone. Restart right away.
     if ! systemctl is-active --quiet "$svc"; then
-        restart_service "$svc" "service is inactive or crashed"
+        restart_service "$svc" "service inactive or crashed" hard
         return
     fi
 
-    # Check 2: Process check (ensure RTT PID is truly alive and responsive)
     local main_pid
     main_pid=$(systemctl show -p MainPID --value "$svc")
     if [ -z "$main_pid" ] || [ "$main_pid" -le 0 ] || ! kill -0 "$main_pid" 2>/dev/null; then
-        restart_service "$svc" "main process PID $main_pid is dead"
+        restart_service "$svc" "main PID $main_pid is dead" hard
         return
     fi
 
-    # Check 3: Check if process is stuck in Uninterruptible Sleep (D-state)
+    # Give a freshly (re)started process time to connect before judging it
+    local start_ts uptime
+    start_ts=$(date -d "$(systemctl show -p ActiveEnterTimestamp --value "$svc")" +%s 2>/dev/null || echo 0)
+    uptime=$(( $(date +%s) - start_ts ))
+    if [ "$uptime" -lt "$STARTUP_GRACE" ]; then
+        return
+    fi
+
     local proc_state
     proc_state=$(ps -o state= -p "$main_pid" 2>/dev/null | tr -d ' ')
     if [ "$proc_state" == "D" ]; then
-        restart_service "$svc" "process is stuck in D-state"
+        strike "$svc" "process stuck in D-state"
         return
     fi
 
-    # Check 4: Listening-socket check - Iran role ONLY.
-    # A --kharej instance is an outbound TLS client and never binds a
-    # listening socket of its own, so running this check on it will ALWAYS
-    # fail and restart a perfectly healthy tunnel forever. That mismatch is
-    # almost certainly what caused the original restart-loop bug.
     local exec_line
     exec_line=$(grep -m1 "^ExecStart=" "$svc_path")
-    if [[ "$exec_line" == *" --iran"* && "$exec_line" != *"--iran-ip"* ]]; then
-        local start_iso start_ts now_ts uptime
-        start_iso=$(systemctl show -p ActiveEnterTimestamp --value "$svc" 2>/dev/null)
-        start_ts=$(date -d "$start_iso" +%s 2>/dev/null || echo 0)
-        now_ts=$(date +%s)
-        uptime=$((now_ts - start_ts))
 
-        # Give a freshly (re)started process time to actually bind before
-        # judging it - avoids false positives right after a restart.
-        if [ "$uptime" -ge 25 ]; then
-            if ! ss -tlnp 2>/dev/null | grep -q "pid=${main_pid},"; then
-                restart_service "$svc" "process is running but not listening on its configured port"
-            fi
+    if [[ "$exec_line" == *" --iran"* && "$exec_line" != *"--iran-ip"* ]]; then
+        # Iran role: the RTT process must own a listening socket
+        if ss -tlnp 2>/dev/null | grep -q "pid=${main_pid},"; then
+            clear_strike "$svc"
+        else
+            strike "$svc" "process running but not listening"
+        fi
+    else
+        # Kharej role: an outbound client has no listening socket. Its health
+        # is the established session to the Iran server.
+        local iran_ip iran_port
+        iran_ip=$(get_arg "$exec_line" "iran-ip")
+        iran_port=$(get_arg "$exec_line" "iran-port")
+        iran_port=${iran_port:-443}
+
+        # Only IPv4 literals are checked; otherwise we cannot judge reliably
+        if ! [[ "$iran_ip" =~ ^[0-9.]+$ ]]; then
+            clear_strike "$svc"
+            return
+        fi
+
+        if ss -Htnp state established dst "${iran_ip}:${iran_port}" 2>/dev/null | grep -q "pid=${main_pid},"; then
+            clear_strike "$svc"
+        else
+            strike "$svc" "no established session to ${iran_ip}:${iran_port}"
         fi
     fi
 }
@@ -829,7 +884,7 @@ EOF
 
     $SUDO systemctl daemon-reload
     $SUDO systemctl enable --now rtt-watchdog.timer > /dev/null 2>&1
-    echo -e "${green}Fixed watchdog installed (checks safely every 60s without false positives).${rest}"
+    echo -e "${green}Watchdog v4.3 installed (checks every 60s, restarts only after 3 confirmed failures).${rest}"
 }
 
 uninstall_watchdog() {
@@ -845,12 +900,50 @@ show_watchdog_log() {
     journalctl -t rtt-watchdog -n 50 --no-pager
 }
 
+diagnose() {
+    root_access
+    echo -e "${cyan}===> Connection diagnostics${rest}"
+    echo "Congestion control : $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+    if [ -r /proc/sys/net/netfilter/nf_conntrack_count ]; then
+        echo "conntrack entries  : $(cat /proc/sys/net/netfilter/nf_conntrack_count)/$(cat /proc/sys/net/netfilter/nf_conntrack_max)"
+    fi
+
+    for svc in tunnel.service lbtunnel.service custom_tunnel.service; do
+        [ -f "/etc/systemd/system/$svc" ] || continue
+        local pid exec_line starts ip port
+        pid=$(systemctl show -p MainPID --value "$svc")
+        exec_line=$(grep -m1 "^ExecStart=" "/etc/systemd/system/$svc")
+        starts=$(journalctl -u "$svc" --since "1 hour ago" --no-pager 2>/dev/null | grep -c "Started ")
+        echo -e "${yellow}[$svc]${rest} active=$(systemctl is-active "$svc") pid=$pid starts_last_hour=$starts"
+
+        if [[ "$exec_line" == *" --iran"* && "$exec_line" != *"--iran-ip"* ]]; then
+            echo "  listening sockets of RTT : $(ss -tlnp 2>/dev/null | grep -c "pid=${pid},")"
+            echo "  owner of port 443        : $(ss -tlnp 'sport = :443' 2>/dev/null | tail -n +2)"
+        else
+            ip=$(get_exec_arg "$exec_line" "iran-ip")
+            port=$(get_exec_arg "$exec_line" "iran-port")
+            port=${port:-443}
+            echo "  established to ${ip}:${port} : $(ss -Htnp state established dst "${ip}:${port}" 2>/dev/null | grep -c "pid=${pid},")"
+            if [ -n "$ip" ]; then
+                if ping -M do -c 2 -W 2 -s 1372 "$ip" > /dev/null 2>&1; then
+                    echo "  MTU 1400 path test       : OK"
+                else
+                    echo "  MTU 1400 path test       : FAILED (MTU or ICMP problem; check plain ping first)"
+                fi
+            fi
+        fi
+    done
+
+    echo -e "${yellow}Last watchdog events:${rest}"
+    journalctl -t rtt-watchdog -n 15 --no-pager 2>/dev/null
+}
+
 # ip & version
 myip=$(hostname -I | awk '{print $1}')
 version=$([ -f "$INSTALL_DIR/RTT" ] && "$INSTALL_DIR/RTT" -v 2>&1 | grep -o 'version="[0-9.]*"')
 
 clear
-echo -e "${cyan}Radkesvat Fixed By Parham Pahlean (v4.2 Patched)${rest}"
+echo -e "${cyan}Radkesvat Fixed By Parham Pahlean (v4.3 Stability Edition)${rest}"
 echo -e "Your IP is: ${cyan}($myip)${rest} "
 echo -e "${yellow}******************************${rest}"
 check_tunnel_status
@@ -871,6 +964,7 @@ echo -e "${cyan}25) Show watchdog log${rest}"
 echo -e "${red}26) Uninstall watchdog${rest}"
 echo -e "${purple}27) Update RTT binary to latest version${rest}"
 echo -e "${purple}28) Install HAProxy (optional)${rest}"
+echo -e "${green}29) Connection diagnostics${rest}"
 echo "0) Exit"
 read -p "Please choose: " choice
 
@@ -889,6 +983,7 @@ case $choice in
     26) uninstall_watchdog ;;
     27) update_services ;;
     28) install_haproxy ;;
+    29) diagnose ;;
     0) exit ;;
     *) echo "Invalid choice." ;;
 esac
