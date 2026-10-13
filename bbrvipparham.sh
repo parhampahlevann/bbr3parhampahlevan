@@ -1,8 +1,25 @@
 #!/bin/bash
 # =========================================================================
-# RTT (ReverseTlsTunnel) Installer - v5.0 (Anti-Drop & Stability release)
+# RTT (ReverseTlsTunnel) Installer - v5.1 (Default preset + Anti-Drop)
 # =========================================================================
 # Goal: a fast, light and stable Iran <-> Kharej tunnel without random drops.
+#
+#  v5.1 changes
+#   * New "Default" protocol preset (menu 1): zero-question install. Always
+#     fetches the LATEST RTT release (no yes/no prompt), uses a fixed
+#     SNI (samsung.com) and a fixed password (123) on both sides, and only
+#     auto-picks a safe forward-port range if your SSH port would collide.
+#     SECURITY NOTE: a fixed, non-secret password/SNI means ANYONE who finds
+#     your Iran IP can attempt to use this tunnel. It is meant for a quick
+#     first boot, not for a password you keep - change it with menu 20
+#     (and the SNI with menu 19) once the link is confirmed working. The old
+#     interactive flow (choose your own SNI/password) is still available as
+#     menu 11.
+#   * Fixed a false "tunnel is DOWN" report right after install/verify: the
+#     PID used to count live connections was captured once before the
+#     15x2s wait loop, so if RTT respawned during that window (e.g. right
+#     after --connection-age kicks in) the check looked at a dead PID. The
+#     PID is now re-read on every iteration.
 #
 #  v5.0 changes
 #   * --connection-age:4800 on BOTH sides. This is the RTT author's own switch
@@ -37,6 +54,8 @@ INSTALL_DIR="/root"
 UNIT_DIR="/etc/systemd/system"
 TUNNEL_MSS=1340
 CONN_AGE=4800
+DEFAULT_SNI="samsung.com"
+DEFAULT_PASSWORD="123"
 RTT_INSTALLER_URL="https://raw.githubusercontent.com/radkesvat/ReverseTlsTunnel/master/scripts/install.sh"
 RTT_LATEST_API="https://api.github.com/repos/radkesvat/ReverseTlsTunnel/releases/latest"
 
@@ -621,14 +640,12 @@ install_rtt_custom() {
     return $rc
 }
 
+#  Always installs the latest RTT release automatically - no prompt.
+#  (install_rtt_custom() is kept further up only so a specific version can
+#  still be pinned by calling it directly/manually if ever needed.)
 install_selected_version() {
-    local choice rc
-    read -r -p "Do you want to install the Latest version? [yes/no] (default: yes): " choice
-    if [[ "$choice" == "no" ]]; then
-        install_rtt_custom
-    else
-        install_rtt
-    fi
+    local rc
+    install_rtt
     rc=$?
     if [ "$rc" -ne 0 ]; then
         if [ -x "$INSTALL_DIR/RTT" ]; then
@@ -691,6 +708,49 @@ configure_arguments() {
             [ "$ratio" -gt 1 ] && noise_flag=" --noise:$((ratio - 1))"
         fi
         arguments="--iran --lport:$LPORT_RANGE --sni:$sni --password:$password$noise_flag$KEEP_UFW_FLAG$KEEP_OS_LIMIT_FLAG$CONN_AGE_FLAG"
+        open_ufw_range "${LPORT_RANGE/-/:}"
+        open_firewalld_range "$LPORT_RANGE"
+    fi
+}
+
+# "Default" protocol preset: asks ONLY what truly cannot be guessed
+# (role, and the Iran IP on the Kharej side). SNI + password are fixed
+# (DEFAULT_SNI / DEFAULT_PASSWORD) and the port range is auto-resolved
+# instead of prompted. Sets $server_choice and $arguments, same as
+# configure_arguments().
+configure_arguments_default() {
+    local server_ip
+    read -r -p "Which server do you want to use? (1 for Iran, 2 for Kharej): " server_choice
+    case "$server_choice" in
+        1|2) ;;
+        *) echo "Invalid choice. Please enter '1' or '2'."; exit 1 ;;
+    esac
+
+    echo -e "${cyan}Default preset: SNI=$DEFAULT_SNI, password=$DEFAULT_PASSWORD (fixed, identical on both sides).${rest}"
+    check_sni_dns "$DEFAULT_SNI"
+    prompt_keep_ufw
+    compute_common_flags
+
+    if [ "$server_choice" == "2" ]; then
+        prompt_valid "Please enter IRAN IP (internal-server): " v_host "Invalid IP / hostname."
+        server_ip="$REPLY_VALUE"
+        check_iran_reachable "$server_ip" 443
+        arguments="--kharej --iran-ip:$server_ip --iran-port:443 --toip:127.0.0.1 --toport:multiport --password:$DEFAULT_PASSWORD --sni:$DEFAULT_SNI$KEEP_UFW_FLAG$KEEP_OS_LIMIT_FLAG$CONN_AGE_FLAG"
+    else
+        # Same safety logic as choose_lport_range(), but auto-applied instead
+        # of asked, so this stays a zero-question install.
+        LPORT_RANGE="23-65535"
+        local p conflict=() first
+        for p in $(ssh_ports); do
+            [ "$p" -ge 23 ] && conflict+=("$p")
+        done
+        if [ ${#conflict[@]} -gt 0 ]; then
+            first=${conflict[0]}
+            if [ "$first" -gt 443 ]; then LPORT_RANGE="23-$((first - 1))"; else LPORT_RANGE="$((first + 1))-65535"; fi
+            echo -e "${yellow}sshd detected on port(s) ${conflict[*]} - auto-adjusted forward range to $LPORT_RANGE so SSH stays reachable.${rest}"
+        fi
+        check_port_443_free
+        arguments="--iran --lport:$LPORT_RANGE --sni:$DEFAULT_SNI --password:$DEFAULT_PASSWORD$KEEP_UFW_FLAG$KEEP_OS_LIMIT_FLAG$CONN_AGE_FLAG"
         open_ufw_range "${LPORT_RANGE/-/:}"
         open_firewalld_range "$LPORT_RANGE"
     fi
@@ -809,10 +869,14 @@ verify_after_install() {
     if [ "$role" == "1" ]; then
         # Iran role: RTT must actually bind a listening socket. is-active alone
         # does not prove that - it only proves the process launched.
+        # (pid is re-read every iteration: if RTT respawned mid-check the old
+        # pid would be dead and would falsely report "not listening".)
         for i in 1 2 3 4 5; do
+            pid=$(service_pid "$svc")
             listening_ok "$pid" && break
             sleep 2
         done
+        pid=$(service_pid "$svc")
         if listening_ok "$pid"; then
             echo -e "${green}Tunnel service started successfully and is listening.${rest}"
         else
@@ -825,9 +889,11 @@ verify_after_install() {
         port=${port:-443}
         if v_ipv4 "$ip"; then
             for i in $(seq 1 15); do
+                pid=$(service_pid "$svc")
                 [ "$(count_links "$pid" "$ip" "$port")" -gt 0 ] && break
                 sleep 2
             done
+            pid=$(service_pid "$svc")
             if [ "$(count_links "$pid" "$ip" "$port")" -gt 0 ]; then
                 echo -e "${green}Tunnel is UP: live connection to $ip:$port.${rest}"
             else
@@ -849,6 +915,31 @@ show_peer_reminder() {
 }
 
 # ------------------------------------------------------------- install flows
+# "Default" protocol preset: RTT, same underlying service/flags as the
+# regular install(), just auto-configured (no SNI/password questions).
+install_default() {
+    root_access
+    check_dependencies
+    check_installed
+    install_selected_version
+
+    configure_arguments_default
+
+    write_unit tunnel.service "RTT Tunnel Service (Default preset)" "$INSTALL_DIR/RTT $arguments"
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl enable tunnel.service > /dev/null 2>&1
+    rm -f "$MANUAL_DIR/tunnel.service.manual_stop"
+
+    apply_kernel_tuning
+    install_watchdog
+
+    $SUDO systemctl restart tunnel.service
+    verify_after_install tunnel.service "$server_choice"
+    echo -e "${yellow}Protocol: Default (RTT)   SNI: $DEFAULT_SNI   Password: $DEFAULT_PASSWORD (fixed on both sides).${rest}"
+    echo -e "${red}Security note: this password/SNI are NOT secret - anyone who learns your Iran IP could try this tunnel. Once the link is confirmed (menu 9), change the password with menu 20.${rest}"
+    show_peer_reminder
+}
+
 install() {
     root_access
     check_dependencies
@@ -1539,13 +1630,13 @@ main() {
     version=$(rtt_version)
 
     clear
-    echo -e "${cyan}Radkesvat Fixed By Parham Pahlean (v5.0 Anti-Drop)${rest}"
+    echo -e "${cyan}Radkesvat Fixed By Parham Pahlean (v5.1 Default preset + Anti-Drop)${rest}"
     echo -e "Your IP is: ${cyan}($myip)${rest}   RTT version: ${cyan}${version:-not installed}${rest}"
     echo -e "${yellow}******************************${rest}"
     check_tunnel_status
     check_lb_tunnel_status
     echo -e "${yellow}******************************${rest}"
-    echo -e "${green}1) Install (Multiport)${rest}"
+    echo -e "${green}1) Install (Default - quick, no questions)${rest}"
     echo -e "${red}2) Uninstall (Multiport)${rest}"
     echo "3) Start Multiport"
     echo "4) Stop Multiport"
@@ -1557,6 +1648,7 @@ main() {
     echo -e "${green}8) Apply ALL stability fixes to the installed tunnel (recommended)${rest}"
     echo -e "${cyan}9) Diagnose connection (links, DNS, kernel, logs)${rest}"
     echo "10) Show tunnel logs"
+    echo -e "${green}11) Install (Advanced - choose your own SNI & password)${rest}"
     echo -e "${purple}18) Re-apply kernel / MSS / service-hardening profile only${rest}"
     echo -e "${cyan}19) Change Tunnel SNI${rest}"
     echo -e "${cyan}20) Change tunnel password${rest}"
@@ -1571,7 +1663,7 @@ main() {
     read -r -p "Please choose: " choice
 
     case $choice in
-        1) install ;;
+        1) install_default ;;
         2) uninstall ;;
         3) start_tunnel ;;
         4) stop_tunnel ;;
@@ -1581,6 +1673,7 @@ main() {
         8) apply_all_fixes ;;
         9) diagnose ;;
         10) show_logs ;;
+        11) install ;;
         18) root_access; apply_kernel_tuning ;;
         19) change_sni ;;
         20) change_password ;;
